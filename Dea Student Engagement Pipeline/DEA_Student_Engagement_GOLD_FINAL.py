@@ -648,9 +648,9 @@ df_email = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
     .filter(col("activity_type") == EMAIL_TYPE_FILTER) \
     .filter(col("meeting_status") == EMAIL_STATUS_FILTER) \
     .filter(
-        ~col("activity_text").rlike("(?i)A new event has been scheduled") &
-        ~col("activity_text").rlike("(?i)is requesting access to the following folder") &
-        ~col("activity_text").rlike("(?i)requests access to an item")
+        ~coalesce(col("body_preview").rlike("(?i)A new event has been scheduled"), lit(False)) &
+        ~coalesce(col("body_preview").rlike("(?i)is requesting access to the following folder"), lit(False)) &
+        ~coalesce(col("body_preview").rlike("(?i)requests access to an item"), lit(False))
     ) \
     .filter(col("lead_id").isNotNull()) \
     .groupBy("lead_id") \
@@ -660,7 +660,7 @@ df_email = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
 # --- 2. DAYS_SINCE_LAST_MEETING (CRM) ---
 # activity_text contains 'A new event has been scheduled.' (case-insensitive)
 df_crm_meeting = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
-    .filter(col("activity_text").rlike("(?i)A new event has been scheduled")) \
+    .filter(coalesce(col("body_preview").rlike("(?i)A new event has been scheduled"), lit(False))) \
     .filter(col("lead_id").isNotNull()) \
     .groupBy("lead_id") \
     .agg(max("activity_at").alias("_last_crm_meeting_at")) \
@@ -788,17 +788,17 @@ df_flags = df_flags.withColumn(
     .otherwise(lit(0))
 )
 
-# MEETING_ENGAGED_FLAG: NULL if either meeting-recency source is NULL.
-# When both exist, 1 if either is <=30; otherwise 0.
+# MEETING_ENGAGED_FLAG: NULL only if BOTH meeting-recency sources are NULL.
+# When at least one exists, 1 if either is <=30; otherwise 0.
 df_flags = df_flags.withColumn(
     "meeting_engaged_flag",
     when(
-        col("days_since_last_meeting").isNull() | col("days_since_last_meeting_calendly").isNull(),
+        col("days_since_last_meeting").isNull() & col("days_since_last_meeting_calendly").isNull(),
         lit(None).cast("int")
     )
     .when(
-        (col("days_since_last_meeting") <= MEETING_THRESHOLD) |
-        (col("days_since_last_meeting_calendly") <= MEETING_THRESHOLD),
+        (coalesce(col("days_since_last_meeting"), lit(999)) <= MEETING_THRESHOLD) |
+        (coalesce(col("days_since_last_meeting_calendly"), lit(999)) <= MEETING_THRESHOLD),
         lit(1)
     )
     .otherwise(lit(0))

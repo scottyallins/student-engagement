@@ -143,11 +143,30 @@ repair_json_udf = udf(StringType())(_targeted_repair_impl)
 _TEMP_TABLES = []
 _pipeline_counter = 0
 _lineage_tree = []  # List of (number, depth, table_name)
+_CDC_WATERMARK = None  # Set by process_table in CDC mode; read by write_silver
 
 
-def parse_bronze_table(bronze_table):
+def get_silver_watermark(silver_table):
+    """Get last CDC watermark from Silver parent table.
+    Returns MAX(bronze_updated_at) or None if table doesn't exist.
+    """
+    try:
+        result = spark.sql(f"""
+            SELECT MAX(bronze_updated_at) as max_date
+            FROM {CATALOG}.{SILVER_SCHEMA}.{silver_table}
+        """).collect()[0]
+        return result['max_date']
+    except Exception:
+        return None
+
+
+def parse_bronze_table(bronze_table, watermark=None):
     """Read Bronze, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse."""
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
+
+    if watermark:
+        df = df.filter(col("bronze_updated_at") > lit(watermark))
+        print(f"  CDC: reading Bronze rows after {watermark}")
 
     # Quick wrapper detection from one sample row (no full table scan)
     sample_row = df.select("raw_data").filter(col("raw_data").isNotNull()).first()
@@ -175,7 +194,7 @@ def parse_bronze_table(bronze_table):
     full_temp = f"{CATALOG}.{SILVER_SCHEMA}._tmp_{bronze_table}"
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
     spark.sql(f"DROP TABLE IF EXISTS {full_temp}")
-    df.select("insert_date", "raw_data_repaired") \
+    df.select("insert_date", "bronze_updated_at", "raw_data_repaired") \
         .write.format("delta").mode("overwrite") \
         .option("mergeSchema", "true") \
         .saveAsTable(full_temp)
@@ -256,7 +275,7 @@ def parse_bronze_table(bronze_table):
     parsed_type = df_parsed.schema["parsed"].dataType
     if isinstance(parsed_type, StructType):
         field_names = _dedup_names([_sanitize_col_name(f.name) for f in parsed_type.fields])
-        select_exprs = [col("insert_date").alias("bronze_insert_date")]
+        select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at")]
         for f, safe_name in zip(parsed_type.fields, field_names):
             select_exprs.append(col(f"parsed.`{f.name}`").alias(safe_name))
         df_flat = df_parsed.select(*select_exprs)
@@ -266,18 +285,20 @@ def parse_bronze_table(bronze_table):
         element_type = df_exploded.schema["_element"].dataType
         if isinstance(element_type, StructType):
             elem_names = _dedup_names([_sanitize_col_name(f.name) for f in element_type.fields])
-            select_exprs = [col("insert_date").alias("bronze_insert_date")]
+            select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at")]
             for f, safe_name in zip(element_type.fields, elem_names):
                 select_exprs.append(col(f"_element.`{f.name}`").alias(safe_name))
             df_flat = df_exploded.select(*select_exprs)
         else:
             df_flat = df_exploded.select(
                 col("insert_date").alias("bronze_insert_date"),
+                col("bronze_updated_at"),
                 col("_element").alias("value")
             )
     else:
         df_flat = df_parsed.select(
             col("insert_date").alias("bronze_insert_date"),
+            col("bronze_updated_at"),
             col("parsed").alias("value")
         )
     return df_flat
@@ -369,8 +390,26 @@ def find_pk(df):
 
 
 def write_silver(df, table_name):
-    """Write DataFrame to silver schema and return row count."""
+    """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set."""
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
+
+    if _CDC_WATERMARK is not None:
+        try:
+            spark.sql(f"DESCRIBE TABLE {full}")
+            wm_str = _CDC_WATERMARK.strftime("%Y-%m-%d %H:%M:%S")
+            spark.sql(f"DELETE FROM {full} WHERE bronze_updated_at > '{wm_str}'")
+            df.write.format("delta").mode("append") \
+                .option("mergeSchema", "true") \
+                .option("delta.columnMapping.mode", "name") \
+                .option("delta.minReaderVersion", "2") \
+                .option("delta.minWriterVersion", "5") \
+                .saveAsTable(full)
+            cnt = spark.table(full).count()
+            print(f"  \u2705 CDC: {table_name}: {cnt:,} rows (delete+insert)")
+            return cnt
+        except Exception:
+            pass
+
     df.write.format("delta").mode("overwrite") \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
@@ -382,8 +421,14 @@ def write_silver(df, table_name):
     return cnt
 
 
-def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path=""):
-    """Explode an array column into a child table. Recurse on nested arrays until scalar."""
+def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None):
+    """Explode an array column into a child table. Recurse on nested arrays until scalar.
+
+    parent_pk: The PK column name of the immediate parent. This is ALWAYS renamed
+    to {parent_name}_{parent_pk} in the child table so it's a clear foreign key.
+    At deeper levels, parent_pk is the child element's own PK (from struct fields),
+    not a carried FK from above — so only the immediate parent's PK gets renamed.
+    """
     child_name = f"{parent_name}_{array_col}"
 
     df_child = df.withColumn("_element", explode_outer(col(array_col)))
@@ -391,19 +436,33 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
 
     if isinstance(element_type, StructType):
         element_field_names = [f.name for f in element_type.fields]
+        elem_names = _dedup_names([_sanitize_col_name(f.name) for f in element_type.fields])
+        # Detect element's own PK (for recursion into grandchild tables)
+        element_pk = None
+        for f, safe_name in zip(element_type.fields, elem_names):
+            if safe_name.lower() == "id" and isinstance(f.dataType, (StringType, IntegerType, LongType)):
+                element_pk = safe_name
+                break
         carry = []
         for c in dict.fromkeys(carry_cols):
             if c in df.columns and c != array_col:
-                if c in element_field_names:
+                # Rename parent's PK to {parent_name}_{pk} — always, not just on collision
+                if c in element_field_names or c == parent_pk:
                     carry.append(col(c).alias(f"{parent_name}_{c}"))
                 else:
                     carry.append(col(c))
-        elem_names = _dedup_names([_sanitize_col_name(f.name) for f in element_type.fields])
         element_fields = [col(f"_element.`{f.name}`").alias(safe) for f, safe in zip(element_type.fields, elem_names)]
         df_child = df_child.select(*carry, *element_fields)
         print(f"  {'  '*depth}📦 {array_col}: array of objects — extracted {len(element_type.fields)} fields")
     else:
-        carry = [col(c) for c in dict.fromkeys(carry_cols) if c in df.columns and c != array_col]
+        element_pk = None  # Scalar arrays have no struct PK
+        carry = []
+        for c in dict.fromkeys(carry_cols):
+            if c in df.columns and c != array_col:
+                if c == parent_pk:
+                    carry.append(col(c).alias(f"{parent_name}_{c}"))
+                else:
+                    carry.append(col(c))
         df_child = df_child.select(*carry, col("_element").alias(array_col))
         print(f"  {'  '*depth}📦 {array_col}: array of scalars")
 
@@ -416,16 +475,19 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
     write_silver(df_child, child_name)
     _lineage_tree.append((num_path, depth + 1, child_name))
 
-    # Extract custom struct from child if present
+    # Build carry for downstream tables: original carry_cols that survived,
+    # PLUS parent-prefixed columns (renamed FKs), PLUS child's own PK
     child_pk = find_pk(df_child)
     child_carry = list(dict.fromkeys(
-        [c for c in carry_cols if c in df_child.columns] + ([child_pk] if child_pk else [])
+        [c for c in carry_cols if c in df_child.columns] +
+        [c for c in df_child.columns if c.startswith(f"{parent_name}_")] +
+        ([child_pk] if child_pk else [])
     ))
     has_child_custom = "custom" in df_child.columns and isinstance(df_child.schema["custom"].dataType, StructType)
     has_child_cf = any(c.startswith("custom_cf_") for c in df_child.columns)
     if has_child_custom or has_child_cf:
         custom_num = f"{num_path}_0"
-        df_child = extract_custom(df_child, child_name, child_carry, custom_num)
+        df_child = extract_custom(df_child, child_name, child_carry, custom_num, parent_pk=element_pk)
 
     # Recurse on nested arrays
     _, child_arrays, _ = categorize_fields(df_child)
@@ -440,10 +502,10 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
     for ca in child_arrays:
         grandchild_idx += 1
         grandchild_num = f"{num_path}_{grandchild_idx}"
-        explode_to_child(df_child, child_name, ca, new_carry, depth + 1, grandchild_num)
+        explode_to_child(df_child, child_name, ca, new_carry, depth + 1, grandchild_num, parent_pk=element_pk)
 
 
-def extract_custom(df, parent_name, carry_cols, num_path):
+def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
     """Extract custom struct AND custom_cf_ columns into separate child tables.
 
     THREE separate outputs (custom and custom_cf_ are TOTALLY DIFFERENT):
@@ -464,7 +526,13 @@ def extract_custom(df, parent_name, carry_cols, num_path):
     if not has_custom_struct and not top_cf_cols:
         return df
 
-    carry = [col(c) for c in dict.fromkeys(carry_cols) if c in df.columns]
+    carry = []
+    for c in dict.fromkeys(carry_cols):
+        if c in df.columns:
+            if c == parent_pk:
+                carry.append(col(c).alias(f"{parent_name}_{c}"))
+            else:
+                carry.append(col(c))
 
     struct_cf_fields = []
     struct_scalar_fields = []
@@ -503,13 +571,16 @@ def extract_custom(df, parent_name, carry_cols, num_path):
         # Explode arrays that survived flatten in the custom table
         custom_pk = find_pk(df_custom)
         custom_carry = list(dict.fromkeys(
-            [c for c in carry_cols if c in df_custom.columns] + ([custom_pk] if custom_pk else [])
+            [c for c in carry_cols if c in df_custom.columns] +
+            [c for c in df_custom.columns if c.startswith(f"{parent_name}_")] +
+            ([custom_pk] if custom_pk else [])
         ))
         _, custom_arrays_in_table, _ = categorize_fields(df_custom)
         for ca in custom_arrays_in_table:
             grandchild_idx += 1
             grandchild_num = f"{num_path}_{grandchild_idx}"
-            explode_to_child(df_custom, custom_name, ca, custom_carry, depth=1, num_path=grandchild_num)
+            explode_to_child(df_custom, custom_name, ca, custom_carry, depth=1, num_path=grandchild_num,
+                             parent_pk=(custom_pk if custom_pk and custom_pk not in carry_cols else None))
 
     # -- 2. Build _custom_arrays table (ALL custom struct arrays in ONE key-value table) --
     if has_custom_struct and struct_array_fields:
@@ -594,7 +665,7 @@ def print_lineage_tree():
 
 def process_table(bronze_name, silver_name=None):
     """Full Bronze → Silver pipeline: parse, flatten structs, extract custom, explode arrays."""
-    global _pipeline_counter, _lineage_tree
+    global _pipeline_counter, _lineage_tree, _CDC_WATERMARK
     _pipeline_counter += 1
     pipeline = _pipeline_counter
 
@@ -611,8 +682,16 @@ def process_table(bronze_name, silver_name=None):
     # Print root structure
     print(f"  # * raw_{bronze_name}-> bronze_{bronze_name}-> {silver_name}")
 
-    df_flat = parse_bronze_table(bronze_name)
+    # Check Silver watermark for CDC
+    _CDC_WATERMARK = get_silver_watermark(silver_name)
+    if _CDC_WATERMARK:
+        print(f"  CDC MODE: reading changes after {_CDC_WATERMARK}")
+    else:
+        print(f"  FULL LOAD: first run")
+
+    df_flat = parse_bronze_table(bronze_name, watermark=_CDC_WATERMARK)
     if df_flat is None:
+        _CDC_WATERMARK = None
         return
 
     # Flatten structs (keep custom for separate extraction)
@@ -620,7 +699,7 @@ def process_table(bronze_name, silver_name=None):
 
     # Find PK for carry
     pk = find_pk(df_flat)
-    carry = list(dict.fromkeys(["bronze_insert_date"] + ([pk] if pk else [])))
+    carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
 
     # Extract custom as child table if present (struct or flat custom.cf_ columns)
     child_idx = 0
@@ -629,7 +708,7 @@ def process_table(bronze_name, silver_name=None):
     if has_custom or has_custom_cf:
         child_idx += 1
         custom_num = f"{pipeline}_{child_idx}"
-        df_flat = extract_custom(df_flat, silver_name, carry, custom_num)
+        df_flat = extract_custom(df_flat, silver_name, carry, custom_num, parent_pk=pk)
 
     # Print physical schema tree and summary for parent (after custom removal)
     print_physical_schema(df_flat, silver_name)
@@ -643,7 +722,7 @@ def process_table(bronze_name, silver_name=None):
         for arr in arrays:
             child_idx += 1
             child_num = f"{pipeline}_{child_idx}"
-            explode_to_child(df_flat, silver_name, arr, carry, depth=0, num_path=child_num)
+            explode_to_child(df_flat, silver_name, arr, carry, depth=0, num_path=child_num, parent_pk=pk)
 
     # Print lineage tree
     print_lineage_tree()
@@ -652,6 +731,9 @@ def process_table(bronze_name, silver_name=None):
     for temp in _TEMP_TABLES:
         spark.sql(f"DROP TABLE IF EXISTS {temp}")
     _TEMP_TABLES.clear()
+
+    # Reset CDC watermark for next table
+    _CDC_WATERMARK = None
 
     elapsed = time.time() - start
     print(f"  ⏱️ Completed in {elapsed:.1f}s")

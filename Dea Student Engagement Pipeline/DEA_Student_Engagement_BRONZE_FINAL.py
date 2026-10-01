@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,DROP ALL TABLES — Start Fresh
 # MAGIC %skip
 # MAGIC # ============================================================================
@@ -80,43 +84,41 @@ print(f"   Target: {CATALOG}.{BRONZE_SCHEMA}")
 
 # DBTITLE 1,CDC (Silver layer)
 # ============================================================================
-# CDC belongs in SILVER, not Bronze.
+# CDC lives in Bronze — incremental pull + MERGE from Postgres
 # ============================================================================
-# Bronze always does a FULL LOAD (overwrite) from Postgres every run.
-# No watermarks, no MERGE, no CDC logic here.
+# Bronze load_table() now supports CDC:
+#   1. First run  -> FULL LOAD (overwrite, size-based partitioning)
+#   2. Subsequent -> CDC: pull only changed rows + MERGE (idempotent upsert)
+#   3. Dual watermark: insert_date (new rows) + date_updated from JSON (updated rows)
+#   4. Configurable merge keys per table ($.id, $.EVENT_URI, $.ID, raw_data, composite)
 #
 # Silver's job:
-#   1. First silver run  → Process ALL bronze data (initial load)
-#   2. Subsequent runs   → Read watermark → query bronze for changed rows → MERGE
-#   3. Batch loading may be needed in Silver's initial load (after array explosion)
-#   4. CDC updates are small (only changed rows) → no batch needed
-#
-# This cell is intentionally empty. CDC functions will be defined in the
-# Silver notebook when it is built.
+#   1. Read changed Bronze rows (using watermark)
+#   2. Parse + flatten + explode into parent/child tables
+#   3. MERGE into Silver parent tables, DELETE+INSERT for child tables
 # ============================================================================
 
-print("✅ CDC lives in Silver — Bronze does full load only")
+print("✅ CDC lives in Bronze — incremental pull + MERGE from Postgres")
 
 # COMMAND ----------
 
 # DBTITLE 1,LOAD size and Batch
 # ============================================================================
-# LOAD TABLE — Size-based full load from Postgres to Bronze Delta
+# LOAD TABLE — CDC-aware incremental load from Postgres to Bronze Delta
 # ============================================================================
-# Bronze always does a FULL LOAD (overwrite). No CDC, no MERGE.
-# CDC and MERGE belong in the Silver layer.
+# First run:  FULL LOAD (overwrite, with size-based partitioning)
+# Subsequent: CDC incremental pull + MERGE (idempotent upsert)
 #
-# Strategy:
-#   1. Estimate source size: COUNT + 100-row sample for avg bytes/row
-#   2. < 256MB  → SINGLE_READ (spark.read.jdbc, no batching)
-#   3. >= 256MB → PARTITIONED (Spark native JDBC partitioning on insert_date)
-#   4. Always overwrite (full load every run)
+# Dual watermark: insert_date (new rows) + date_updated from JSON (updated rows)
+# Tables without date_updated use insert_date only.
+# Tables without 'id' use a configurable merge key or raw_data comparison.
 # ============================================================================
 
 import time
 from builtins import round, max, min  # override pyspark functions (imported by cell 2 star import)
 
 TARGET_BATCH_MB = 256
+
 
 def estimate_source_size(jdbc_url, props, table_name):
     """Quick row count + avg row size from a 100-row sample."""
@@ -144,19 +146,136 @@ def estimate_source_size(jdbc_url, props, table_name):
     return {"rows": row_count, "avg_bytes": int(avg_bytes), "total_mb": round(total_mb, 1)}
 
 
-def load_table(table_name, target_table):
-    """Full load from Postgres to Bronze Delta. Always overwrite."""
-    start = time.time()
-    print(f"\n{'='*80}\n📥 INGESTING: {table_name}\n{'='*80}")
+def get_last_watermark(target_table, date_updated_key="$.date_updated"):
+    """Get CDC watermark from existing Bronze table.
+    Returns {'insert_date': ts, 'date_updated': ts} or None if table doesn't exist.
+    """
+    try:
+        if date_updated_key:
+            result = spark.sql(f"""
+                SELECT 
+                    MAX(insert_date) as max_insert_date,
+                    MAX(TO_TIMESTAMP(GET_JSON_OBJECT(raw_data, '{date_updated_key}'))) as max_date_updated
+                FROM {target_table}
+            """).collect()[0]
+            return {
+                'insert_date': result['max_insert_date'],
+                'date_updated': result['max_date_updated']
+            }
+        else:
+            result = spark.sql(f"SELECT MAX(insert_date) as max_insert_date FROM {target_table}").collect()[0]
+            return {'insert_date': result['max_insert_date'], 'date_updated': None}
+    except Exception:
+        return None
 
-    # Step 1: Estimate source size
+
+def load_table(table_name, target_table,
+               merge_key="$.id",
+               composite_keys=None,
+               dedup=False,
+               date_updated_key="$.date_updated"):
+    """CDC-aware load from Postgres to Bronze Delta.
+
+    Args:
+        table_name:       Postgres source table (e.g., "raw.all_payments")
+        target_table:     Bronze target (e.g., "crm_ingestion.bronze.all_payments")
+        merge_key:        JSON path for single merge key (e.g., "$.id"). None = use raw_data.
+        composite_keys:   List of JSON paths for composite merge key (overrides merge_key).
+        dedup:            Dedup before merge using ROW_NUMBER() OVER PARTITION BY composite_keys.
+        date_updated_key: JSON path for date_updated watermark. None = insert_date only.
+    """
+    start = time.time()
+    print(f"\n{'='*80}\n\U0001f4e5 INGESTING: {table_name}\n{'='*80}")
+
+    # --- Try CDC first ---
+    watermark = get_last_watermark(target_table, date_updated_key)
+
+    if watermark and watermark["insert_date"]:
+        max_insert = watermark["insert_date"].strftime("%Y-%m-%d %H:%M:%S")
+
+        if watermark["date_updated"] and date_updated_key:
+            max_update = watermark["date_updated"].strftime("%Y-%m-%d %H:%M:%S")
+            date_key_short = date_updated_key[2:]
+            query = (
+                f"(SELECT * FROM {table_name} "
+                f"WHERE insert_date > '{max_insert}'::timestamp "
+                f"OR (raw_data->>'{date_key_short}')::timestamp > '{max_update}'::timestamp) as cdc"
+            )
+        else:
+            query = (
+                f"(SELECT * FROM {table_name} "
+                f"WHERE insert_date > '{max_insert}'::timestamp) as cdc"
+            )
+
+        print("\U0001f504 CDC MODE")
+        df = spark.read.jdbc(url=jdbc_url, table=query, properties=connection_properties)
+        row_count = df.count()
+
+        if row_count > 0:
+            # Always dedup source before MERGE to prevent multiple-source-rows-matching-same-target error
+            temp_view = "temp_cdc"
+            df.createOrReplaceTempView(temp_view)
+            if dedup and composite_keys:
+                partition_expr = ", ".join([
+                    f"GET_JSON_OBJECT(raw_data, '{k}')" for k in composite_keys
+                ])
+            elif composite_keys:
+                partition_expr = ", ".join([
+                    f"GET_JSON_OBJECT(raw_data, '{k}')" for k in composite_keys
+                ])
+            elif merge_key:
+                partition_expr = f"GET_JSON_OBJECT(raw_data, '{merge_key}')"
+            else:
+                partition_expr = "raw_data"
+            df = spark.sql(f"""
+                SELECT * FROM {temp_view}
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY {partition_expr}
+                    ORDER BY insert_date DESC
+                ) = 1
+            """)
+
+            temp_name = f"temp_merge_{int(time.time())}"
+            df.createOrReplaceTempView(temp_name)
+
+            if composite_keys:
+                merge_cond = " AND ".join([
+                    f"GET_JSON_OBJECT(t.raw_data, '{k}') = GET_JSON_OBJECT(s.raw_data, '{k}')"
+                    for k in composite_keys
+                ])
+            elif merge_key:
+                merge_cond = f"GET_JSON_OBJECT(t.raw_data, '{merge_key}') = GET_JSON_OBJECT(s.raw_data, '{merge_key}')"
+            else:
+                merge_cond = "t.raw_data = s.raw_data"
+
+            spark.sql(f"""
+                MERGE INTO {target_table} t
+                USING {temp_name} s
+                ON {merge_cond}
+                WHEN MATCHED THEN UPDATE SET
+                    t.raw_data         = s.raw_data,
+                    t.insert_date      = s.insert_date,
+                    t.bronze_updated_at = current_timestamp()
+                WHEN NOT MATCHED THEN INSERT (raw_data, insert_date, bronze_updated_at)
+                VALUES (s.raw_data, s.insert_date, current_timestamp())
+            """)
+
+            elapsed = time.time() - start
+            print(f"\u2705 MERGE: {row_count:,} rows in {elapsed:.1f}s")
+            return row_count
+        else:
+            print("\u23ed\ufe0f SKIP: No changes")
+            return 0
+
+    # --- FULL LOAD (initial creation, with size-based partitioning) ---
+    print("\U0001f195 FULL LOAD")
+
     size = estimate_source_size(jdbc_url, connection_properties, table_name)
     if size["rows"] == 0:
-        print("⏭️ SKIP: No data")
+        print("\u23ed\ufe0f SKIP: No data")
         return 0
     print(f"  source: {size['rows']:,} rows | ~{size['avg_bytes']:,} bytes/row | ~{size['total_mb']:.1f}MB total")
 
-    # Step 2: Pick strategy
     if size["total_mb"] < TARGET_BATCH_MB:
         print(f"  strategy: SINGLE_READ")
         df = spark.read.jdbc(url=jdbc_url, table=table_name, properties=connection_properties)
@@ -180,30 +299,34 @@ def load_table(table_name, target_table):
             print(f"  strategy: SINGLE_READ (partition fallback)")
             df = spark.read.jdbc(url=jdbc_url, table=table_name, properties=connection_properties)
 
-    # Step 3: Write (always full load — overwrite)
     row_count = df.count()
     elapsed = time.time() - start
 
     if row_count == 0:
-        print("⏭️ SKIP: No data after read")
+        print("\u23ed\ufe0f SKIP: No data after read")
         return 0
 
+    df = df.withColumn("bronze_updated_at", current_timestamp())
     df.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable(target_table)
-    print(f"✅ LOADED: {row_count:,} rows in {elapsed:.1f}s")
+    print(f"\u2705 LOADED: {row_count:,} rows in {elapsed:.1f}s")
     return row_count
 
-print(f"✅ load_table() loaded | Target batch: {TARGET_BATCH_MB}MB")
+
+print(f"\u2705 load_table() loaded | CDC-aware | Target batch: {TARGET_BATCH_MB}MB")
 print(f"   Usage: load_table('raw.table', 'catalog.schema.table')")
+print(f"   CDC:   load_table('raw.table', 'catalog.schema.table', merge_key='$.id', date_updated_key='$.date_updated')")
+print(f"   Composite: load_table('raw.table', 'catalog.schema.table', composite_keys=['$.id','$.name'], dedup=True)")
+print(f"   No-key: load_table('raw.table', 'catalog.schema.table', merge_key=None, date_updated_key=None)")
 
 # COMMAND ----------
 
 # DBTITLE 1,1_all_payments
-load_table("raw.all_payments", "crm_ingestion.bronze.all_payments")
+load_table("raw.all_payments", "crm_ingestion.bronze.all_payments", merge_key=None, date_updated_key=None)
 
 # COMMAND ----------
 
 # DBTITLE 1,2_calendly_scheduled_events
-load_table("raw.calendly_scheduled_events", "crm_ingestion.bronze.calendly_scheduled_events")
+load_table("raw.calendly_scheduled_events", "crm_ingestion.bronze.calendly_scheduled_events", merge_key=None, date_updated_key=None)
 
 # COMMAND ----------
 
@@ -223,22 +346,22 @@ load_table("raw.lead_activites_raw", "crm_ingestion.bronze.lead_activites_raw")
 # COMMAND ----------
 
 # DBTITLE 1,6_lead_merges
-load_table("raw.lead_merges", "crm_ingestion.bronze.lead_merges")
+load_table("raw.lead_merges", "crm_ingestion.bronze.lead_merges", merge_key=None, date_updated_key=None)
 
 # COMMAND ----------
 
 # DBTITLE 1,7_leads_raw
-load_table("raw.leads_raw", "crm_ingestion.bronze.leads_raw")
+load_table("raw.leads_raw", "crm_ingestion.bronze.leads_raw", composite_keys=["$.id", "$.name", "$.date_updated"], dedup=True)
 
 # COMMAND ----------
 
 # DBTITLE 1,8_mdl_users_raw
-load_table("raw.mdl_users_raw", "crm_ingestion.bronze.mdl_users_raw")
+load_table("raw.mdl_users_raw", "crm_ingestion.bronze.mdl_users_raw", merge_key="$.ID", date_updated_key=None)
 
 # COMMAND ----------
 
 # DBTITLE 1,9_student_sentiment
-load_table("raw.student_sentiment", "crm_ingestion.bronze.student_sentiment")
+load_table("raw.student_sentiment", "crm_ingestion.bronze.student_sentiment", merge_key=None, date_updated_key=None)
 
 # COMMAND ----------
 
