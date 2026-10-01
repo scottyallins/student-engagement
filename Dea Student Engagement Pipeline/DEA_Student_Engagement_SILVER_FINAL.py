@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Title
 # MAGIC %md
 # MAGIC # DEA Student Engagement SILVER FINAL
@@ -368,7 +372,7 @@ def write_silver(df, table_name):
     """Write DataFrame to silver schema and return row count."""
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
     df.write.format("delta").mode("overwrite") \
-        .option("mergeSchema", "true") \
+        .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \
         .option("delta.minWriterVersion", "5") \
@@ -514,8 +518,8 @@ def extract_custom(df, parent_name, carry_cols, num_path):
             row = df.select(
                 *carry,
                 lit(orig_name).alias("custom_key"),
-                explode_outer(col(f"custom.`{orig_name}`")).cast("string").alias("value")
-            )
+                explode_outer(col(f"custom.`{orig_name}`")).alias("_exploded_value")
+            ).withColumn("value", col("_exploded_value").cast("string")).drop("_exploded_value")
             array_rows.append(row)
         df_arrays = array_rows[0]
         for r in array_rows[1:]:

@@ -1,49 +1,48 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Title
 # MAGIC %md
 # MAGIC # DEA Student Engagement GOLD FINAL
 # MAGIC
-# MAGIC Silver → Gold transformation with **canonical dimensions, fact tables, and analytics aggregations**.
+# MAGIC Silver → Gold transformation producing the **Customer Health Profile** per spec.
 # MAGIC
-# MAGIC ## Customer Health Profile Architecture
+# MAGIC ## Core Processed Datasets
 # MAGIC
-# MAGIC ### Dimensions
-# MAGIC * `dim_leads` — Canonical lead dimension resolves merged leads via `lead_merges` (SOURCE_LEAD_ID → DESTINATION_LEAD_ID)
-# MAGIC * `dim_users` — Deduplicated CRM users (sales reps, success managers)
-# MAGIC * `dim_lead_emails` — Email → lead_key mapping for Customer Health Profile lookup by email
+# MAGIC | Dataset | Description |
+# MAGIC |---------|-------------|
+# MAGIC | `LEADS_PROCESSED` | Flattened lead/contact, account, status, and source-lineage attributes |
+# MAGIC | `CLOSE_CRM_USERS_PROCESSED` | Current user dimension with ID, name, email, status, role |
+# MAGIC | `LEADS_ACTIVITIES_SUMMARY` | Deduplicated activities by ACTIVITY_ID (DATE_UPDATED → INSERT_DATE) with meeting/email/call fields |
+# MAGIC | `SALES_DETAILS` | Latest qualifying sale per LEAD_ID (outcome 7 or 8) with setter/closer, contract value, program |
+# MAGIC | `LEADS_ACCOUNT_DETAILS_UPDATES` | One current Coaching Client record per LEAD_ID with engagement metrics, flags, pattern, score, health band |
 # MAGIC
-# MAGIC ### Fact Tables
-# MAGIC * `fact_sales` — Opportunities with setter/closer attribution
-# MAGIC * `fact_activities` — All CRM activities (calls, emails, SMS, meetings) with canonical lead resolution
-# MAGIC * `fact_calendly_meetings` — Calendly scheduled meetings joined to leads by email
-# MAGIC * `fact_payments` — Payment history joined to leads by email
+# MAGIC ## Engagement Model (3 dimensions)
+# MAGIC * **Slack** — `DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT` from student_sentiment (≤14 days = engaged)
+# MAGIC * **Platform** — `DAYS_SINCE_LAST_LOGIN` from mdl_users_raw.LASTACCESS (≤14 days = engaged)
+# MAGIC * **Meeting** — CRM text 'A new event has been scheduled' + Calendly EVENT_CREATED_AT (≤30 days = engaged)
 # MAGIC
-# MAGIC ### Aggregation Tables
-# MAGIC * `agg_lead_activity_summary` — Per-lead activity aggregations (last dates, counts, directional metrics)
-# MAGIC * `agg_platform_sentiment` — Platform engagement (Moodle LMS LASTACCESS) + customer sentiment
-# MAGIC * `agg_lead_engagement_classification` — 8-category engagement classification (Fully Engaged, Comm+Platform, Comm+Meeting, Platform+Meeting, Comm Only, Platform Only, Meeting Only, No Engagement)
-# MAGIC * `agg_customer_health_score` — Unified health score (0-100) with engagement base + activity bonus + missed penalty + **sentiment adjustment**
+# MAGIC ## Health Score Formula
+# MAGIC `FINAL_HEALTH_SCORE = base_score(engagement_pattern) + missed_call_adjustment + sentiment_adjustment`
+# MAGIC * **Not capped** at 0 or 100
+# MAGIC * **Base**: 90/80/75/60/50/40/30/20/NO DATA
+# MAGIC * **Missed calls (14d)**: 0→+5, 1-2→0, 3+→-15
+# MAGIC * **Sentiment**: POSITIVE→+10, NEUTRAL→+5, NEGATIVE→-25
+# MAGIC * **Bands**: NO DATA / GOOD(≥75) / AVERAGE(≥50) / POOR(<50)
 # MAGIC
-# MAGIC ### Mart
-# MAGIC * `mart_lead_360` — Complete 360-degree Customer Health Profile joining all dimensions, facts, and aggregations
+# MAGIC ## Deduplication Rules
+# MAGIC | Source | Key | Ordering |
+# MAGIC |--------|-----|----------|
+# MAGIC | CRM activities | ACTIVITY_ID | DATE_UPDATED → INSERT_DATE |
+# MAGIC | Calendly events | EVENT_URI | INVITEE_UPDATED_AT → EVENT_CREATED_AT → INSERT_DATE |
+# MAGIC | Platform users | USER_ID | TIMEMODIFIED |
+# MAGIC | Student sentiment | CHANNEL_ID | INSERT_DATE |
 # MAGIC
-# MAGIC ### Health Score Formula
-# MAGIC `health_score = base_score(engagement_tier) + activity_bonus - missed_penalty + sentiment_adjustment`
-# MAGIC * **Base**: High=80, Medium=60, Low=40, None=20
-# MAGIC * **Activity Bonus**: +10 if >20 activities, +5 if 5-20, 0 otherwise
-# MAGIC * **Missed Penalty**: -5/missed call (max -15), -10/no-show (max -20)
-# MAGIC * **Sentiment Adjustment**: Positive=+10, Neutral=0, Negative=-15
-# MAGIC * **Health Bands**: Good=70-100, Average=50-69, Poor=30-49, Critical=0-29
-# MAGIC
-# MAGIC ### Data Sources
-# MAGIC * CRM (Close CRM): `crm_ingestion.silver` → leads, activities, opportunities, users, merges
-# MAGIC * Platform (Moodle LMS): `crm_ingestion.silver.mdl_users_raw` → LASTACCESS for platform engagement
-# MAGIC * Sentiment: `crm_ingestion.silver.student_sentiment` → SENTIMENTS_LAST_30_DAYS
-# MAGIC * Payments: `crm_ingestion.silver.all_payments` → payment history
-# MAGIC * Meetings: `crm_ingestion.silver.calendly_scheduled_events` → Calendly meeting data
-# MAGIC
-# MAGIC ### Cross-System Join Limitation
-# MAGIC CRM, Moodle, payments, and sentiment systems use **different email masking schemes**. Email-based joins between CRM and external systems produce 0% match rate with masked data. The pipeline architecture is production-ready — joins will produce matches with unmasked email data.
+# MAGIC ## Excluded per spec
+# MAGIC * ❌ No lead-merge logic
+# MAGIC * ❌ No payment-processing logic
 
 # COMMAND ----------
 
@@ -65,30 +64,90 @@ GOLD_SCHEMA = "gold"
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{GOLD_SCHEMA}")
 
+# ============================================================================
+# HARDCODED BUSINESS CONSTANTS (per spec — do not alter without written approval)
+# ============================================================================
+
+# Email filter
+EMAIL_TYPE_FILTER = "Email"
+EMAIL_STATUS_FILTER = "inbox"
+
+# Email exclusions (case-insensitive substring match)
+EMAIL_EXCLUSIONS = [
+    "A new event has been scheduled.",
+    "is requesting access to the following folder",
+    "requests access to an item",
+]
+
+# CRM meeting signal (same text excluded from email but included for meetings)
+CRM_MEETING_SIGNAL = "A new event has been scheduled."
+
+# Upcoming meeting
+UPCOMING_MEETING_TYPE = "Meeting"
+
+# Missed calls
+MISSED_CALL_TYPE = "Call"
+MISSED_CALL_DIRECTION = "inbound"
+MISSED_CALL_DISPOSITION = "no-answer"
+MISSED_CALL_LOOKBACK_DAYS = 14
+
+# Slack types
+STUDENT_SLACK_TYPE = "student"
+TEAM_SLACK_TYPE = "internal_member"
+EXCLUDED_SLACK_CHANNEL = "C082U471YMU"
+
+# Engagement thresholds (days)
+COMMUNICATION_THRESHOLD = 14   # Slack engagement
+PLATFORM_THRESHOLD = 14        # Platform engagement
+MEETING_THRESHOLD = 30         # Meeting engagement
+
+# Sentiment
+POSITIVE_SENTIMENT = "POSITIVE"
+NEUTRAL_SENTIMENT = "NEUTRAL"
+NEGATIVE_SENTIMENT = "NEGATIVE"
+NO_SENTIMENT = "NO_SENTIMENT"
+
+# Sentiment adjustments
+SENTIMENT_ADJ = {"POSITIVE": 10, "NEUTRAL": 5, "NEGATIVE": -25}
+
+# Missed call adjustments
+MISSED_CALL_ADJ = {0: 5, 1: 0, 2: 0}  # 0→+5, 1-2→0, 3+→-15
+
+# Health bands
+HEALTH_BAND_GOOD = 75
+HEALTH_BAND_AVERAGE = 50
+
+# Qualifying sale activity type IDs
+SALE_TYPE_IDS = [
+    "actitype_3E85vFq3a06LlEzXT2N1kS",   # 7) New Sale
+    "actitype_0FNk72Q8eSYX2MVd4A2UFx",   # 8) New Sale [Custom Payment Plan]
+]
+
+# Custom field IDs for sale activities
+CF_CLOSER = "custom_cf_Lv5lSqLOZwLrNhe5M7kWx2mF8Ge2Z23aw5NUNhbXvVS"
+CF_SETTER = "custom_cf_v385AJ8HSgepKQ3rvqo4yOA3nn49eGqz39DOqojJG5M"
+CF_DATE_OF_SALE = "custom_cf_duzvav8KQ1PjbJLeAjqZna96ndGp3jO5U2JTfIuGFKi"
+CF_PROGRAM = "custom_cf_mXqKxcmjnlEW223wM4lgb04XyYwDm0GJ9v99xWHPWO2"
+CF_CONTRACT_VALUE = "custom_cf_vIanPjPEit6ssajmWkcprF2V1nO1itfes8hOSnjmhfT"
+CF_CONTACT_NAME = "custom_cf_vFrtpvBHRQmraddhs4Jbd6MZ71fAg71tt4g3VlMbM6K"
+
 print(f"Gold Layer Configuration")
 print(f"  Source: {CATALOG}.{SILVER_SCHEMA}")
 print(f"  Target: {CATALOG}.{GOLD_SCHEMA}")
+print(f"  Hardcoded constants loaded (per spec)")
 print("="*80)
 
 # COMMAND ----------
 
 # DBTITLE 1,dim_leads - Canonical Lead Dimension
 # ============================================================================
-# DIMENSION TABLE: dim_leads
+# LEADS_PROCESSED — Flattened lead/contact, account, status, source-lineage
 # ============================================================================
-# Purpose: Canonical lead dimension with merge resolution
-#
-# Key Features:
-#   ✅ Resolves merged leads to canonical IDs via lead_merges
-#   ✅ One record per unique lead (post-merge)
-#   ✅ Includes core lead attributes
-#   ✅ Type 1 SCD (current state only)
+# Spec: No lead-merge logic. One record per LEAD_ID.
 # ============================================================================
 
-print("\nBuilding dim_leads...")
+print("\nBuilding LEADS_PROCESSED...")
 
-# Load lead base data from silver.leads_raw
-# (Only non-cf_ columns — cf_ fields are handled in the EAV _custom_cf table)
 df_leads_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.leads_raw").select(
     col("id").alias("lead_id"),
     col("name").alias("lead_name"),
@@ -100,66 +159,59 @@ df_leads_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.leads_raw").select(
     col("description"),
     col("organization_id"),
     col("created_by").alias("created_by_user_id"),
-    col("created_by_name")
+    col("created_by_name"),
+    col("bronze_insert_date").alias("source_insert_date")
 )
 
-# Build canonical mapping from lead_merges
-# SOURCE_LEAD_ID was merged into DESTINATION_LEAD_ID
-df_merges = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_merges").select(
-    col("SOURCE_LEAD_ID").alias("merged_lead_id"),
-    col("DESTINATION_LEAD_ID").alias("canonical_lead_id")
-).filter(
-    col("merged_lead_id").isNotNull() & 
-    col("canonical_lead_id").isNotNull()
+# Deduplicate by lead_id — keep latest by lead_updated_date then source_insert_date
+window_lead = Window.partitionBy("lead_id").orderBy(
+    col("lead_updated_date").desc_nulls_last(),
+    col("source_insert_date").desc_nulls_last()
 )
-
-# Resolve merged leads: use canonical (destination) ID if available, otherwise use original
-df_dim_leads = df_leads_raw.alias("l").join(
-    df_merges.alias("m"),
-    col("l.lead_id") == col("m.merged_lead_id"),
-    "left"
-).select(
-    coalesce(col("m.canonical_lead_id"), col("l.lead_id")).alias("lead_key"),
-    col("l.lead_id").alias("original_lead_id"),
-    col("l.lead_name"),
-    col("l.account_name"),
-    col("l.status_id"),
-    col("l.customer_status"),
-    col("l.lead_created_date"),
-    col("l.lead_updated_date"),
-    col("l.description"),
-    col("l.organization_id"),
-    col("l.created_by_user_id"),
-    col("l.created_by_name")
-)
-
-# Keep most recent record per canonical lead (windowed deduplication)
-window_lead = Window.partitionBy("lead_key").orderBy(col("lead_updated_date").desc_nulls_last())
-df_dim_leads_final = df_dim_leads.withColumn(
+df_leads_final = df_leads_raw.withColumn(
     "row_num", row_number().over(window_lead)
 ).filter(col("row_num") == 1).drop("row_num").withColumn(
     "gold_insert_date", current_timestamp()
 )
 
-# Write to Gold
-df_dim_leads_final.write.format("delta").mode("overwrite") \
+df_leads_final.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.dim_leads")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_PROCESSED")
 
-count_leads = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_leads").count()
-print(f"✅ dim_leads: {count_leads:,} canonical leads")
+count_leads = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_PROCESSED").count()
+print(f"✅ LEADS_PROCESSED: {count_leads:,} leads")
+
+# Also create dim_lead_emails (email → lead_id mapping, NO lead_merges)
+print("\nBuilding dim_lead_emails...")
+df_emails = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.leads_raw_contacts_emails").select(
+    col("leads_raw_id").alias("lead_id"),
+    lower(trim(col("email"))).alias("email"),
+    col("type").alias("email_type"),
+    col("is_unsubscribed"),
+    col("bronze_insert_date").alias("source_insert_date")
+).filter(col("email").isNotNull() & (col("email") != ""))
+
+# Deduplicate emails — keep one per (lead_id, email)
+window_email = Window.partitionBy("lead_id", "email").orderBy(col("source_insert_date").desc_nulls_last())
+df_emails = df_emails.withColumn("row_num", row_number().over(window_email)).filter(col("row_num") == 1).drop("row_num")
+
+df_emails.write.format("delta").mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails")
+
+count_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").count()
+print(f"✅ dim_lead_emails: {count_emails:,} email mappings")
 
 # COMMAND ----------
 
 # DBTITLE 1,dim_users - User Dimension
 # ============================================================================
-# DIMENSION TABLE: dim_users
+# CLOSE_CRM_USERS_PROCESSED — Current user dimension
 # ============================================================================
-# Purpose: Deduplicated user dimension (sales reps, success managers)
-# Source: silver.close_crm_users_raw_data (already exploded from parent)
+# Spec: User ID, name, email, status, role, and user lookup mappings
 # ============================================================================
 
-print("\nBuilding dim_users...")
+print("\nBuilding CLOSE_CRM_USERS_PROCESSED...")
 
 df_users_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.close_crm_users_raw_data").select(
     col("id").alias("user_id"),
@@ -171,11 +223,11 @@ df_users_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.close_crm_users_raw_data"
     col("image"),
     col("date_created").alias("user_created_date"),
     col("date_updated").alias("user_updated_date"),
-    col("bronze_insert_date").alias("silver_insert_date")
+    col("bronze_insert_date").alias("source_insert_date")
 )
 
-# Deduplicate users - keep most recent
-window_users = Window.partitionBy("user_id").orderBy(col("silver_insert_date").desc_nulls_last())
+# Deduplicate by user_id — keep most recent by date_updated
+window_users = Window.partitionBy("user_id").orderBy(col("user_updated_date").desc_nulls_last())
 df_dim_users = df_users_raw.withColumn(
     "row_num", row_number().over(window_users)
 ).filter(col("row_num") == 1).drop("row_num").select(
@@ -191,289 +243,286 @@ df_dim_users = df_users_raw.withColumn(
     current_timestamp().alias("gold_insert_date")
 )
 
-# Write to Gold
 df_dim_users.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.dim_users")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.CLOSE_CRM_USERS_PROCESSED")
 
-count_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_users").count()
-print(f"✅ dim_users: {count_users:,} unique users")
+count_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.CLOSE_CRM_USERS_PROCESSED").count()
+print(f"✅ CLOSE_CRM_USERS_PROCESSED: {count_users:,} unique users")
 
 # COMMAND ----------
 
 # DBTITLE 1,fact_sales - Sales Transactions
 # ============================================================================
-# FACT TABLE: fact_sales
+# SALES_DETAILS — Latest qualifying sale per LEAD_ID by ACTIVITY_AT
 # ============================================================================
-# Purpose: Sales transactions with setter/closer attribution
-# Source: silver.leads_raw_opportunities (already exploded — no array to unpack)
-#
-# Key Features:
-#   ✅ Resolves merged leads to canonical IDs
-#   ✅ Joins setter/closer attribution from dim_users
-#   ✅ One record per opportunity
+# Spec: Qualifying outcomes: 7) New Sale and 8) New Sale [Custom Payment Plan]
+# Include setter/closer identity, contract value, date of sale, program.
+# Do NOT include cash collected.
+# Source: silver.lead_activites_raw_data (filtered by custom_activity_type_id)
 # ============================================================================
 
-print("\nBuilding fact_sales...")
+print("\nBuilding SALES_DETAILS...")
 
-# Load opportunities (already exploded in silver)
-df_opportunities = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.leads_raw_opportunities").select(
-    col("leads_raw_id").alias("lead_id"),
-    col("id").alias("opportunity_id"),
-    col("value").alias("contracted_value"),
-    col("value_currency").alias("currency"),
-    col("value_formatted"),
-    col("value_period"),
-    col("expected_value"),
-    col("annualized_value"),
-    col("annualized_expected_value"),
-    col("confidence"),
-    col("date_created").cast("timestamp").alias("opportunity_created_date"),
-    col("date_won").cast("timestamp").alias("date_won"),
-    col("date_lost").cast("timestamp").alias("date_lost"),
-    col("date_updated").cast("timestamp").alias("opportunity_updated_date"),
-    col("status_type").alias("sale_status"),
-    col("status_label"),
-    col("status_display_name"),
-    col("status_id"),
-    col("pipeline_id"),
-    col("pipeline_name"),
-    col("created_by").alias("setter_user_id"),
-    col("created_by_name").alias("setter_name_raw"),
-    col("user_id").alias("closer_user_id"),
-    col("user_name").alias("closer_name_raw"),
-    col("contact_id"),
-    col("contact_name"),
-    col("organization_id"),
-    col("note"),
-    col("lead_id").alias("opportunity_lead_id"),
-    col("lead_name")
+# Get the activity type IDs for qualifying sales
+sale_type_ids = [row["id"] for row in spark.table(f"{CATALOG}.{SILVER_SCHEMA}.custom_activites_raw_data")
+    .filter(col("name").isin("7) New Sale", "8) New Sale [Custom Payment Plan]"))
+    .select("id").collect()]
+print(f"  Qualifying sale type IDs: {sale_type_ids}")
+
+# Load activities filtered to qualifying sale types
+df_sales_acts = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_activites_raw_data").filter(
+    col("custom_activity_type_id").isin(sale_type_ids)
+).select(
+    col("id").alias("activity_id"),
+    col("lead_id"),
+    col("activity_at"),
+    col("date_updated"),
+    col("bronze_insert_date").alias("source_insert_date"),
+    col("custom_activity_type_id"),
+    col(CF_CLOSER).alias("closer_user_id_raw"),
+    col(CF_SETTER).alias("setter_user_id_raw"),
+    col(CF_DATE_OF_SALE).alias("date_of_sale_raw"),
+    col(CF_PROGRAM).alias("program_raw"),
+    col(CF_CONTRACT_VALUE).alias("contract_value_raw"),
+    col(CF_CONTACT_NAME).alias("contact_name_raw"),
+    col("user_id").alias("activity_user_id"),
+    col("user_name").alias("activity_user_name"),
+    col("created_by").alias("created_by_id"),
+    col("created_by_name")
 )
 
-# Resolve merged leads to canonical IDs
-# Build canonical mapping (same as dim_leads)
-df_merges = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_merges").select(
-    col("SOURCE_LEAD_ID").alias("merged_lead_id"),
-    col("DESTINATION_LEAD_ID").alias("canonical_lead_id")
-).filter(
-    col("merged_lead_id").isNotNull() & 
-    col("canonical_lead_id").isNotNull()
+# Deduplicate by activity_id — keep latest by DATE_UPDATED then INSERT_DATE
+window_sale = Window.partitionBy("activity_id").orderBy(
+    col("date_updated").desc_nulls_last(),
+    col("source_insert_date").desc_nulls_last()
 )
+df_sales_dedup = df_sales_acts.withColumn("row_num", row_number().over(window_sale)) \
+    .filter(col("row_num") == 1).drop("row_num")
 
-df_sales_canonical = df_opportunities.alias("o").join(
-    df_merges.alias("m"),
-    col("o.lead_id") == col("m.merged_lead_id"),
+# Get latest qualifying sale per LEAD_ID by ACTIVITY_AT
+window_latest_sale = Window.partitionBy("lead_id").orderBy(
+    col("activity_at").desc_nulls_last()
+)
+df_sales_latest = df_sales_dedup.withColumn("sale_rank", row_number().over(window_latest_sale)) \
+    .filter(col("sale_rank") == 1).drop("sale_rank")
+
+# Join to CLOSE_CRM_USERS_PROCESSED for setter/closer names
+df_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.CLOSE_CRM_USERS_PROCESSED")
+
+df_sales_final = df_sales_latest.alias("s").join(
+    df_users.alias("closer_u"),
+    col("s.closer_user_id_raw") == col("closer_u.user_key"),
     "left"
-).withColumn(
-    "lead_key", coalesce(col("m.canonical_lead_id"), col("o.lead_id"))
-)
-
-# Join setter details from dim_users
-df_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_users")
-df_sales_setter = df_sales_canonical.alias("s").join(
-    df_users.alias("setter"),
-    col("s.setter_user_id") == col("setter.user_key"),
+).join(
+    df_users.alias("setter_u"),
+    col("s.setter_user_id_raw") == col("setter_u.user_key"),
     "left"
 ).select(
-    col("s.*"),
-    col("setter.user_email").alias("setter_email"),
-    col("setter.user_name").alias("setter_name")
-)
-
-# Join closer details
-df_fact_sales = df_sales_setter.alias("s").join(
-    df_users.alias("closer"),
-    col("s.closer_user_id") == col("closer.user_key"),
-    "left"
-).select(
-    col("s.lead_key"),
     col("s.lead_id"),
-    col("s.opportunity_id"),
-    col("s.contracted_value"),
-    col("s.currency"),
-    col("s.value_formatted"),
-    col("s.value_period"),
-    col("s.expected_value"),
-    col("s.annualized_value"),
-    col("s.annualized_expected_value"),
-    col("s.confidence"),
-    col("s.opportunity_created_date"),
-    col("s.date_won"),
-    col("s.date_lost"),
-    col("s.opportunity_updated_date"),
-    col("s.sale_status"),
-    col("s.status_label"),
-    col("s.status_display_name"),
-    col("s.status_id"),
-    col("s.pipeline_id"),
-    col("s.pipeline_name"),
-    col("s.setter_user_id"),
-    col("s.setter_email"),
-    col("s.setter_name"),
-    col("s.closer_user_id"),
-    col("s.closer_name_raw"),
-    col("closer.user_email").alias("closer_email"),
-    col("closer.user_name").alias("closer_name"),
-    col("s.contact_id"),
-    col("s.contact_name"),
-    col("s.organization_id"),
-    col("s.note"),
-    col("s.lead_name"),
+    col("s.activity_id"),
+    col("s.activity_at").alias("sale_activity_at"),
+    col("s.date_of_sale_raw").alias("date_of_sale"),
+    col("s.program_raw").alias("program"),
+    col("s.contract_value_raw").cast("long").alias("contract_value"),
+    col("s.closer_user_id_raw").alias("closer_id"),
+    col("closer_u.user_name").alias("closer_name"),
+    col("closer_u.user_email").alias("closer_email"),
+    col("s.setter_user_id_raw").alias("setter_id"),
+    col("setter_u.user_name").alias("setter_name"),
+    col("setter_u.user_email").alias("setter_email"),
+    col("s.custom_activity_type_id"),
+    col("s.contact_name_raw").alias("contact_name"),
+    col("s.created_by_name"),
     current_timestamp().alias("gold_insert_date")
 )
 
-# Write to Gold
-df_fact_sales.write.format("delta").mode("overwrite") \
+df_sales_final.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.fact_sales")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.SALES_DETAILS")
 
-count_sales = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_sales").count()
-print(f"✅ fact_sales: {count_sales:,} opportunities")
+count_sales = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.SALES_DETAILS").count()
+print(f"✅ SALES_DETAILS: {count_sales:,} qualifying sales (latest per lead)")
 
 # COMMAND ----------
 
 # DBTITLE 1,fact_activities - Activity Transactions
 # ============================================================================
-# FACT TABLE: fact_activities
+# LEADS_ACTIVITIES_SUMMARY — Deduplicated activity records
 # ============================================================================
-# Purpose: All lead activities (calls, emails, SMS, meetings, etc.)
-# Source: silver.lead_activites_raw_data (already exploded — no array to unpack)
-#
-# Key Features:
-#   ✅ Resolves merged leads to canonical IDs
-#   ✅ Includes activity type classification
-#   ✅ Tracks direction (inbound/outbound)
-#   ✅ Tracks status (answered, missed, no-show, etc.)
+# Spec: Keep latest version of each ACTIVITY_ID, prioritizing DATE_UPDATED
+#       then INSERT_DATE. Include timestamp, type, resolved outcome, meeting
+#       fields, email/call attributes, and owner attribution.
 # ============================================================================
 
-print("\nBuilding fact_activities...")
+print("\nBuilding LEADS_ACTIVITIES_SUMMARY...")
 
-# Load activities (already exploded in silver)
 df_activities_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_activites_raw_data").select(
     col("id").alias("activity_id"),
     col("lead_id"),
     col("type").alias("activity_type"),
-    col("activity_at").cast("timestamp").alias("activity_date"),
-    col("direction").alias("activity_direction"),
-    col("status").alias("activity_status"),
-    col("created_by").alias("created_by_user_id"),
-    col("user_id").alias("assigned_user_id"),
-    col("date_created").cast("timestamp").alias("activity_created_date"),
-    col("date_updated").cast("timestamp").alias("activity_updated_date"),
+    col("activity_at").cast("timestamp").alias("activity_at"),
+    col("direction").alias("direction"),
+    col("status").alias("meeting_status"),
+    col("disposition").alias("disposition"),
+    col("subject").alias("subject"),
+    col("body_preview").alias("body_preview"),
+    col("text").alias("activity_text"),
+    col("starts_at").alias("meeting_starts_at"),
+    col("ends_at").alias("meeting_ends_at"),
+    col("outcome_id"),
+    col("outcome_reason"),
+    col("created_by").alias("created_by_id"),
+    col("created_by_name"),
+    col("user_id").alias("user_id"),
+    col("user_name"),
+    col("date_created").cast("timestamp").alias("date_created"),
+    col("date_updated").cast("timestamp").alias("date_updated"),
     col("note"),
-    col("text"),
     col("source").alias("activity_source"),
-    col("cost"),
-    col("actual_duration"),
     col("contact_id"),
-    col("bronze_insert_date")
+    col("organization_id"),
+    col("custom_activity_type_id"),
+    col("bronze_insert_date").alias("insert_date")
 )
 
-# Resolve merged leads to canonical IDs
-df_merges = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_merges").select(
-    col("SOURCE_LEAD_ID").alias("merged_lead_id"),
-    col("DESTINATION_LEAD_ID").alias("canonical_lead_id")
-).filter(
-    col("merged_lead_id").isNotNull() & 
-    col("canonical_lead_id").isNotNull()
+# Deduplicate by ACTIVITY_ID — keep latest by DATE_UPDATED then INSERT_DATE
+window_act = Window.partitionBy("activity_id").orderBy(
+    col("date_updated").desc_nulls_last(),
+    col("insert_date").desc_nulls_last()
+)
+df_activities_final = df_activities_raw.withColumn(
+    "row_num", row_number().over(window_act)
+).filter(col("row_num") == 1).drop("row_num").withColumn(
+    "gold_insert_date", current_timestamp()
 )
 
-df_fact_activities = df_activities_raw.alias("a").join(
-    df_merges.alias("m"),
-    col("a.lead_id") == col("m.merged_lead_id"),
-    "left"
-).select(
-    coalesce(col("m.canonical_lead_id"), col("a.lead_id")).alias("lead_key"),
-    col("a.lead_id"),
-    col("a.activity_id"),
-    col("a.activity_type"),
-    col("a.activity_date"),
-    col("a.activity_direction"),
-    col("a.activity_status"),
-    col("a.created_by_user_id"),
-    col("a.assigned_user_id"),
-    col("a.activity_created_date"),
-    col("a.activity_updated_date"),
-    col("a.note"),
-    col("a.text"),
-    col("a.activity_source"),
-    col("a.cost"),
-    col("a.actual_duration"),
-    col("a.contact_id"),
-    col("a.bronze_insert_date"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-# Write to Gold
-df_fact_activities.write.format("delta").mode("overwrite") \
+df_activities_final.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.fact_activities")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY")
 
-count_activities = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_activities").count()
-print(f"✅ fact_activities: {count_activities:,} activity records")
+count_activities = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY").count()
+print(f"✅ LEADS_ACTIVITIES_SUMMARY: {count_activities:,} deduplicated activities")
 
 # COMMAND ----------
 
 # DBTITLE 1,dim_lead_emails - Email to Lead Mapping
 # ============================================================================
-# DIMENSION TABLE: dim_lead_emails
+# PLATFORM USERS DEDUP — mdl_users_raw by USER_ID, latest TIMEMODIFIED
 # ============================================================================
-# Purpose: Map email addresses to canonical lead_key for email-based lookup
-# Source: silver.leads_raw_contacts_emails + lead_merges
-#
-# This enables the Customer Health Profile lookup by email:
-#   Email → dim_lead_emails → lead_key → all gold tables
+# Spec: For duplicate USER_ID records, retain the row with the latest TIMEMODIFIED.
+# Join to dim_lead_emails via EMAIL → lead_id for downstream metrics.
 # ============================================================================
 
-print("\nBuilding dim_lead_emails...")
+print("\nBuilding platform_users_dedup...")
 
-# Load contact emails from silver (already exploded from contacts array)
-df_emails_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.leads_raw_contacts_emails").select(
-    col("leads_raw_id").alias("lead_id"),
-    lower(trim(col("email"))).alias("email"),
-    col("type").alias("email_type"),
-    col("is_unsubscribed"),
+df_mdl_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.mdl_users_raw").select(
+    col("ID").alias("user_id"),
+    lower(trim(col("EMAIL"))).alias("email"),
+    col("USERNAME"),
+    col("FIRSTACCESS").cast("timestamp").alias("first_access"),
+    col("LASTACCESS").cast("timestamp").alias("last_access"),
+    col("LASTLOGIN").cast("timestamp").alias("last_login_raw"),
+    col("TIMEMODIFIED").cast("timestamp").alias("time_modified"),
+    col("TIMECREATED").cast("timestamp").alias("time_created"),
+    col("DELETED").alias("is_deleted"),
+    col("SUSPENDED").alias("is_suspended"),
+    col("FIRSTNAME"),
+    col("LASTNAME"),
+    col("bronze_insert_date")
+).filter(col("email").isNotNull() & (col("email") != ""))
+
+# Deduplicate by user_id — keep latest TIMEMODIFIED
+window_mdl = Window.partitionBy("user_id").orderBy(col("time_modified").desc_nulls_last())
+df_mdl_dedup = df_mdl_raw.withColumn("row_num", row_number().over(window_mdl)) \
+    .filter(col("row_num") == 1).drop("row_num")
+
+# Join to dim_lead_emails for lead_id lookup
+df_lead_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").select(
+    col("lead_id"), col("email")
+)
+
+df_platform = df_mdl_dedup.alias("m").join(
+    df_lead_emails.alias("le"),
+    col("m.email") == col("le.email"),
+    "left"
+).select(
+    col("le.lead_id"),
+    col("m.user_id"),
+    col("m.email"),
+    col("m.USERNAME"),
+    col("m.first_access"),
+    col("m.last_access"),
+    col("m.last_login_raw"),
+    col("m.time_modified"),
+    col("m.time_created"),
+    col("m.is_deleted"),
+    col("m.is_suspended"),
+    col("m.FIRSTNAME"),
+    col("m.LASTNAME"),
+    current_timestamp().alias("gold_insert_date")
+)
+
+df_platform.write.format("delta").mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.platform_users_dedup")
+
+count_mdl = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.platform_users_dedup").count()
+matched_mdl = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.platform_users_dedup").filter(col("lead_id").isNotNull()).count()
+print(f"✅ platform_users_dedup: {count_mdl:,} users, {matched_mdl:,} matched to CRM leads")
+
+# ============================================================================
+# STUDENT SENTIMENT DEDUP — by CHANNEL_ID, latest INSERT_DATE
+# ============================================================================
+# Spec: For duplicate CHANNEL_ID snapshots, retain latest by INSERT_DATE.
+# ============================================================================
+
+print("\nBuilding student_sentiment_dedup...")
+
+df_sent_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.student_sentiment").select(
+    col("CHANNEL_ID").alias("channel_id"),
+    col("CHANNEL_NAME").alias("channel_name"),
+    col("DAYS_SINCE_LAST_MESSAGE_FROM_STUDENT").alias("days_since_last_message_from_student"),
+    col("DAYS_SINCE_LAST_MESSAGE_FROM_TEAM").alias("days_since_last_message_from_team"),
+    col("SENTIMENTS_LAST_30_DAYS").alias("sentiments_last_30_days"),
+    col("INSERT_DATE").cast("timestamp").alias("insert_date"),
     col("bronze_insert_date")
 )
 
-# Resolve merged leads to canonical IDs
-df_merges = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.lead_merges").select(
-    col("SOURCE_LEAD_ID").alias("merged_lead_id"),
-    col("DESTINATION_LEAD_ID").alias("canonical_lead_id")
-).filter(
-    col("merged_lead_id").isNotNull() & 
-    col("canonical_lead_id").isNotNull()
+# Deduplicate by CHANNEL_ID — keep latest INSERT_DATE
+window_sent = Window.partitionBy("channel_id").orderBy(col("insert_date").desc_nulls_last())
+df_sent_dedup = df_sent_raw.withColumn("row_num", row_number().over(window_sent)) \
+    .filter(col("row_num") == 1).drop("row_num")
+
+# Try joining sentiment CHANNEL_ID → platform_users USERNAME → lead_id
+df_platform_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.platform_users_dedup").select(
+    col("lead_id"), col("USERNAME").alias("platform_username")
 )
 
-df_lead_emails = df_emails_raw.alias("e").join(
-    df_merges.alias("m"),
-    col("e.lead_id") == col("m.merged_lead_id"),
+df_sent_final = df_sent_dedup.alias("s").join(
+    df_platform_users.alias("p"),
+    col("s.channel_id") == col("p.platform_username"),
     "left"
 ).select(
-    coalesce(col("m.canonical_lead_id"), col("e.lead_id")).alias("lead_key"),
-    col("e.lead_id").alias("original_lead_id"),
-    col("e.email"),
-    col("e.email_type"),
-    col("e.is_unsubscribed"),
-    col("e.bronze_insert_date")
-).filter(
-    col("email").isNotNull() & (col("email") != "")
+    col("p.lead_id"),
+    col("s.channel_id"),
+    col("s.channel_name"),
+    col("s.days_since_last_message_from_student"),
+    col("s.days_since_last_message_from_team"),
+    col("s.sentiments_last_30_days"),
+    col("s.insert_date"),
+    current_timestamp().alias("gold_insert_date")
 )
 
-# Deduplicate (keep most recent per email)
-window_email = Window.partitionBy("email").orderBy(col("bronze_insert_date").desc_nulls_last())
-df_lead_emails = df_lead_emails.withColumn(
-    "row_num", row_number().over(window_email)
-).filter(col("row_num") == 1).drop("row_num").withColumn(
-    "gold_insert_date", current_timestamp()
-)
-
-df_lead_emails.write.format("delta").mode("overwrite") \
+df_sent_final.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.student_sentiment_dedup")
 
-count_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").count()
-print(f"✅ dim_lead_emails: {count_emails:,} email mappings")
+count_sent = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.student_sentiment_dedup").count()
+matched_sent = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.student_sentiment_dedup").filter(col("lead_id").isNotNull()).count()
+print(f"✅ student_sentiment_dedup: {count_sent:,} channels, {matched_sent:,} matched to leads")
+if matched_sent == 0:
+    print("  ⚠️  0% match — sentiment CHANNEL_ID doesn't match platform USERNAME with masked data")
 
 # COMMAND ----------
 
@@ -483,11 +532,8 @@ print(f"✅ dim_lead_emails: {count_emails:,} email mappings")
 # ============================================================================
 # Purpose: Calendly scheduled meetings joined to leads by email
 # Source: silver.calendly_scheduled_events + gold.dim_lead_emails
-#
-# Key Features:
-#   ✅ 2.9M+ Calendly events with full meeting metadata
-#   ✅ Resolved to canonical lead_key via email lookup
-#   ✅ Meeting duration, host, event type for engagement analysis
+# Dedup: For duplicate EVENT_URI, retain latest by INVITEE_UPDATED_AT,
+#        then EVENT_CREATED_AT, then INSERT_DATE
 # ============================================================================
 
 print("\nBuilding fact_calendly_meetings...")
@@ -514,9 +560,18 @@ df_calendly = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.calendly_scheduled_events"
     col("bronze_insert_date")
 ).filter(col("invitee_email").isNotNull())
 
-# Join to dim_lead_emails to get lead_key
+# Deduplicate by EVENT_URI — latest INVITEE_UPDATED_AT, then EVENT_CREATED_AT, then INSERT_TIMESTAMP
+window_cal = Window.partitionBy("event_id").orderBy(
+    col("invitee_updated_at").desc_nulls_last(),
+    col("event_created_at").desc_nulls_last(),
+    col("INSERT_TIMESTAMP").desc_nulls_last()
+)
+df_calendly = df_calendly.withColumn("row_num", row_number().over(window_cal)) \
+    .filter(col("row_num") == 1).drop("row_num")
+
+# Join to dim_lead_emails to get lead_id
 df_lead_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").select(
-    col("lead_key"), col("email")
+    col("lead_id"), col("email")
 )
 
 df_calendly_resolved = df_calendly.alias("c").join(
@@ -524,7 +579,7 @@ df_calendly_resolved = df_calendly.alias("c").join(
     lower(trim(col("c.invitee_email"))) == col("le.email"),
     "left"
 ).select(
-    col("le.lead_key"),
+    col("le.lead_id"),
     col("c.event_id"),
     col("c.event_name"),
     col("c.calendly_event_name"),
@@ -544,7 +599,7 @@ df_calendly_resolved = df_calendly.alias("c").join(
 
 # Print match statistics
 total_calendly = df_calendly_resolved.count()
-matched = df_calendly_resolved.filter(col("lead_key").isNotNull()).count()
+matched = df_calendly_resolved.filter(col("lead_id").isNotNull()).count()
 unmatched = total_calendly - matched
 print(f"  Calendly events: {total_calendly:,} total, {matched:,} matched to leads, {unmatched:,} unmatched")
 if matched == 0:
@@ -557,788 +612,415 @@ df_calendly_resolved.write.format("delta").mode("overwrite") \
     .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.fact_calendly_meetings")
 
 count_calendly = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_calendly_meetings").count()
-print(f"✅ fact_calendly_meetings: {count_calendly:,} meeting records")
+print(f"✅ fact_calendly_meetings: {count_calendly:,} deduplicated meeting records")
 
 # COMMAND ----------
 
-# DBTITLE 1,fact_payments - Payment History
+# DBTITLE 1,Step 5: Engagement Metrics
 # ============================================================================
-# FACT TABLE: fact_payments
+# STEP 5: ENGAGEMENT METRICS — All per-lead metrics per spec
 # ============================================================================
-# Purpose: Payment history joined to leads by email
-# Source: silver.all_payments + gold.dim_lead_emails
-#
-# Key Features:
-#   ✅ 53K+ payment records with amount, status, gateway
-#   ✅ Resolved to canonical lead_key via email lookup
-#   ✅ Supports account information for health profile
-# ============================================================================
-
-print("\nBuilding fact_payments...")
-
-df_payments_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.all_payments").select(
-    col("CUSTOMER_EMAIL").alias("customer_email"),
-    col("AMOUNT_RECEIVED").alias("amount_received"),
-    col("PAYMENT_DATE").cast("timestamp").alias("payment_date"),
-    col("PAYMENT_STATUS").alias("payment_status"),
-    col("PAYMENT_GATEWAY").alias("payment_gateway"),
-    col("bronze_insert_date")
-).filter(col("customer_email").isNotNull())
-
-# Join to dim_lead_emails to get lead_key
-df_lead_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").select(
-    col("lead_key"), col("email")
-)
-
-df_payments_resolved = df_payments_raw.alias("p").join(
-    df_lead_emails.alias("le"),
-    lower(trim(col("p.customer_email"))) == col("le.email"),
-    "left"
-).select(
-    col("le.lead_key"),
-    col("p.customer_email"),
-    col("p.amount_received"),
-    col("p.payment_date"),
-    col("p.payment_status"),
-    col("p.payment_gateway"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-total_payments = df_payments_resolved.count()
-matched_pay = df_payments_resolved.filter(col("lead_key").isNotNull()).count()
-print(f"  Payments: {total_payments:,} total, {matched_pay:,} matched to CRM leads, {total_payments - matched_pay:,} unmatched")
-if matched_pay == 0:
-    print("  ⚠️  WARNING: 0% match rate — CRM and payment systems use different email masking.")
-    print("      Payment emails DO match Moodle platform emails (1,231 common).")
-    print("      In production with real emails, CRM join would also produce matches.")
-
-df_payments_resolved.write.format("delta").mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.fact_payments")
-
-count_payments = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_payments").count()
-print(f"✅ fact_payments: {count_payments:,} payment records")
-
-# COMMAND ----------
-
-# DBTITLE 1,agg_platform_sentiment - Platform Engagement + Sentiment
-# ============================================================================
-# AGGREGATION TABLE: agg_platform_sentiment
-# ============================================================================
-# Purpose: Platform engagement + customer sentiment per lead
-# Source: silver.student_sentiment + gold.dim_users + gold.dim_lead_emails
-#
-# Platform Engagement Signals:
-#   ✅ DAYS_SINCE_LAST_MESSAGE_FROM_STUDENT — student's last platform activity
-#   ✅ DAYS_SINCE_LAST_MESSAGE_FROM_TEAM — team's last contact with student
-#
-# Sentiment Classification:
-#   ✅ Positive — positive feedback or active engagement
-#   ✅ Neutral — no strong signals
-#   ✅ Negative — complaints, frustration, no activity
-#
-# Join Path: student_sentiment.CHANNEL_ID → dim_users.user_key → email → dim_lead_emails.email → lead_key
+# Filters to Coaching Client leads, then calculates:
+#   DAYS_SINCE_LAST_EMAIL (with 3 text exclusions)
+#   DAYS_SINCE_LAST_MEETING (CRM text 'A new event has been scheduled.')
+#   DAYS_SINCE_LAST_MEETING_CALENDLY (EVENT_CREATED_AT)
+#   UPCOMING_MEETING_DAYS (TYPE=Meeting, MEETING_STARTS_AT >= CURRENT_DATE)
+#   DAYS_SINCE_LAST_LOGIN / LAST_LOGIN_DATE (from LASTACCESS)
+#   MISSED_CALLS_14D (unique ACTIVITY_ID, 14-day lookback)
+#   DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT (from sentiment)
+#   DAYS_SINCE_LAST_MESSAGE_FROM_TEAM_MEMBER (from sentiment)
+#   SENTIMENTS_LAST_30_DAYS (trimmed, case-insensitive)
 # ============================================================================
 
-print("\nBuilding agg_platform_sentiment...")
+print("\nBuilding agg_engagement_metrics...")
 
-# ============================================================================
-# PLATFORM ENGAGEMENT: from mdl_users_raw (Moodle LMS)
-# ============================================================================
-# mdl_users_raw provides LASTACCESS, FIRSTACCESS, LASTLOGIN — direct platform
-# engagement signals for 799K Moodle users.
-#
-# Join path to CRM leads: mdl_users_raw.EMAIL → dim_lead_emails.email → lead_key
-# NOTE: CRM and Moodle use different email masking schemes. In production with
-# real emails, this join would match. With masked data, match rate is ~0%.
-# The pipeline architecture is correct; the data limitation is due to anonymization.
-# ============================================================================
+# Start with Coaching Client leads
+df_cc = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_PROCESSED") \
+    .filter(col("customer_status") == "Coaching Client") \
+    .select(col("lead_id"))
 
-# Load Moodle platform users
-df_mdl = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.mdl_users_raw").select(
-    col("ID").alias("moodle_user_id"),
-    lower(trim(col("EMAIL"))).alias("platform_email"),
-    col("USERNAME").alias("platform_username"),
-    col("FIRSTACCESS").cast("timestamp").alias("first_access"),
-    col("LASTACCESS").cast("timestamp").alias("last_access"),
-    col("LASTLOGIN").cast("timestamp").alias("last_login"),
-    col("CURRENTLOGIN").cast("timestamp").alias("current_login"),
-    col("DELETED").alias("is_deleted"),
-    col("SUSPENDED").alias("is_suspended"),
-    col("TIMECREATED").cast("timestamp").alias("platform_account_created"),
-    col("bronze_insert_date")
-).filter(col("platform_email").isNotNull())
+cc_count = df_cc.count()
+print(f"  Coaching Client leads: {cc_count:,}")
 
-# Deduplicate — keep most recent per email
-window_mdl = Window.partitionBy("platform_email").orderBy(col("bronze_insert_date").desc_nulls_last())
-df_mdl = df_mdl.withColumn("row_num", row_number().over(window_mdl)).filter(col("row_num") == 1).drop("row_num")
+# --- 1. DAYS_SINCE_LAST_EMAIL ---
+# TYPE=Email, MEETING_STATUS=inbox, exclude 3 text patterns (case-insensitive)
+df_email = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
+    .filter(col("activity_type") == EMAIL_TYPE_FILTER) \
+    .filter(col("meeting_status") == EMAIL_STATUS_FILTER) \
+    .filter(
+        ~col("activity_text").rlike("(?i)A new event has been scheduled") &
+        ~col("activity_text").rlike("(?i)is requesting access to the following folder") &
+        ~col("activity_text").rlike("(?i)requests access to an item")
+    ) \
+    .filter(col("lead_id").isNotNull()) \
+    .groupBy("lead_id") \
+    .agg(max("activity_at").alias("_last_email_at")) \
+    .withColumn("days_since_last_email", datediff(current_date(), col("_last_email_at")))
 
-# Join to dim_lead_emails to get lead_key
-df_lead_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails").select(
-    col("lead_key"), col("email")
-)
+# --- 2. DAYS_SINCE_LAST_MEETING (CRM) ---
+# activity_text contains 'A new event has been scheduled.' (case-insensitive)
+df_crm_meeting = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
+    .filter(col("activity_text").rlike("(?i)A new event has been scheduled")) \
+    .filter(col("lead_id").isNotNull()) \
+    .groupBy("lead_id") \
+    .agg(max("activity_at").alias("_last_crm_meeting_at")) \
+    .withColumn("days_since_last_meeting", datediff(current_date(), col("_last_crm_meeting_at")))
 
-df_platform = df_mdl.alias("m").join(
-    df_lead_emails.alias("le"),
-    col("m.platform_email") == col("le.email"),
-    "left"
-).select(
-    col("le.lead_key"),
-    col("m.platform_email"),
-    col("m.moodle_user_id"),
-    col("m.last_access"),
-    col("m.first_access"),
-    col("m.last_login"),
-    col("m.is_deleted"),
-    col("m.is_suspended"),
-    col("m.platform_account_created")
-)
+# --- 3. DAYS_SINCE_LAST_MEETING_CALENDLY ---
+# Latest EVENT_CREATED_AT per lead from fact_calendly_meetings
+df_cal_meeting = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_calendly_meetings") \
+    .filter(col("lead_id").isNotNull()) \
+    .groupBy("lead_id") \
+    .agg(max("event_created_at").alias("_last_calendly_at")) \
+    .withColumn("days_since_last_meeting_calendly", datediff(current_date(), col("_last_calendly_at")))
 
-# Print match statistics
-total_mdl = df_platform.count()
-matched_mdl = df_platform.filter(col("lead_key").isNotNull()).count()
-print(f"  Platform users: {total_mdl:,} total, {matched_mdl:,} matched to CRM leads, {total_mdl - matched_mdl:,} unmatched")
-if matched_mdl == 0:
-    print("  ⚠️  WARNING: 0% match rate — CRM and Moodle use different email masking schemes.")
-    print("      In production with real emails, this join would produce matches.")
+# --- 4. UPCOMING_MEETING_DAYS ---
+# TYPE=Meeting, MEETING_STARTS_AT >= CURRENT_DATE, latest qualifying start
+df_upcoming = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
+    .filter(col("activity_type") == UPCOMING_MEETING_TYPE) \
+    .filter(col("meeting_starts_at").isNotNull()) \
+    .filter(to_date(col("meeting_starts_at")) >= current_date()) \
+    .withColumn("_meeting_days", datediff(to_date(col("meeting_starts_at")), current_date())) \
+    .groupBy("lead_id") \
+    .agg(min("_meeting_days").alias("upcoming_meeting_days"))
 
-# ============================================================================
-# SENTIMENT: from student_sentiment (communication channel sentiment)
-# ============================================================================
-# student_sentiment.CHANNEL_ID uses user_<32hex> format that doesn't match any
-# CRM or Moodle ID. Sentiment is stored as a standalone signal.
-# ============================================================================
-
-df_sentiment_raw = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.student_sentiment").select(
-    col("CHANNEL_ID").alias("channel_id"),
-    col("CHANNEL_NAME").alias("channel_name"),
-    col("DAYS_SINCE_LAST_MESSAGE_FROM_STUDENT").alias("days_since_last_student_message"),
-    col("DAYS_SINCE_LAST_MESSAGE_FROM_TEAM").alias("days_since_last_team_message"),
-    col("SENTIMENTS_LAST_30_DAYS").alias("sentiment_raw"),
-    col("INSERT_DATE"),
-    col("bronze_insert_date")
-)
-
-# Try joining sentiment CHANNEL_ID to Moodle USERNAME
-sent_mdl_join = df_sentiment_raw.alias("s").join(
-    df_mdl.alias("m"),
-    col("s.channel_id") == col("m.platform_username"),
-    "left"
-).select(
-    col("m.platform_email"),
-    col("s.channel_id"),
-    col("s.days_since_last_student_message"),
-    col("s.days_since_last_team_message"),
-    col("s.sentiment_raw"),
-    col("s.bronze_insert_date").alias("sent_bronze_date")
-).filter(col("platform_email").isNotNull())
-
-sent_matched = sent_mdl_join.count()
-print(f"  Sentiment: {df_sentiment_raw.count():,} total, {sent_matched:,} matched to Moodle users")
-
-# Build platform engagement metrics
-df_platform_final = df_platform.filter(col("lead_key").isNotNull()).withColumn(
-    "days_since_last_platform_activity",
-    datediff(current_date(), col("last_access"))
-).withColumn(
-    "platform_engaged",
-    when(col("days_since_last_platform_activity").isNull(), lit(False))
-    .when(col("days_since_last_platform_activity") <= 30, lit(True))
-    .otherwise(lit(False))
-).withColumn(
-    "platform_engagement_status",
-    when(col("days_since_last_platform_activity").isNull(), lit("Never Active"))
-    .when(col("days_since_last_platform_activity") > 90, lit("Disengaged"))
-    .when(col("days_since_last_platform_activity") > 30, lit("At Risk"))
-    .otherwise(lit("Active"))
-)
-
-# Merge sentiment if any matches exist
-if sent_matched > 0:
-    window_sent = Window.partitionBy("platform_email").orderBy(col("sent_bronze_date").desc_nulls_last())
-    df_sent_dedup = sent_mdl_join.withColumn("row_num", row_number().over(window_sent)).filter(col("row_num") == 1).drop("row_num")
-    
-    df_platform_final = df_platform_final.alias("p").join(
-        df_sent_dedup.alias("s"),
-        col("p.platform_email") == col("s.platform_email"),
-        "left"
-    ).select(
-        col("p.*"),
-        col("s.sentiment_raw")
-    )
-else:
-    df_platform_final = df_platform_final.withColumn("sentiment_raw", lit(None).cast("string"))
-
-# Classify sentiment
-df_platform_final = df_platform_final.withColumn(
-    "sentiment",
-    when(col("sentiment_raw").rlike("(?i)positive|happy|satisfied|engaged|active"), lit("Positive"))
-    .when(col("sentiment_raw").rlike("(?i)negative|frustrat|complaint|dissatisf|escalat|angry|unhappy"), lit("Negative"))
-    .when(col("sentiment_raw").rlike("(?i)neutral"), lit("Neutral"))
-    .when(col("sentiment_raw").rlike("(?i)no student activity|no activity|inactive"), lit("Negative"))
-    .otherwise(lit("Neutral"))
-).select(
-    col("lead_key"),
-    col("platform_engaged"),
-    col("platform_engagement_status"),
-    col("days_since_last_platform_activity"),
-    col("last_access").alias("last_platform_access"),
-    col("first_access"),
-    col("platform_email"),
-    col("moodle_user_id"),
-    col("sentiment"),
-    col("sentiment_raw"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-df_platform_final.write.format("delta").mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_platform_sentiment")
-
-count_sentiment = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_platform_sentiment").count()
-print(f"✅ agg_platform_sentiment: {count_sentiment:,} lead platform+sentiment records")
-
-if count_sentiment > 0:
-    print("\nSentiment Distribution:")
-    df_platform_final.groupBy("sentiment").count().orderBy(col("count").desc()).show()
-    print("\nPlatform Engagement Distribution:")
-    df_platform_final.groupBy("platform_engagement_status").count().orderBy(col("count").desc()).show()
-else:
-    print("\n⚠️  No platform engagement records matched to CRM leads.")
-    print("    Platform engagement and sentiment signals are architecturally included")
-    print("    but require unmasked email data for cross-system joins.")
-    print("\nSentiment Distribution (standalone, not joined to leads):")
-    df_sentiment_raw.groupBy("sentiment_raw").count().orderBy(col("count").desc()).show(truncate=False)
-
-# COMMAND ----------
-
-# DBTITLE 1,agg_lead_activity_summary - Activity Aggregations
-# ============================================================================
-# AGGREGATION TABLE: agg_lead_activity_summary
-# ============================================================================
-# Purpose: Summarize all activities per lead for easy analysis
-# Source: gold.fact_activities
-#
-# Metrics:
-#   ✅ Last activity dates by type (email, call, SMS, meeting)
-#   ✅ Total counts by type
-#   ✅ Directional counts (sent, received, answered, missed)
-#   ✅ Days since last activity metrics
-# ============================================================================
-
-print("\nBuilding agg_lead_activity_summary...")
-
-df_activities = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_activities")
-
-# Aggregate by lead
-df_summary = df_activities.groupBy("lead_key").agg(
-    # Last activity dates
-    max(col("activity_date")).alias("last_activity_date"),
-    max(when(col("activity_type") == "Email", col("activity_date"))).alias("last_email_date"),
-    max(when(col("activity_type") == "Call", col("activity_date"))).alias("last_call_date"),
-    max(when(col("activity_type") == "SMS", col("activity_date"))).alias("last_sms_date"),
-    max(when(col("activity_type") == "Meeting", col("activity_date"))).alias("last_meeting_date"),
-    
-    # Total counts
-    count("*").alias("total_activities"),
-    count(when(col("activity_type") == "Email", 1)).alias("email_count"),
-    count(when(col("activity_type") == "Call", 1)).alias("call_count"),
-    count(when(col("activity_type") == "SMS", 1)).alias("sms_count"),
-    count(when(col("activity_type") == "Meeting", 1)).alias("meeting_count"),
-    
-    # Directional counts
-    count(when((col("activity_type") == "Email") & (col("activity_direction") == "outbound"), 1)).alias("emails_sent"),
-    count(when((col("activity_type") == "Email") & (col("activity_direction") == "inbound"), 1)).alias("emails_received"),
-    count(when((col("activity_type") == "Call") & (col("activity_status") == "answered"), 1)).alias("calls_answered"),
-    count(when((col("activity_type") == "Call") & col("activity_status").isin("no_answer", "busy", "failed"), 1)).alias("calls_no_answer"),
-    count(when((col("activity_type") == "Meeting") & (col("activity_status") == "completed"), 1)).alias("meetings_completed"),
-    count(when((col("activity_type") == "Meeting") & (col("activity_status") == "no_show"), 1)).alias("meetings_no_show")
-).select(
-    col("lead_key"),
-    col("last_activity_date"),
-    col("last_email_date"),
-    col("last_call_date"),
-    col("last_sms_date"),
-    col("last_meeting_date"),
-    datediff(current_date(), col("last_activity_date")).alias("days_since_last_activity"),
-    datediff(current_date(), col("last_meeting_date")).alias("days_since_last_meeting"),
-    col("total_activities"),
-    col("email_count"),
-    col("call_count"),
-    col("sms_count"),
-    col("meeting_count"),
-    col("emails_sent"),
-    col("emails_received"),
-    col("calls_answered"),
-    col("calls_no_answer"),
-    col("meetings_completed"),
-    col("meetings_no_show"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-# Write to Gold
-df_summary.write.format("delta").mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_activity_summary")
-
-count_summary = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_activity_summary").count()
-print(f"✅ agg_lead_activity_summary: {count_summary:,} lead summaries")
-
-# COMMAND ----------
-
-# DBTITLE 1,agg_lead_engagement_classification - Engagement Scoring
-# ============================================================================
-# AGGREGATION TABLE: agg_lead_engagement_classification
-# ============================================================================
-# Purpose: Classify lead engagement across multiple channels
-# Source: gold.agg_lead_activity_summary
-#
-# Engagement Dimensions:
-#   1. Platform Engagement: Recent platform/LMS activity
-#   2. Meeting Engagement: Recent meetings scheduled/completed
-#   3. Communication Engagement: Recent emails/calls/messages
-#
-# Engagement Tiers:
-#   - High: Multi-channel engagement (3 dimensions)
-#   - Medium: Two channels active
-#   - Low: Single channel only
-#   - None: No recent engagement
-# ============================================================================
-
-print("\nBuilding agg_lead_engagement_classification...")
-
-df_activity = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_activity_summary")
-
-# LEFT JOIN platform sentiment for platform engagement + sentiment
-df_platform = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_platform_sentiment")
-
-df_base = df_activity.alias("a").join(
-    df_platform.alias("p"),
-    col("a.lead_key") == col("p.lead_key"),
-    "left"
-)
-
-# Calculate engagement flags (recent = last 30 days)
-df_engagement = df_base.select(
-    col("a.lead_key"),
-    col("a.days_since_last_activity"),
-    col("a.days_since_last_meeting"),
-    col("p.days_since_last_platform_activity"),
-    
-    # Communication engagement flag
-    when(col("a.days_since_last_activity") <= 30, lit(True)).otherwise(lit(False)).alias("communication_engaged"),
-    when(col("a.emails_received") > 0, lit(True)).otherwise(lit(False)).alias("has_responded"),
-    
-    # Meeting engagement flag
-    when(col("a.days_since_last_meeting") <= 30, lit(True)).otherwise(lit(False)).alias("meeting_engaged"),
-    when(col("a.meetings_completed") > 0, lit(True)).otherwise(lit(False)).alias("has_met"),
-    
-    # Platform engagement flag (from sentiment data)
-    coalesce(col("p.platform_engaged"), lit(False)).alias("platform_engaged"),
-    col("p.platform_engagement_status"),
-    
-    # Sentiment
-    col("p.sentiment"),
-    col("p.sentiment_raw"),
-    
-    # Missed engagement flags
-    col("a.calls_no_answer"),
-    col("a.meetings_no_show"),
-    
-    # Activity counts
-    col("a.total_activities"),
-    col("a.email_count"),
-    col("a.call_count"),
-    col("a.meeting_count")
-).withColumn(
-    "engagement_score",
-    (
-        when(col("communication_engaged"), 1).otherwise(0) +
-        when(col("meeting_engaged"), 1).otherwise(0) +
-        when(col("platform_engaged"), 1).otherwise(0)
-    )
-).withColumn(
-    "engagement_category",
-    when((col("communication_engaged")) & (col("meeting_engaged")) & (col("platform_engaged")), lit("Fully Engaged"))
-    .when((col("communication_engaged")) & (col("platform_engaged")) & (~col("meeting_engaged")), lit("Communication + Platform Engaged"))
-    .when((col("communication_engaged")) & (col("meeting_engaged")) & (~col("platform_engaged")), lit("Communication + Meeting Engaged"))
-    .when((~col("communication_engaged")) & (col("meeting_engaged")) & (col("platform_engaged")), lit("Platform + Meeting Engaged"))
-    .when((col("communication_engaged")) & (~col("meeting_engaged")) & (~col("platform_engaged")), lit("Communication Only"))
-    .when((~col("communication_engaged")) & (~col("meeting_engaged")) & (col("platform_engaged")), lit("Platform Only"))
-    .when((~col("communication_engaged")) & (col("meeting_engaged")) & (~col("platform_engaged")), lit("Meeting Only"))
-    .otherwise(lit("No Engagement"))
-).withColumn(
-    "engagement_tier",
-    when(col("engagement_score") == 3, lit("High"))
-    .when(col("engagement_score") == 2, lit("Medium"))
-    .when(col("engagement_score") == 1, lit("Low"))
-    .otherwise(lit("None"))
-).withColumn(
-    "engagement_status",
-    when(col("a.days_since_last_activity").isNull() & col("p.days_since_last_platform_activity").isNull(), lit("Never Engaged"))
-    .when(coalesce(col("a.days_since_last_activity"), col("p.days_since_last_platform_activity")) > 90, lit("Dormant"))
-    .when(coalesce(col("a.days_since_last_activity"), col("p.days_since_last_platform_activity")) > 30, lit("At Risk"))
-    .when(coalesce(col("a.days_since_last_activity"), col("p.days_since_last_platform_activity")) > 7, lit("Cooling"))
-    .otherwise(lit("Active"))
-).select(
-    col("lead_key"),
-    col("engagement_category"),
-    col("engagement_tier"),
-    col("engagement_status"),
-    col("engagement_score"),
-    col("communication_engaged"),
-    col("meeting_engaged"),
-    col("platform_engaged"),
-    col("platform_engagement_status"),
-    col("has_responded"),
-    col("has_met"),
-    col("sentiment"),
-    col("sentiment_raw"),
-    col("days_since_last_activity"),
-    col("days_since_last_meeting"),
-    col("days_since_last_platform_activity"),
-    col("calls_no_answer").alias("missed_calls"),
-    col("meetings_no_show"),
-    col("total_activities"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-# Write to Gold
-df_engagement.write.format("delta").mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_engagement_classification")
-
-count_engagement = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_engagement_classification").count()
-print(f"✅ agg_lead_engagement_classification: {count_engagement:,} classifications")
-
-# COMMAND ----------
-
-# DBTITLE 1,agg_customer_health_score - Health Score + Sentiment
-# ============================================================================
-# AGGREGATION TABLE: agg_customer_health_score
-# ============================================================================
-# Purpose: Calculate unified customer health score (0-100)
-# Source: gold.agg_lead_engagement_classification
-#
-# Scoring Components:
-#   1. Base Score (Engagement Tier): High=80, Medium=60, Low=40, None=20
-#   2. Activity Bonus: +10 if >20 activities, +5 if 5-20, 0 otherwise
-#   3. Missed Engagement Penalty: -5/call (max -15), -10/no-show (max -20)
-#
-# Health Bands: Good=70-100, Average=50-69, Poor=30-49, Critical=0-29
-# ============================================================================
-
-print("\nBuilding agg_customer_health_score...")
-
-df_engagement = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_engagement_classification")
-
-# Calculate health score
-df_health = df_engagement.withColumn(
-    "base_score",
-    when(col("engagement_tier") == "High", lit(80))
-    .when(col("engagement_tier") == "Medium", lit(60))
-    .when(col("engagement_tier") == "Low", lit(40))
-    .otherwise(lit(20))
-).withColumn(
-    "activity_bonus",
-    when(col("total_activities") > 20, lit(10))
-    .when(col("total_activities") >= 5, lit(5))
-    .otherwise(lit(0))
-).withColumn(
-    "missed_penalty",
-    (least(col("missed_calls") * 5, lit(15)) + least(col("meetings_no_show") * 10, lit(20)))
-).withColumn(
-    "sentiment_adjustment",
-    when(col("sentiment") == "Positive", lit(10))
-    .when(col("sentiment") == "Negative", lit(-15))
-    .otherwise(lit(0))
-).withColumn(
-    "health_score",
-    greatest(lit(0), least(lit(100), col("base_score") + col("activity_bonus") - col("missed_penalty") + col("sentiment_adjustment")))
-).withColumn(
-    "health_band",
-    when(col("health_score") >= 70, lit("Good"))
-    .when(col("health_score") >= 50, lit("Average"))
-    .when(col("health_score") >= 30, lit("Poor"))
-    .otherwise(lit("Critical"))
-).select(
-    col("lead_key"),
-    col("health_score"),
-    col("health_band"),
-    col("base_score"),
-    col("activity_bonus"),
-    col("missed_penalty"),
-    col("sentiment_adjustment"),
-    col("sentiment"),
-    col("sentiment_raw"),
-    col("engagement_category"),
-    col("engagement_tier"),
-    col("engagement_status"),
-    col("communication_engaged"),
-    col("meeting_engaged"),
-    col("platform_engaged"),
-    col("missed_calls"),
-    col("meetings_no_show"),
-    col("total_activities"),
-    current_timestamp().alias("gold_insert_date")
-)
-
-# Write to Gold
-df_health.write.format("delta").mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_customer_health_score")
-
-count_health = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_customer_health_score").count()
-print(f"✅ agg_customer_health_score: {count_health:,} health scores")
-
-# Show health band distribution
-print("\nHealth Band Distribution:")
-df_health.groupBy("health_band").count().orderBy(col("count").desc()).show()
-
-# COMMAND ----------
-
-# DBTITLE 1,mart_lead_360 - Complete Customer Health Profile
-# ============================================================================
-# MART TABLE: mart_lead_360
-# ============================================================================
-# Purpose: Complete 360-degree view of each lead combining all dimensions
-#
-# Contains:
-#   ✅ Lead attributes (dim_leads)
-#   ✅ Sales data (fact_sales — most recent sale per lead)
-#   ✅ Activity summary (agg_lead_activity_summary)
-#   ✅ Engagement classification (agg_lead_engagement_classification)
-#   ✅ Health score (agg_customer_health_score)
-#
-# This is the primary table for dashboards and reporting
-# ============================================================================
-
-print("\nBuilding mart_lead_360...")
-
-# Load all source tables
-df_leads = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_leads")
-df_lead_emails = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails")
-df_activity = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_activity_summary")
-df_engagement = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_engagement_classification")
-df_health = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_customer_health_score")
-df_platform = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_platform_sentiment")
-
-# Get most recent sale per lead
-df_sales = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_sales")
-window_sales = Window.partitionBy("lead_key").orderBy(
-    col("date_won").desc_nulls_last(),
-    col("contracted_value").desc()
-)
-df_sales_recent = df_sales.withColumn(
-    "row_num", row_number().over(window_sales)
-).filter(col("row_num") == 1).drop("row_num")
-
-# Get most recent Calendly meeting per lead
-df_calendly = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_calendly_meetings").filter(col("lead_key").isNotNull())
-window_cal = Window.partitionBy("lead_key").orderBy(col("meeting_start").desc_nulls_last())
-df_calendly_recent = df_calendly.withColumn(
-    "row_num", row_number().over(window_cal)
-).filter(col("row_num") == 1).drop("row_num").select(
-    col("lead_key").alias("cal_lead_key"),
-    col("meeting_start").alias("last_calendly_meeting"),
-    col("duration_minutes").alias("last_meeting_duration"),
-    col("event_name").alias("last_meeting_type"),
-    col("host_name").alias("last_meeting_host")
-)
-
-# Get latest payment per lead
-df_payments = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.fact_payments").filter(col("lead_key").isNotNull())
-window_pay = Window.partitionBy("lead_key").orderBy(col("payment_date").desc_nulls_last())
-df_payments_recent = df_payments.withColumn(
-    "row_num", row_number().over(window_pay)
-).filter(col("row_num") == 1).drop("row_num").select(
-    col("lead_key").alias("pay_lead_key"),
-    col("amount_received").alias("last_payment_amount"),
-    col("payment_date").alias("last_payment_date"),
-    col("payment_status").alias("last_payment_status"),
-    col("payment_gateway").alias("last_payment_gateway")
-)
-
-# Get total payments per lead
-df_payments_total = df_payments.groupBy("lead_key").agg(
-    sum("amount_received").alias("total_paid"),
-    count("*").alias("payment_count"),
-    sum(when(col("payment_status") == "succeeded", col("amount_received")).otherwise(lit(0))).alias("total_succeeded")
-).select(
-    col("lead_key").alias("paytot_lead_key"),
-    col("total_paid"),
-    col("payment_count"),
-    col("total_succeeded")
-)
-
-# Get primary email per lead (first non-unsubscribed)
-window_email = Window.partitionBy("lead_key").orderBy(
-    col("is_unsubscribed").asc(),
-    col("email").asc()
-)
-df_primary_email = df_lead_emails.withColumn(
-    "row_num", row_number().over(window_email)
-).filter(col("row_num") == 1).drop("row_num").select(
-    col("lead_key").alias("email_lead_key"),
-    col("email").alias("primary_email"),
-    col("email_type").alias("primary_email_type"),
-    col("is_unsubscribed").alias("is_email_unsubscribed")
-)
-
-# Join everything together
-df_mart = df_leads.alias("l") \
-    .join(df_primary_email.alias("em"), col("l.lead_key") == col("em.email_lead_key"), "left") \
-    .join(df_sales_recent.alias("s"), col("l.lead_key") == col("s.lead_key"), "left") \
-    .join(df_activity.alias("a"), col("l.lead_key") == col("a.lead_key"), "left") \
-    .join(df_engagement.alias("e"), col("l.lead_key") == col("e.lead_key"), "left") \
-    .join(df_health.alias("h"), col("l.lead_key") == col("h.lead_key"), "left") \
-    .join(df_platform.alias("p"), col("l.lead_key") == col("p.lead_key"), "left") \
-    .join(df_calendly_recent.alias("cal"), col("l.lead_key") == col("cal.cal_lead_key"), "left") \
-    .join(df_payments_recent.alias("pr"), col("l.lead_key") == col("pr.pay_lead_key"), "left") \
-    .join(df_payments_total.alias("pt"), col("l.lead_key") == col("pt.paytot_lead_key"), "left") \
+# --- 5. Platform: DAYS_SINCE_LAST_LOGIN / LAST_LOGIN_DATE ---
+# From platform_users_dedup.LASTACCESS (not LASTLOGIN)
+df_platform = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.platform_users_dedup") \
+    .filter(col("lead_id").isNotNull()) \
+    .filter(col("last_access").isNotNull()) \
     .select(
-        # Lead identifiers
-        col("l.lead_key"),
-        col("l.original_lead_id"),
-        col("l.lead_name"),
-        col("l.account_name"),
-        col("em.primary_email"),
-        col("em.primary_email_type"),
-        col("em.is_email_unsubscribed"),
-        
-        # Lead attributes
-        col("l.status_id"),
-        col("l.customer_status"),
-        col("l.lead_created_date"),
-        col("l.lead_updated_date"),
-        col("l.organization_id"),
-        col("l.created_by_user_id"),
-        col("l.created_by_name"),
-        col("l.description"),
-        datediff(current_date(), col("l.lead_created_date")).alias("days_since_created"),
-        datediff(current_date(), col("l.lead_updated_date")).alias("days_since_updated"),
-        
-        # Sales data (most recent opportunity)
-        coalesce(col("s.contracted_value"), lit(0)).alias("contract_value"),
-        col("s.currency"),
-        col("s.sale_status"),
-        col("s.status_label"),
-        col("s.date_won"),
-        col("s.pipeline_name"),
-        col("s.setter_name"),
-        col("s.setter_email"),
-        col("s.closer_name"),
-        col("s.closer_email"),
-        
-        # Payment data
-        col("pr.last_payment_amount"),
-        col("pr.last_payment_date"),
-        col("pr.last_payment_status"),
-        col("pr.last_payment_gateway"),
-        col("pt.total_paid"),
-        col("pt.payment_count"),
-        col("pt.total_succeeded"),
-        
-        # Activity summary (CRM)
-        col("a.last_activity_date"),
-        col("a.last_email_date"),
-        col("a.last_call_date"),
-        col("a.last_meeting_date"),
-        col("a.days_since_last_activity"),
-        col("a.days_since_last_meeting"),
-        col("a.total_activities"),
-        col("a.email_count"),
-        col("a.call_count"),
-        col("a.meeting_count"),
-        col("a.emails_sent"),
-        col("a.emails_received"),
-        col("a.calls_answered"),
-        col("a.calls_no_answer").alias("missed_calls"),
-        col("a.meetings_completed"),
-        col("a.meetings_no_show"),
-        
-        # Calendly meetings
-        col("cal.last_calendly_meeting"),
-        col("cal.last_meeting_duration"),
-        col("cal.last_meeting_type"),
-        col("cal.last_meeting_host"),
-        
-        # Platform engagement
-        col("p.days_since_last_platform_activity"),
-        col("p.platform_engagement_status"),
-        col("p.platform_email"),
-        col("p.moodle_user_id"),
-        
-        # Sentiment
-        col("p.sentiment"),
-        col("p.sentiment_raw"),
-        
-        # Engagement classification
-        col("e.engagement_category"),
-        col("e.engagement_tier"),
-        col("e.engagement_status"),
-        col("e.engagement_score"),
-        col("e.communication_engaged"),
-        col("e.meeting_engaged"),
-        col("e.platform_engaged"),
-        col("e.has_responded"),
-        col("e.has_met"),
-        
-        # Health score
-        col("h.health_score"),
-        col("h.health_band"),
-        col("h.base_score"),
-        col("h.activity_bonus"),
-        col("h.missed_penalty"),
-        col("h.sentiment_adjustment"),
-        
-        # Metadata
+        col("lead_id"),
+        to_date(col("last_access")).alias("last_login_date"),
+        datediff(current_date(), to_date(col("last_access"))).alias("days_since_last_login")
+    )
+
+# --- 6. MISSED_CALLS_14D ---
+# TYPE=Call, DIRECTION=inbound, DISPOSITION=no-answer, 14-day lookback
+df_missed = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACTIVITIES_SUMMARY") \
+    .filter(col("activity_type") == MISSED_CALL_TYPE) \
+    .filter(col("direction") == MISSED_CALL_DIRECTION) \
+    .filter(col("disposition") == MISSED_CALL_DISPOSITION) \
+    .filter(col("activity_at") >= date_sub(current_date(), MISSED_CALL_LOOKBACK_DAYS)) \
+    .filter(col("lead_id").isNotNull()) \
+    .groupBy("lead_id") \
+    .agg(countDistinct("activity_id").alias("missed_calls_14d"))
+
+# --- 7. Sentiment metrics ---
+# From student_sentiment_dedup (already deduped by CHANNEL_ID)
+df_sentiment = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.student_sentiment_dedup") \
+    .filter(col("lead_id").isNotNull()) \
+    .select(
+        col("lead_id"),
+        col("days_since_last_message_from_student").alias("days_since_last_message_from_client"),
+        col("days_since_last_message_from_team").alias("days_since_last_message_from_team_member"),
+        trim(upper(col("sentiments_last_30_days"))).alias("sentiment")
+    )
+
+# Default missing sentiment to NO_SENTIMENT
+df_sentiment = df_sentiment.withColumn(
+    "sentiment",
+    when(col("sentiment").isNull() | (col("sentiment") == ""), lit(NO_SENTIMENT))
+    .otherwise(col("sentiment"))
+)
+
+# --- Join all metrics to Coaching Client leads ---
+df_metrics = df_cc.alias("cc") \
+    .join(df_email.select("lead_id", "days_since_last_email").alias("e"), col("cc.lead_id") == col("e.lead_id"), "left") \
+    .join(df_crm_meeting.select("lead_id", "days_since_last_meeting").alias("cm"), col("cc.lead_id") == col("cm.lead_id"), "left") \
+    .join(df_cal_meeting.select("lead_id", "days_since_last_meeting_calendly").alias("clm"), col("cc.lead_id") == col("clm.lead_id"), "left") \
+    .join(df_upcoming.alias("u"), col("cc.lead_id") == col("u.lead_id"), "left") \
+    .join(df_platform.alias("p"), col("cc.lead_id") == col("p.lead_id"), "left") \
+    .join(df_missed.alias("mc"), col("cc.lead_id") == col("mc.lead_id"), "left") \
+    .join(df_sentiment.alias("s"), col("cc.lead_id") == col("s.lead_id"), "left") \
+    .select(
+        col("cc.lead_id"),
+        col("e.days_since_last_email"),
+        col("cm.days_since_last_meeting"),
+        col("clm.days_since_last_meeting_calendly"),
+        col("u.upcoming_meeting_days"),
+        col("p.last_login_date"),
+        col("p.days_since_last_login"),
+        coalesce(col("mc.missed_calls_14d"), lit(0)).alias("missed_calls_14d"),
+        col("s.days_since_last_message_from_client"),
+        col("s.days_since_last_message_from_team_member"),
+        col("s.sentiment"),
         current_timestamp().alias("gold_insert_date")
     )
 
-# Write to Gold
+df_metrics.write.format("delta").mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_metrics")
+
+count_metrics = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_metrics").count()
+print(f"✅ agg_engagement_metrics: {count_metrics:,} Coaching Client leads with metrics")
+# Print sample
+df_metrics.limit(5).toPandas().to_string()
+
+# COMMAND ----------
+
+# DBTITLE 1,Steps 6-7: Engagement Flags + Health Score
+# ============================================================================
+# STEPS 6-7: ENGAGEMENT FLAGS, PATTERN, AND HEALTH SCORE
+# ============================================================================
+# Step 6: Derive three engagement flags, then apply ordered pattern table
+# Step 7: Apply base score, missed-call adjustment, sentiment adjustment, band
+# ============================================================================
+
+print("\nBuilding agg_engagement_flags_score...")
+
+df_metrics = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_metrics")
+
+# --- Step 6: Engagement Flags ---
+# SLACK_ENGAGED_FLAG: NULL if client-message recency is NULL; 1 if <=14; else 0
+df_flags = df_metrics.withColumn(
+    "slack_engaged_flag",
+    when(col("days_since_last_message_from_client").isNull(), lit(None).cast("int"))
+    .when(col("days_since_last_message_from_client") <= COMMUNICATION_THRESHOLD, lit(1))
+    .otherwise(lit(0))
+)
+
+# PLATFORM_ENGAGED_FLAG: NULL if login recency is NULL; 1 if <=14; else 0
+df_flags = df_flags.withColumn(
+    "platform_engaged_flag",
+    when(col("days_since_last_login").isNull(), lit(None).cast("int"))
+    .when(col("days_since_last_login") <= PLATFORM_THRESHOLD, lit(1))
+    .otherwise(lit(0))
+)
+
+# MEETING_ENGAGED_FLAG: NULL if either meeting-recency source is NULL.
+# When both exist, 1 if either is <=30; otherwise 0.
+df_flags = df_flags.withColumn(
+    "meeting_engaged_flag",
+    when(
+        col("days_since_last_meeting").isNull() | col("days_since_last_meeting_calendly").isNull(),
+        lit(None).cast("int")
+    )
+    .when(
+        (col("days_since_last_meeting") <= MEETING_THRESHOLD) |
+        (col("days_since_last_meeting_calendly") <= MEETING_THRESHOLD),
+        lit(1)
+    )
+    .otherwise(lit(0))
+)
+
+# --- Engagement Pattern (ordered table per spec) ---
+# "Other" means 0 or NULL
+slack_1 = col("slack_engaged_flag") == 1
+slack_other = (col("slack_engaged_flag") == 0) | col("slack_engaged_flag").isNull()
+plat_1 = col("platform_engaged_flag") == 1
+plat_other = (col("platform_engaged_flag") == 0) | col("platform_engaged_flag").isNull()
+meet_1 = col("meeting_engaged_flag") == 1
+meet_other = (col("meeting_engaged_flag") == 0) | col("meeting_engaged_flag").isNull()
+
+df_flags = df_flags.withColumn(
+    "engagement_pattern",
+    when(slack_1 & plat_1 & meet_1, lit("SLACK + PLATFORM + MEETING"))
+    .when(slack_1 & plat_1 & meet_other, lit("SLACK + PLATFORM"))
+    .when(slack_other & plat_1 & meet_1, lit("PLATFORM + MEETING"))
+    .when(slack_1 & plat_other & meet_1, lit("SLACK + MEETING"))
+    .when(slack_1 & plat_other & meet_other, lit("SLACK ONLY"))
+    .when(slack_other & plat_1 & meet_other, lit("PLATFORM ONLY"))
+    .when(slack_other & plat_other & meet_1, lit("MEETING ONLY"))
+    .when((col("slack_engaged_flag") == 0) & (col("platform_engaged_flag") == 0) & (col("meeting_engaged_flag") == 0), lit("NO ENGAGEMENT"))
+    .when((col("slack_engaged_flag") == 0) & (col("platform_engaged_flag") == 0) & col("meeting_engaged_flag").isNull(), lit("NO ENGAGEMENT"))
+    .when(col("slack_engaged_flag").isNull() & (col("platform_engaged_flag") == 0) & (col("meeting_engaged_flag") == 0), lit("NO ENGAGEMENT"))
+    .when((col("slack_engaged_flag") == 0) & col("platform_engaged_flag").isNull() & (col("meeting_engaged_flag") == 0), lit("NO ENGAGEMENT"))
+    .otherwise(lit("NO DATA"))
+)
+
+# --- Step 7: Health Score ---
+# Base score by engagement pattern
+df_flags = df_flags.withColumn(
+    "base_score",
+    when(col("engagement_pattern") == "SLACK + PLATFORM + MEETING", lit(90))
+    .when(col("engagement_pattern") == "SLACK + PLATFORM", lit(80))
+    .when(col("engagement_pattern") == "PLATFORM + MEETING", lit(75))
+    .when(col("engagement_pattern") == "SLACK + MEETING", lit(60))
+    .when(col("engagement_pattern") == "PLATFORM ONLY", lit(50))
+    .when(col("engagement_pattern") == "MEETING ONLY", lit(40))
+    .when(col("engagement_pattern") == "SLACK ONLY", lit(30))
+    .when(col("engagement_pattern") == "NO ENGAGEMENT", lit(20))
+    .otherwise(lit(None).cast("int"))  # NO DATA → no score
+)
+
+# Missed call adjustment (NOT applied to NO DATA)
+df_flags = df_flags.withColumn(
+    "missed_call_adjustment",
+    when(col("engagement_pattern") == "NO DATA", lit(0))
+    .when(col("missed_calls_14d") == 0, lit(5))
+    .when(col("missed_calls_14d").between(1, 2), lit(0))
+    .when(col("missed_calls_14d") >= 3, lit(-15))
+    .otherwise(lit(0))
+)
+
+# Sentiment adjustment (NOT applied to NO DATA)
+df_flags = df_flags.withColumn(
+    "sentiment_adjustment",
+    when(col("engagement_pattern") == "NO DATA", lit(0))
+    .when(col("sentiment") == POSITIVE_SENTIMENT, lit(10))
+    .when(col("sentiment") == NEUTRAL_SENTIMENT, lit(5))
+    .when(col("sentiment") == NEGATIVE_SENTIMENT, lit(-25))
+    .otherwise(lit(0))
+)
+
+# FINAL_HEALTH_SCORE = base + missed_call_adj + sentiment_adj (NOT capped at 0 or 100)
+df_flags = df_flags.withColumn(
+    "final_health_score",
+    when(col("engagement_pattern") == "NO DATA", lit(None).cast("int"))
+    .otherwise(col("base_score") + col("missed_call_adjustment") + col("sentiment_adjustment"))
+)
+
+# Health band
+df_flags = df_flags.withColumn(
+    "health_band",
+    when(col("engagement_pattern") == "NO DATA", lit("NO DATA"))
+    .when(col("final_health_score") >= HEALTH_BAND_GOOD, lit("GOOD"))
+    .when(col("final_health_score") >= HEALTH_BAND_AVERAGE, lit("AVERAGE"))
+    .otherwise(lit("POOR"))
+)
+
+df_flags.write.format("delta").mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_flags_score")
+
+count_flags = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_flags_score").count()
+print(f"✅ agg_engagement_flags_score: {count_flags:,} leads")
+
+# Print pattern distribution
+print("\n  Engagement Pattern Distribution:")
+spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_flags_score") \
+    .groupBy("engagement_pattern").count().orderBy(col("count").desc()).show(truncate=False)
+
+# Print health band distribution
+print("\n  Health Band Distribution:")
+spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_flags_score") \
+    .groupBy("health_band").count().orderBy(col("count").desc()).show(truncate=False)
+
+# COMMAND ----------
+
+# DBTITLE 1,Step 8: LEADS_ACCOUNT_DETAILS_UPDATES
+# ============================================================================
+# STEP 8: LEADS_ACCOUNT_DETAILS_UPDATES — Final Customer Health Profile
+# ============================================================================
+# One current Coaching Client record per LEAD_ID.
+# Supports lookup by Coaching Client email.
+#
+# Field groups:
+#   Account & Lead: lead_id, customer_name, account_name, status, email, CSM
+#   Sales Context: sale_date, program, contract_value, setter, closer
+#   Engagement Metrics: email_recency, message_recency, meeting_recency,
+#                       upcoming_meeting, login_recency, missed_calls, sentiment
+#   Health Output: 3 flags, pattern, base_score, adjustments, final_score, band
+# ============================================================================
+
+print("\nBuilding LEADS_ACCOUNT_DETAILS_UPDATES...")
+
+# Coaching Client leads
+df_cc = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_PROCESSED") \
+    .filter(col("customer_status") == "Coaching Client")
+
+# Email lookup — deduplicate to one email per lead_id to avoid row multiplication
+df_emails_raw = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.dim_lead_emails") \
+    .select(col("lead_id"), col("email").alias("customer_email"))
+
+window_email = Window.partitionBy("lead_id").orderBy(col("customer_email"))
+df_emails = df_emails_raw.withColumn("rn", row_number().over(window_email)) \
+    .filter(col("rn") == 1).drop("rn")
+
+# Sales context
+df_sales = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.SALES_DETAILS")
+
+# Engagement flags + health score
+df_flags = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_engagement_flags_score")
+
+# CSM user info (join created_by to users for avatar)
+df_users = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.CLOSE_CRM_USERS_PROCESSED") \
+    .select(
+        col("user_key").alias("csm_user_id"),
+        col("user_name").alias("csm_name"),
+        col("user_email").alias("csm_email"),
+        col("image").alias("csm_avatar")
+    )
+
+# Join everything
+df_mart = df_cc.alias("l") \
+    .join(df_emails.alias("e"), col("l.lead_id") == col("e.lead_id"), "left") \
+    .join(df_sales.alias("s"), col("l.lead_id") == col("s.lead_id"), "left") \
+    .join(df_flags.alias("f"), col("l.lead_id") == col("f.lead_id"), "left") \
+    .join(df_users.alias("u"), col("l.created_by_user_id") == col("u.csm_user_id"), "left") \
+    .select(
+        # --- Account & Lead ---
+        col("l.lead_id"),
+        col("l.lead_name").alias("customer_name"),
+        col("l.account_name"),
+        col("l.customer_status"),
+        col("e.customer_email"),
+        col("l.created_by_user_id").alias("csm_user_id"),
+        col("u.csm_name"),
+        col("u.csm_email"),
+        col("u.csm_avatar"),
+        col("l.lead_created_date"),
+        col("l.lead_updated_date"),
+        # --- Sales Context ---
+        col("s.date_of_sale").alias("latest_sale_date"),
+        col("s.program").alias("sale_program"),
+        col("s.contract_value"),
+        col("s.setter_id"),
+        col("s.setter_name"),
+        col("s.setter_email"),
+        col("s.closer_id"),
+        col("s.closer_name"),
+        col("s.closer_email"),
+        col("s.sale_activity_at"),
+        # --- Engagement Metrics ---
+        col("f.days_since_last_email"),
+        col("f.days_since_last_meeting"),
+        col("f.days_since_last_meeting_calendly"),
+        col("f.upcoming_meeting_days"),
+        col("f.last_login_date"),
+        col("f.days_since_last_login"),
+        col("f.missed_calls_14d"),
+        col("f.days_since_last_message_from_client"),
+        col("f.days_since_last_message_from_team_member"),
+        col("f.sentiment"),
+        # --- Health Output ---
+        col("f.slack_engaged_flag"),
+        col("f.platform_engaged_flag"),
+        col("f.meeting_engaged_flag"),
+        col("f.engagement_pattern"),
+        col("f.base_score"),
+        col("f.missed_call_adjustment"),
+        col("f.sentiment_adjustment"),
+        col("f.final_health_score"),
+        col("f.health_band"),
+        current_timestamp().alias("gold_insert_date")
+    )
+
 df_mart.write.format("delta").mode("overwrite") \
     .option("overwriteSchema", "true") \
-    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.mart_lead_360")
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACCOUNT_DETAILS_UPDATES")
 
-count_mart = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.mart_lead_360").count()
-print(f"✅ mart_lead_360: {count_mart:,} complete lead records")
+count_mart = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACCOUNT_DETAILS_UPDATES").count()
+print(f"✅ LEADS_ACCOUNT_DETAILS_UPDATES: {count_mart:,} Coaching Client records")
+
+# Print health band distribution
+print("\n  Health Band Distribution:")
+spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACCOUNT_DETAILS_UPDATES") \
+    .groupBy("health_band").count().orderBy(col("count").desc()).show(truncate=False)
+
+# Print engagement pattern distribution
+print("\n  Engagement Pattern Distribution:")
+spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACCOUNT_DETAILS_UPDATES") \
+    .groupBy("engagement_pattern").count().orderBy(col("count").desc()).show(truncate=False)
+
+# Sample email lookup
+print("\n  Sample Email Lookup:")
+spark.table(f"{CATALOG}.{GOLD_SCHEMA}.LEADS_ACCOUNT_DETAILS_UPDATES") \
+    .filter(col("customer_email").isNotNull()) \
+    .select("customer_email", "customer_name", "engagement_pattern", "final_health_score", "health_band") \
+    .limit(5).show(truncate=False)
 
 print("\n" + "="*80)
-print("GOLD LAYER BUILD COMPLETE")
+print("✅ GOLD LAYER COMPLETE — All spec-compliant tables built")
 print("="*80)
-print(f"\nGold tables created:")
-for tbl in ["dim_leads", "dim_users", "dim_lead_emails", "fact_sales", "fact_activities",
-            "fact_calendly_meetings", "fact_payments",
-            "agg_lead_activity_summary", "agg_platform_sentiment", 
-            "agg_lead_engagement_classification", 
-            "agg_customer_health_score", "mart_lead_360"]:
-    cnt = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.{tbl}").count()
-    print(f"  gold.{tbl}: {cnt:,} rows")
-
-print("\n" + "="*80)
-print("ENGAGEMENT CATEGORY DISTRIBUTION")
-print("="*80)
-spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_lead_engagement_classification") \
-    .groupBy("engagement_category").count().orderBy(col("count").desc()).show(truncate=False)
-
-print("="*80)
-print("HEALTH BAND DISTRIBUTION")
-print("="*80)
-spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_customer_health_score") \
-    .groupBy("health_band").count().orderBy(col("count").desc()).show()
-
-print("="*80)
-print("SENTIMENT DISTRIBUTION")
-print("="*80)
-spark.table(f"{CATALOG}.{GOLD_SCHEMA}.agg_platform_sentiment") \
-    .groupBy("sentiment").count().orderBy(col("count").desc()).show()
-
-print("="*80)
-print("SAMPLE: Customer Health Profile (top 5 by health_score)")
-print("="*80)
-spark.table(f"{CATALOG}.{GOLD_SCHEMA}.mart_lead_360") \
-    .select("lead_key", "lead_name", "primary_email", "engagement_category",
-            "sentiment", "health_score", "health_band",
-            "communication_engaged", "meeting_engaged", "platform_engaged") \
-    .orderBy(col("health_score").desc()).limit(5).show(truncate=False)
