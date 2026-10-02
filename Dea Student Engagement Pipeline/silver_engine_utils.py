@@ -698,23 +698,44 @@ def process_table(bronze_name, silver_name=None):
 
     df_flat = parse_bronze_table(bronze_name, watermark=_CDC_WATERMARK)
     if df_flat is None:
-        # CDC found no new data — print existing silver table summary
+        # CDC found no new data — print full existing silver table details
         if _CDC_WATERMARK:
             print(f"  ✅ CDC: No new rows since {_CDC_WATERMARK}")
-            print(f"  📊 Existing silver tables:")
             try:
                 tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{SILVER_SCHEMA}").collect()
+                related = []
                 for t in tables:
                     tname = t['tableName']
                     if tname == silver_name or tname.startswith(f"{silver_name}_"):
                         try:
                             cnt = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}").count()
-                            print(f"     {tname}: {cnt:,} rows")
+                            related.append((tname, cnt))
                         except:
-                            pass
-            except:
-                pass
-            print_lineage_tree()
+                            related.append((tname, -1))
+
+                print(f"\n  📊 Existing silver tables ({len(related)}):")
+                for tname, cnt in related:
+                    print(f"     {tname}: {cnt:,} rows")
+
+                # Print physical schema and summary for each table
+                for tname, cnt in related:
+                    try:
+                        tdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}")
+                        print_physical_schema(tdf, tname)
+                        print_schema_summary(tdf, tname)
+                    except:
+                        pass
+
+                # Build lineage tree from table names
+                _lineage_tree = [(f"{pipeline}", 0, silver_name)]
+                for tname, cnt in related:
+                    if tname != silver_name:
+                        _lineage_tree.append((f"{pipeline}", 1, tname))
+
+                print_lineage_tree()
+            except Exception as e:
+                print(f"  ⚠️ Could not read existing silver tables: {str(e)[:80]}")
+
             elapsed = time.time() - start
             print(f"  ⏱️ Completed in {elapsed:.1f}s (CDC — no new data)")
             print(f"{'='*80}")
