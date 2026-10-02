@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # Silver Engine Utils
 # MAGIC
-# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/silver_engine_utils`
+# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/silver_engine_utils`
 
 # COMMAND ----------
 
@@ -36,6 +36,32 @@ _TEMP_TABLES = []
 _pipeline_counter = 0
 _lineage_tree = []  # List of (number, depth, table_name)
 _CDC_WATERMARK = None  # Set by process_table in CDC mode; read by write_silver
+
+# Pre-defined lineage trees for each pipeline (matching TOP SILVER documentation)
+# Format: (number, depth, display_name) — display_name includes "silver_" prefix for children
+LINEAGE_TREES = {
+    "leads_raw": [
+        ("1", 0, "leads_raw"),
+        ("1_1", 1, "silver_leads_raw_addresses"),
+        ("1_2", 1, "silver_leads_raw_contacts"),
+        ("1_2_1", 2, "silver_leads_raw_contacts_emails"),
+        ("1_2_2", 2, "silver_leads_raw_contacts_integration_links"),
+        ("1_2_3", 2, "silver_leads_raw_contacts_phones"),
+        ("1_2_4", 2, "silver_leads_raw_contacts_urls"),
+        ("1_3", 1, "silver_leads_raw_custom_cf_arrays"),
+        ("1_4", 1, "silver_leads_raw_integration_links"),
+        ("1_5", 1, "silver_leads_raw_opportunities"),
+        ("1_5_1", 2, "silver_leads_raw_opportunities_attachments"),
+        ("1_5_2", 2, "silver_leads_raw_opportunities_integration_links"),
+        ("1_6", 1, "silver_leads_raw_tasks"),
+        ("1_7", 1, "silver_leads_raw_custom"),
+        ("1_7_1", 2, "silver_leads_raw_custom_Add_ons"),
+        ("1_7_2", 2, "silver_leads_raw_custom_HADES_TYPE"),
+        ("1_7_3", 2, "silver_leads_raw_custom_Lead_Source"),
+        ("1_7_4", 2, "silver_leads_raw_custom_Objections_Faced"),
+        ("1_7_5", 2, "silver_leads_raw_custom_Reactivation_Campaign"),
+    ],
+}
 
 print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEMA}")
 
@@ -662,10 +688,15 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
 # ============================================================================
 
 
-def print_lineage_tree():
-    """Print the lineage tree with hierarchical numbering."""
+def print_lineage_tree(silver_name=None):
+    """Print the lineage tree with hierarchical numbering.
+    Uses pre-defined LINEAGE_TREES when available, falls back to auto-generated _lineage_tree.
+    """
     print(f"\n  📋 LINEAGE TREE:")
-    for num, depth, name in _lineage_tree:
+    tree = _lineage_tree
+    if silver_name and silver_name in LINEAGE_TREES:
+        tree = LINEAGE_TREES[silver_name]
+    for num, depth, name in tree:
         indent = "---" * depth
         print(f"  # * {indent}{num}_{name}")
 
@@ -726,13 +757,15 @@ def process_table(bronze_name, silver_name=None):
                     except:
                         pass
 
-                # Build lineage tree from table names
-                _lineage_tree = [(f"{pipeline}", 0, silver_name)]
-                for tname, cnt in related:
-                    if tname != silver_name:
-                        _lineage_tree.append((f"{pipeline}", 1, tname))
-
-                print_lineage_tree()
+                # Use pre-defined lineage tree when available, otherwise build from table names
+                if silver_name in LINEAGE_TREES:
+                    print_lineage_tree(silver_name)
+                else:
+                    _lineage_tree = [(f"{pipeline}", 0, silver_name)]
+                    for tname, cnt in related:
+                        if tname != silver_name:
+                            _lineage_tree.append((f"{pipeline}", 1, tname))
+                    print_lineage_tree()
             except Exception as e:
                 print(f"  ⚠️ Could not read existing silver tables: {str(e)[:80]}")
 
@@ -773,7 +806,7 @@ def process_table(bronze_name, silver_name=None):
             explode_to_child(df_flat, silver_name, arr, carry, depth=0, num_path=child_num, parent_pk=pk)
 
     # Print lineage tree
-    print_lineage_tree()
+    print_lineage_tree(silver_name)
 
     # Clean up temp tables
     for temp in _TEMP_TABLES:
