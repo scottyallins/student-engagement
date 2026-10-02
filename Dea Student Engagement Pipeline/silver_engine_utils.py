@@ -17,7 +17,7 @@
 
 from pyspark.sql.functions import (
     col, lit, from_json, schema_of_json, explode_outer, udf,
-    get_json_object, regexp_replace, to_json, expr
+    get_json_object, regexp_replace, to_json, expr, create_map
 )
 from pyspark.sql.types import (
     StructType, ArrayType, StringType, IntegerType, LongType
@@ -48,18 +48,17 @@ LINEAGE_TREES = {
         ("1_2_2", 2, "silver_leads_raw_contacts_integration_links"),
         ("1_2_3", 2, "silver_leads_raw_contacts_phones"),
         ("1_2_4", 2, "silver_leads_raw_contacts_urls"),
-        ("1_3", 1, "silver_leads_raw_custom_cf_arrays"),
-        ("1_4", 1, "silver_leads_raw_integration_links"),
-        ("1_5", 1, "silver_leads_raw_opportunities"),
-        ("1_5_1", 2, "silver_leads_raw_opportunities_attachments"),
-        ("1_5_2", 2, "silver_leads_raw_opportunities_integration_links"),
-        ("1_6", 1, "silver_leads_raw_tasks"),
-        ("1_7", 1, "silver_leads_raw_custom"),
-        ("1_7_1", 2, "silver_leads_raw_custom_Add_ons"),
-        ("1_7_2", 2, "silver_leads_raw_custom_HADES_TYPE"),
-        ("1_7_3", 2, "silver_leads_raw_custom_Lead_Source"),
-        ("1_7_4", 2, "silver_leads_raw_custom_Objections_Faced"),
-        ("1_7_5", 2, "silver_leads_raw_custom_Reactivation_Campaign"),
+        ("1_3", 1, "silver_leads_raw_integration_links"),
+        ("1_4", 1, "silver_leads_raw_opportunities"),
+        ("1_4_1", 2, "silver_leads_raw_opportunities_attachments"),
+        ("1_4_2", 2, "silver_leads_raw_opportunities_integration_links"),
+        ("1_5", 1, "silver_leads_raw_tasks"),
+        ("1_6", 1, "silver_leads_raw_custom"),
+        ("1_6_1", 2, "silver_leads_raw_custom_Add_ons"),
+        ("1_6_2", 2, "silver_leads_raw_custom_HADES_TYPE"),
+        ("1_6_3", 2, "silver_leads_raw_custom_Lead_Source"),
+        ("1_6_4", 2, "silver_leads_raw_custom_Objections_Faced"),
+        ("1_6_5", 2, "silver_leads_raw_custom_Reactivation_Campaign"),
     ],
 }
 
@@ -532,15 +531,15 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
 
 
 def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
-    """Extract custom struct AND custom_cf_ columns into separate child tables.
+    """Extract custom struct AND custom_cf_ columns.
 
-    THREE separate outputs (custom and custom_cf_ are TOTALLY DIFFERENT):
+    THREE outputs:
     1. _custom table: regular custom struct scalars → individual columns
-    2. _custom_arrays table: ALL custom struct arrays → ONE key-value table (custom_key + value)
-    3. _custom_cf table: ALL custom_cf_ fields → ONE EAV table (custom_field_name + custom_field_value)
+    2. Each named custom array → separate child table (via explode_to_child)
+    3. custom_fields MAP column: ALL cf_ fields → single MAP<STRING, STRING> column added to parent
 
-    custom_cf_ fields are ALL scalars. None are arrays.
-    The custom_field_name stores the full name including the custom.cf_ prefix.
+    cf_ fields are dynamic field identifiers (like user_id), NOT structural entities.
+    They never become their own tables — they stay as values in the custom_fields MAP.
     """
     # Detect cf_ from TWO sources:
     # Source 1: Top-level columns starting with "custom_cf_" (from JSON keys like "custom.cf_xxx")
@@ -575,8 +574,6 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
                 struct_scalar_fields.append((f.name, _sanitize_col_name(f.name)))
 
     custom_name = f"{parent_name}_custom"
-    cf_name = f"{parent_name}_custom_cf"
-    arrays_name = f"{parent_name}_custom_arrays"
     grandchild_idx = 0
 
     # -- 1. Build _custom table (regular scalar fields from custom struct only) --
@@ -608,67 +605,53 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
             explode_to_child(df_custom, custom_name, ca, custom_carry, depth=1, num_path=grandchild_num,
                              parent_pk=(custom_pk if custom_pk and custom_pk not in carry_cols else None))
 
-    # -- 2. Build _custom_arrays table (ALL custom struct arrays in ONE key-value table) --
+    # -- 1a. Explode each named custom array into its own table --
     if has_custom_struct and struct_array_fields:
-        array_rows = []
+        # Build carry expressions for array explosion (from original df)
+        array_carry_names = []
+        array_carry_exprs = []
+        for c in dict.fromkeys(carry_cols):
+            if c in df.columns:
+                if c == parent_pk:
+                    renamed = f"{parent_name}_{c}"
+                    array_carry_names.append(renamed)
+                    array_carry_exprs.append(col(c).alias(renamed))
+                else:
+                    array_carry_names.append(c)
+                    array_carry_exprs.append(col(c))
+
         for orig_name, safe_name in struct_array_fields:
-            row = df.select(
-                *carry,
-                lit(orig_name).alias("custom_key"),
-                explode_outer(col(f"custom.`{orig_name}`")).alias("_exploded_value")
-            ).withColumn("value", col("_exploded_value").cast("string")).drop("_exploded_value")
-            array_rows.append(row)
-        df_arrays = array_rows[0]
-        for r in array_rows[1:]:
-            df_arrays = df_arrays.unionByName(r, allowMissingColumns=True)
+            grandchild_idx += 1
+            grandchild_num = f"{num_path}_{grandchild_idx}"
+            df_one_array = df.select(*array_carry_exprs, col(f"custom.`{orig_name}`").alias(safe_name))
+            print(f"\n  📦 NAMED CUSTOM ARRAY — {custom_name}_{safe_name}")
+            explode_to_child(df_one_array, custom_name, safe_name, array_carry_names,
+                           depth=1, num_path=grandchild_num, parent_pk=parent_pk)
 
-        print(f"\n  📦 CUSTOM ARRAYS TABLE — {arrays_name}")
-        print(f"     Custom array fields: {len(struct_array_fields)}")
-        for orig, safe in struct_array_fields:
-            print(f"       {orig}")
-        print_schema_summary(df_arrays, arrays_name)
-        print_physical_schema(df_arrays, arrays_name)
-        write_silver(df_arrays, arrays_name)
-        _lineage_tree.append((num_path, 2, arrays_name))
+    # -- 2. Build custom_fields MAP column from ALL cf_ fields --
+    # cf_ fields are dynamic identifiers — they become values in a MAP, NOT separate tables
+    map_entries = []
 
-    # -- 3. Build _custom_cf table (ALL cf_ fields as EAV rows) --
-    # Collect from top-level custom_cf_ columns AND cf_ fields inside custom struct
-    all_cf = []  # (column_ref, field_name_for_eav)
-
-    # From top-level custom_cf_ columns
+    # Top-level cf_ columns (may be scalars or arrays)
     for c in top_cf_cols:
-        orig_name = c.replace("custom_cf_", "custom.cf_", 1)
-        all_cf.append((col(c), orig_name))
+        cf_key = c.replace("custom_cf_", "cf_", 1)
+        if isinstance(df.schema[c].dataType, ArrayType):
+            map_entries.extend([lit(cf_key), to_json(col(c))])
+        else:
+            map_entries.extend([lit(cf_key), col(c).cast("string")])
 
-    # From custom struct cf_ fields
+    # Custom struct cf_ fields (may be scalars or arrays)
     if has_custom_struct:
         for f_name in struct_cf_fields:
-            all_cf.append((col(f"custom.`{f_name}`"), f"custom.{f_name}"))
+            field_type = df.schema["custom"].dataType[f_name].dataType
+            if isinstance(field_type, ArrayType):
+                map_entries.extend([lit(f_name), to_json(col(f"custom.`{f_name}`"))])
+            else:
+                map_entries.extend([lit(f_name), col(f"custom.`{f_name}`").cast("string")])
 
-    if all_cf:
-        cf_rows = []
-        for col_ref, field_name in all_cf:
-            row = df.select(
-                *carry,
-                lit(field_name).alias("custom_field_name"),
-                col_ref.cast("string").alias("custom_field_value")
-            )
-            cf_rows.append(row)
-        df_cf = cf_rows[0]
-        for r in cf_rows[1:]:
-            df_cf = df_cf.unionByName(r, allowMissingColumns=True)
-        df_cf = df_cf.filter(col("custom_field_value").isNotNull())
-
-        print(f"\n  🔑 CUSTOM_CF TABLE — {cf_name} (EAV)")
-        print(f"     cf_ fields: {len(all_cf)}")
-        for col_ref, fname in all_cf[:10]:
-            print(f"       {fname}")
-        if len(all_cf) > 10:
-            print(f"       ... and {len(all_cf) - 10} more")
-        print_schema_summary(df_cf, cf_name)
-        print_physical_schema(df_cf, cf_name)
-        write_silver(df_cf, cf_name)
-        _lineage_tree.append((num_path, 3, cf_name))
+    if map_entries:
+        df = df.withColumn("custom_fields", create_map(*map_entries))
+        print(f"\n  📝 CUSTOM_FIELDS MAP — {len(map_entries) // 2} cf_ keys added to parent as MAP column")
 
     # -- Drop everything custom-related from parent --
     cols_to_drop = list(top_cf_cols)
