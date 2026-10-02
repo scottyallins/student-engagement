@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Title
 # MAGIC %md
 # MAGIC # Silver Engine Utils
@@ -37,29 +41,17 @@ _pipeline_counter = 0
 _lineage_tree = []  # List of (number, depth, table_name)
 _CDC_WATERMARK = None  # Set by process_table in CDC mode; read by write_silver
 
-# Pre-defined lineage trees for each pipeline (matching TOP SILVER documentation)
-# Format: (number, depth, display_name) — display_name includes "silver_" prefix for children
-LINEAGE_TREES = {
-    "leads_raw": [
-        ("1", 0, "leads_raw"),
-        ("1_1", 1, "silver_leads_raw_addresses"),
-        ("1_2", 1, "silver_leads_raw_contacts"),
-        ("1_2_1", 2, "silver_leads_raw_contacts_emails"),
-        ("1_2_2", 2, "silver_leads_raw_contacts_integration_links"),
-        ("1_2_3", 2, "silver_leads_raw_contacts_phones"),
-        ("1_2_4", 2, "silver_leads_raw_contacts_urls"),
-        ("1_3", 1, "silver_leads_raw_integration_links"),
-        ("1_4", 1, "silver_leads_raw_opportunities"),
-        ("1_4_1", 2, "silver_leads_raw_opportunities_attachments"),
-        ("1_4_2", 2, "silver_leads_raw_opportunities_integration_links"),
-        ("1_5", 1, "silver_leads_raw_tasks"),
-        ("1_6", 1, "silver_leads_raw_custom"),
-        ("1_6_1", 2, "silver_leads_raw_custom_Add_ons"),
-        ("1_6_2", 2, "silver_leads_raw_custom_HADES_TYPE"),
-        ("1_6_3", 2, "silver_leads_raw_custom_Lead_Source"),
-        ("1_6_4", 2, "silver_leads_raw_custom_Objections_Faced"),
-        ("1_6_5", 2, "silver_leads_raw_custom_Reactivation_Campaign"),
-    ],
+# Pipeline number mapping (fixed per pipeline, not execution-order dependent)
+PIPELINE_NUMBERS = {
+    "leads_raw": 1,
+    "lead_activites_raw": 2,
+    "close_crm_users_raw": 3,
+    "custom_activites_raw": 4,
+    "all_payments": 5,
+    "calendly_scheduled_events": 6,
+    "student_sentiment": 7,
+    "mdl_users_raw": 8,
+    "lead_merges": 9,
 }
 
 print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEMA}")
@@ -671,15 +663,74 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
 # ============================================================================
 
 
-def print_lineage_tree(silver_name=None):
-    """Print the lineage tree with hierarchical numbering.
-    Uses pre-defined LINEAGE_TREES when available, falls back to auto-generated _lineage_tree.
+def _discover_lineage_tree(silver_name, pipeline, existing_table_names):
+    """Auto-discover hierarchical lineage tree from silver table schemas.
+    
+    Two-pass discovery per table:
+    1. Schema-based: read table schema → array columns → child tables (most accurate)
+    2. Prefix-based: check for {parent}_* tables not found via schema (handles custom arrays
+       where extract_custom() explodes arrays from the original struct, not the silver table)
+    
+    Also checks for _custom tables (extracted from struct, not array).
+    Recurses into children to find grandchildren.
     """
+    tree = [(f"{pipeline}", 0, silver_name)]
+    table_set = set(existing_table_names)
+    discovered = {silver_name}
+    
+    def _discover_children(parent_table, parent_num, depth):
+        """Discover children via schema (arrays) then prefix fallback."""
+        try:
+            df = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{parent_table}")
+        except:
+            return
+        
+        _, arrays, _ = categorize_fields(df)
+        
+        # Also check for _custom table (extracted from custom struct, not an array)
+        custom_name = f"{parent_table}_custom"
+        if custom_name in table_set and custom_name not in discovered:
+            arrays.append("custom")
+        
+        child_idx = 0
+        # Pass 1: schema-based discovery (array columns → child tables)
+        for arr_col in arrays:
+            child_name = f"{parent_table}_{arr_col}"
+            if child_name not in table_set or child_name in discovered:
+                continue
+            child_idx += 1
+            child_num = f"{parent_num}_{child_idx}"
+            discovered.add(child_name)
+            tree.append((child_num, depth + 1, f"silver_{child_name}"))
+            _discover_children(child_name, child_num, depth + 1)
+        
+        # Pass 2: prefix-based fallback for tables not found via schema
+        # (handles custom array tables where arrays were in the original struct)
+        for tname in sorted(table_set):
+            if not tname.startswith(f"{parent_table}_") or tname in discovered:
+                continue
+            # Check if this is a direct child (not a grandchild via a more specific discovered table)
+            is_direct = True
+            for other in discovered:
+                # Only reject if a MORE SPECIFIC (longer) discovered table is the real parent
+                if other != parent_table and tname.startswith(f"{other}_") and len(other) > len(parent_table):
+                    is_direct = False
+                    break
+            if is_direct:
+                child_idx += 1
+                child_num = f"{parent_num}_{child_idx}"
+                discovered.add(tname)
+                tree.append((child_num, depth + 1, f"silver_{tname}"))
+                _discover_children(tname, child_num, depth + 1)
+    
+    _discover_children(silver_name, f"{pipeline}", 0)
+    return tree
+
+
+def print_lineage_tree(silver_name=None):
+    """Print the lineage tree with hierarchical numbering."""
     print(f"\n  📋 LINEAGE TREE:")
-    tree = _lineage_tree
-    if silver_name and silver_name in LINEAGE_TREES:
-        tree = LINEAGE_TREES[silver_name]
-    for num, depth, name in tree:
+    for num, depth, name in _lineage_tree:
         indent = "---" * depth
         print(f"  # * {indent}{num}_{name}")
 
@@ -688,7 +739,7 @@ def process_table(bronze_name, silver_name=None):
     """Full Bronze → Silver pipeline: parse, flatten structs, extract custom, explode arrays."""
     global _pipeline_counter, _lineage_tree, _CDC_WATERMARK
     _pipeline_counter += 1
-    pipeline = _pipeline_counter
+    pipeline = PIPELINE_NUMBERS.get(silver_name or bronze_name, _pipeline_counter)
 
     if silver_name is None:
         silver_name = bronze_name
@@ -740,15 +791,10 @@ def process_table(bronze_name, silver_name=None):
                     except:
                         pass
 
-                # Use pre-defined lineage tree when available, otherwise build from table names
-                if silver_name in LINEAGE_TREES:
-                    print_lineage_tree(silver_name)
-                else:
-                    _lineage_tree = [(f"{pipeline}", 0, silver_name)]
-                    for tname, cnt in related:
-                        if tname != silver_name:
-                            _lineage_tree.append((f"{pipeline}", 1, tname))
-                    print_lineage_tree()
+                # Auto-discover lineage tree from existing silver table schemas
+                table_names = [tname for tname, _ in related]
+                _lineage_tree = _discover_lineage_tree(silver_name, pipeline, table_names)
+                print_lineage_tree()
             except Exception as e:
                 print(f"  ⚠️ Could not read existing silver tables: {str(e)[:80]}")
 
