@@ -10,6 +10,8 @@
 # MAGIC Bronze → Silver pipeline for `close_crm_users_raw`. **2 tables**: parent + organizations.
 # MAGIC
 # MAGIC **PK**: `id` | **Source**: `crm_ingestion.bronze.close_crm_users_raw`
+# MAGIC
+# MAGIC UDF fix: `data` array now unwrapped in JSON_OBJECT path (Oct 2026).
 
 # COMMAND ----------
 

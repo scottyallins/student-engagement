@@ -115,7 +115,11 @@ def _parse_activity_final(raw):
             )
 
             try:
-                return json.dumps(json.loads(json_obj_str))
+                inner = json.loads(json_obj_str)
+                # Unwrap "data" array if present (e.g., close_crm_users_raw)
+                if isinstance(inner, dict) and "data" in inner:
+                    return json.dumps(inner["data"])
+                return json.dumps(inner)
             except (json.JSONDecodeError, TypeError):
                 return None
 
