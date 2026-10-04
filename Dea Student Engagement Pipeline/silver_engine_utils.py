@@ -203,10 +203,19 @@ def parse_bronze_table(bronze_table, watermark=None):
         print(f"  ⏭️ SKIP: Could not find valid JSON after repair")
         return None
 
-    # Merge schemas: combine multiple JSON objects into an array for a single schema_of_json call
-    # Random sampling discovers ALL keys across different rows (e.g., every custom field variant)
+    # Merge schemas: flatten individual records from all samples into one flat array
+    # This handles cases where each sample is itself a JSON array (e.g., lead_activites_raw
+    # where UDF returns [record1, record2, ...] per row). Flattening avoids ARRAY<ARRAY<...>>
+    # which schema_of_json can't merge correctly.
     json_samples = [r["raw_data_repaired"] for r in sample_rows if r["raw_data_repaired"]]
-    json_array_str = "[" + ",".join(json_samples) + "]"
+    all_records = []
+    for s in json_samples:
+        parsed_sample = json.loads(s)
+        if isinstance(parsed_sample, list):
+            all_records.extend(parsed_sample)
+        else:
+            all_records.append(parsed_sample)
+    json_array_str = json.dumps(all_records)
     try:
         raw_schema_str = df.select(schema_of_json(lit(json_array_str)).alias("s")).collect()[0]["s"]
         # If wrapped in ARRAY<...>, extract the inner STRUCT using bracket-depth matching

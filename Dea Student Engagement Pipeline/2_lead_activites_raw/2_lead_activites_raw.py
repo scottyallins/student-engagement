@@ -7,7 +7,7 @@
 # MAGIC %md
 # MAGIC # 2. PIPELINE - lead_activites_raw
 # MAGIC
-# MAGIC Bronze → Silver pipeline for `lead_activites_raw`. **20+ child/grandchild tables**: attached_call_ids, attachments, attendees, bcc, cc, calendar_event_uids, coach_legs (participation_history), conference_links, envelope (bcc, cc, from, reply_to, sender, to), integrations (artifacts, integration_data, participants), mentions, message_ids, note_mentions, opens, provider_calendar_ids, recording_history, references, send_attempts, to, users.
+# MAGIC Bronze → Silver pipeline for `lead_activites_raw`. **30 tables** (parent + 27 children + 2 grandchildren): attached_call_ids, attachments, attendees, bcc, body_text_quoted, cc, calendar_event_uids, coach_legs (participation_history), conference_links, envelope (bcc, cc, from, reply_to, sender, to), integrations (artifacts, integration_data, participants), mentions, message_ids, note_mentions, opens, provider_calendar_ids, recording_history, references, send_attempts, to, user_note_mentions, users.
 # MAGIC
 # MAGIC **PK**: `activity_id` | **Source**: `crm_ingestion.bronze.lead_activites_raw`
 
