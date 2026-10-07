@@ -14,7 +14,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Load Silver Engine
-# MAGIC %run "/Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/silver_engine_utils"
+# MAGIC %run "/Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/DEA_utils/silver_engine_utils"
 
 # COMMAND ----------
 

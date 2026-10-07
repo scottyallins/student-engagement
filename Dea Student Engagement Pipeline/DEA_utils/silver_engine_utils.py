@@ -7,7 +7,7 @@
 # MAGIC %md
 # MAGIC # Silver Engine Utils
 # MAGIC
-# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/silver_engine_utils`
+# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/DEA_utils/silver_engine_utils`
 
 # COMMAND ----------
 
@@ -21,7 +21,8 @@
 
 from pyspark.sql.functions import (
     col, lit, from_json, schema_of_json, explode_outer, udf,
-    get_json_object, regexp_replace, to_json, expr, create_map
+    get_json_object, regexp_replace, to_json, expr, create_map,
+    md5, concat_ws, coalesce
 )
 from pyspark.sql.types import (
     StructType, ArrayType, StringType, IntegerType, LongType
@@ -213,9 +214,11 @@ def parse_bronze_table(bronze_table, watermark=None):
     # which schema_of_json can't merge correctly.
     json_samples = [r["raw_data_repaired"] for r in sample_rows if r["raw_data_repaired"]]
     all_records = []
+    _udf_returns_array = False
     for s in json_samples:
         parsed_sample = json.loads(s)
         if isinstance(parsed_sample, list):
+            _udf_returns_array = True
             all_records.extend(parsed_sample)
         else:
             all_records.append(parsed_sample)
@@ -259,7 +262,8 @@ def parse_bronze_table(bronze_table, watermark=None):
         print(f"  🔍 Discovered schema (single sample, fallback): {_fb_ddl[:120]}...")
 
     # Parse (fast — reads from temp table, only from_json is computed)
-    df_parsed = df.withColumn("parsed", from_json(col("raw_data_repaired"), deduped_st))
+    _from_json_schema = ArrayType(deduped_st) if _udf_returns_array else deduped_st
+    df_parsed = df.withColumn("parsed", from_json(col("raw_data_repaired"), _from_json_schema))
     valid = df_parsed.filter(col("parsed").isNotNull()).count()
     print(f"  Parsed: {valid:,} ({valid/total*100:.1f}%)")
 
@@ -405,9 +409,29 @@ def print_physical_schema(df, label):
 # ============================================================================
 
 
+def add_record_hash(df):
+    """Add an MD5 record_hash column over all business columns.
+
+    Excludes bronze_insert_date, bronze_updated_at (metadata that changes
+    per load) and record_hash itself. The hash provides a deterministic
+    fingerprint for deduplication and change detection (spec Phase 1).
+    """
+    exclude = {"bronze_insert_date", "bronze_updated_at", "record_hash"}
+    hash_cols = [c for c in df.columns if c not in exclude]
+    if not hash_cols:
+        return df
+    return df.withColumn(
+        "record_hash",
+        md5(concat_ws("||", *[coalesce(col(c).cast("string"), lit("NULL")) for c in hash_cols]))
+    )
+
+
 def write_silver(df, table_name):
-    """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set."""
+    """Write DataFrame to silver table with MD5 record_hash. CDC mode if _CDC_WATERMARK is set."""
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
+
+    # Add MD5 hash over all business columns (spec Phase 1: dedup traceability)
+    df = add_record_hash(df)
 
     if _CDC_WATERMARK is not None:
         try:
@@ -748,8 +772,15 @@ def print_lineage_tree(silver_name=None):
         print(f"  # * {indent}{num}_{name}")
 
 
-def process_table(bronze_name, silver_name=None):
-    """Full Bronze → Silver pipeline: parse, flatten structs, extract custom, explode arrays."""
+def process_table(bronze_name, silver_name=None, only_arrays=None):
+    """Full Bronze → Silver pipeline: parse, flatten structs, extract custom, explode arrays.
+
+    Args:
+        bronze_name:  Bronze source table name
+        silver_name:  Silver target table name (defaults to bronze_name)
+        only_arrays:  List of array column names to explode. None = explode all (default).
+                      [] = don't explode any arrays. ["contacts"] = only explode contacts.
+    """
     global _pipeline_counter, _lineage_tree, _CDC_WATERMARK
     _pipeline_counter += 1
     pipeline = PIPELINE_NUMBERS.get(silver_name or bronze_name, _pipeline_counter)
@@ -838,8 +869,10 @@ def process_table(bronze_name, silver_name=None):
     print_schema_summary(df_flat, f"{silver_name} (parent)")
     write_silver(df_flat, silver_name)
 
-    # Explode arrays
+    # Explode arrays (filtered by only_arrays if specified)
     scalars, arrays, structs = categorize_fields(df_flat)
+    if only_arrays is not None:
+        arrays = [a for a in arrays if a in only_arrays]
     if arrays:
         print(f"  Arrays to explode: {arrays}")
         for arr in arrays:
