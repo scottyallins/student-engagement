@@ -7,7 +7,7 @@
 # MAGIC %md
 # MAGIC # Silver Engine Utils
 # MAGIC
-# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/Dea Student Engagement Pipeline/DEA_utils/silver_engine_utils`
+# MAGIC Shared utility functions for Bronze → Silver ingestion. Call via `%run /Users/scottsbv@gmail.com/student-engagement/utils`
 
 # COMMAND ----------
 
@@ -61,70 +61,98 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 
 # DBTITLE 1,JSON Repair UDF
 # ============================================================================
-# JSON REPAIR UDF — parse_activity_final logic 
+# JSON REPAIR UDF — one-size-fits-all JSON normalization
 # ============================================================================
-# Handles:
+# Handles ALL Close CRM table shapes:
 #   1. JSON_OBJECT wrapper → extracts + repairs inner JSON
-#   2. "data" key → returns just the data array (lead_activites path)
-#   3. Removes problematic free-text keys (description, notes, body_text, etc.)
-#   4. Converts single quotes → double quotes (preserving apostrophes in words)
-#   5. Converts Python literals (None → null)
-#   6. Returns clean JSON string ready for from_json()
+#   2. "data" key → returns just the data array
+#   3. Preserves apostrophes in words (e.g. Prospect's Name)
+#   4. Nulls problem keys (description, notes, etc.) via scan-based string match
+#   5. Converts single quotes → double quotes (delimiters only)
+#   6. Also nulls problem keys programmatically as a safety net
+#   7. Returns clean JSON string ready for from_json()
+
+
+_PROBLEM_KEYS = {"description", "notes", "body_text", "subject", "text", "note"}
+
+
+def _null_problem_keys(obj):
+    """Recursively null out free-text keys on parsed objects (not strings)."""
+    if isinstance(obj, dict):
+        for k in obj:
+            if k in _PROBLEM_KEYS:
+                obj[k] = None
+            else:
+                _null_problem_keys(obj[k])
+    elif isinstance(obj, list):
+        for item in obj:
+            _null_problem_keys(item)
+
+
+def _null_problem_keys_in_string(s):
+    """Null out problem key values in a single-quoted JSON string (before quote replacement).
+    Uses scan-based approach: finds 'key': ' then scans for closing ' followed by next key.
+    """
+    for key in _PROBLEM_KEYS:
+        marker = f"'{key}': '"
+        idx = s.find(marker)
+        while idx >= 0:
+            val_start = idx + len(marker)
+            # Find closing ' followed by next key: ', 'next_key':
+            m = re.search(r"'\s*,\s*'\w+'\s*:", s[val_start:])
+            if m:
+                closing_pos = val_start + m.start()
+                s = s[:idx] + f"'{key}': null" + s[closing_pos+1:]
+            else:
+                # Last key in object — look for ' followed by }
+                m2 = re.search(r"'\s*}", s[val_start:])
+                if m2:
+                    closing_pos = val_start + m2.start()
+                    s = s[:idx] + f"'{key}': null" + s[closing_pos+1:]
+            idx = s.find(marker, idx + len(f"'{key}': null"))
+    return s
 
 
 def _parse_activity_final(raw):
-    """Normalize Close CRM activity JSON and return a valid JSON string."""
+    """Normalize Close CRM JSON and return a valid JSON string for ALL tables."""
     if not raw:
         return None
 
     try:
         outer = json.loads(raw.strip())
 
-        # Custom-activity path: JSON_OBJECT contains a stringified payload.
+        # Custom-activity / close_crm_users path: JSON_OBJECT contains a stringified payload
         if isinstance(outer, dict) and "JSON_OBJECT" in outer:
             json_obj_str = outer["JSON_OBJECT"]
 
             if not isinstance(json_obj_str, str) or not json_obj_str:
                 return None
 
-            problem_keys = [
-                "description", "notes", "body_text",
-                "subject", "text", "note"
-            ]
-
-            for key in problem_keys:
-                pattern = rf"('{key}'):\s*'.*?'(?=\s*[,}}])"
-                json_obj_str = re.sub(
-                    pattern,
-                    r"\1: null",
-                    json_obj_str,
-                    flags=re.DOTALL
-                )
-
-            # Preserve apostrophes in words, e.g. don't.
-            json_obj_str = re.sub(
-                r"([a-zA-Z])'([a-zA-Z])",
-                r"\1APOSTROPHE\2",
-                json_obj_str
-            )
-
-            json_obj_str = (
-                json_obj_str
-                .replace("'", '"')
-                .replace("APOSTROPHE", "'")
-                .replace(": None", ": null")
-            )
-
+            # Step 1: Try parsing as-is (already valid JSON)
             try:
                 inner = json.loads(json_obj_str)
-                # Unwrap "data" array if present (e.g., close_crm_users_raw)
-                if isinstance(inner, dict) and "data" in inner:
-                    return json.dumps(inner["data"])
-                return json.dumps(inner)
             except (json.JSONDecodeError, TypeError):
-                return None
+                # Step 2: Repair single-quoted JSON
+                # 2a: Preserve apostrophes in words (e.g. Prospect's Name)
+                repaired = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROPHE\2", json_obj_str)
+                # 2b: Null out problem keys (scan-based, before quote replacement)
+                repaired = _null_problem_keys_in_string(repaired)
+                # 2c: Replace remaining single quotes with double quotes, restore apostrophes
+                repaired = repaired.replace("'", '"').replace("APOSTROPHE", "'")
+                try:
+                    inner = json.loads(repaired)
+                except (json.JSONDecodeError, TypeError):
+                    return None
 
-        # Lead-activity path: return only the data array.
+            # Step 3: Null out problem keys programmatically (safety net for already-valid JSON)
+            _null_problem_keys(inner)
+
+            # Step 4: Unwrap "data" array if present
+            if isinstance(inner, dict) and "data" in inner:
+                return json.dumps(inner["data"])
+            return json.dumps(inner)
+
+        # Lead-activity path: return only the data array
         if isinstance(outer, dict) and "data" in outer:
             return json.dumps(outer["data"])
 
@@ -171,24 +199,40 @@ def parse_bronze_table(bronze_table, watermark=None):
     if not sample_row:
         return None
 
-    # Parse + repair via UDF (handles JSON_OBJECT wrapper, single quotes, data array)
-    df = df.withColumn("raw_data_repaired", repair_json_udf(col("raw_data")))
+    # Detect if data needs UDF repair (JSON_OBJECT wrapper, data key, or single-quote delimiters)
+    _needs_repair = False
+    try:
+        _sample_parsed = json.loads(sample_row["raw_data"].strip())
+        if isinstance(_sample_parsed, dict) and ("JSON_OBJECT" in _sample_parsed or "data" in _sample_parsed):
+            _needs_repair = True
+    except (json.JSONDecodeError, TypeError):
+        # Can't parse as standard JSON — likely single-quote delimiters, needs UDF
+        _needs_repair = True
 
-    # NOTE: custom. keys are intentionally kept as nested struct fields so the
-    # custom object can be extracted into its own child table (extract_custom)
+    if _needs_repair:
+        # Parse + repair via UDF (handles JSON_OBJECT wrapper, single quotes, data array)
+        df = df.withColumn("raw_data_repaired", repair_json_udf(col("raw_data")))
 
-    # Write repaired data to temp table — UDF runs ONCE during write, then all reads are UDF-free
-    full_temp = f"{CATALOG}.{SILVER_SCHEMA}._tmp_{bronze_table}"
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
-    spark.sql(f"DROP TABLE IF EXISTS {full_temp}")
-    df.select("insert_date", "bronze_updated_at", "raw_data_repaired") \
-        .write.format("delta").mode("overwrite") \
-        .option("mergeSchema", "true") \
-        .saveAsTable(full_temp)
-    _TEMP_TABLES.append(full_temp)
+        # NOTE: custom. keys are intentionally kept as nested struct fields so the
+        # custom object can be extracted into its own child table (extract_custom)
 
-    # Read from temp table (fast — no UDF)
-    df = spark.table(full_temp)
+        # Write repaired data to temp table — UDF runs ONCE during write, then all reads are UDF-free
+        full_temp = f"{CATALOG}.{SILVER_SCHEMA}._tmp_{bronze_table}"
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
+        spark.sql(f"DROP TABLE IF EXISTS {full_temp}")
+        df.select("insert_date", "bronze_updated_at", "raw_data_repaired") \
+            .write.format("delta").mode("overwrite") \
+            .option("mergeSchema", "true") \
+            .saveAsTable(full_temp)
+        _TEMP_TABLES.append(full_temp)
+
+        # Read from temp table (fast — no UDF)
+        df = spark.table(full_temp)
+    else:
+        # Clean JSON detected — skip UDF repair and temp table, use raw_data directly
+        print(f"  ✓ Clean JSON detected — skipping UDF repair")
+        df = df.withColumn("raw_data_repaired", col("raw_data"))
+
     total = df.count()
     if total == 0:
         print(f"  ⏭️ SKIP: No data after repair")
@@ -222,9 +266,16 @@ def parse_bronze_table(bronze_table, watermark=None):
             all_records.extend(parsed_sample)
         else:
             all_records.append(parsed_sample)
-    json_array_str = json.dumps(all_records)
+    # schema_of_json returns ARRAY<STRING> for large inputs (> ~100KB).
+    # Limit to 20 records — sufficient for schema discovery and stays under the threshold.
+    _schema_records = all_records[:20] if len(all_records) > 20 else all_records
+    json_array_str = json.dumps(_schema_records)
     try:
-        raw_schema_str = df.select(schema_of_json(lit(json_array_str)).alias("s")).collect()[0]["s"]
+        raw_schema_str = spark.range(1).select(schema_of_json(lit(json_array_str)).alias("s")).collect()[0]["s"]
+        # If schema_of_json returned ARRAY<STRING> (records too large), retry with a single record
+        if raw_schema_str.upper() == "ARRAY<STRING>" and len(_schema_records) > 1:
+            json_array_str = json.dumps(all_records[:1])
+            raw_schema_str = spark.range(1).select(schema_of_json(lit(json_array_str)).alias("s")).collect()[0]["s"]
         # If wrapped in ARRAY<...>, extract the inner STRUCT using bracket-depth matching
         schema_upper = raw_schema_str.upper()
         if schema_upper.startswith("ARRAY<") and not schema_upper.startswith("ARRAY<ARRAY<"):
@@ -238,31 +289,60 @@ def parse_bronze_table(bronze_table, watermark=None):
                         raw_schema_str = raw_schema_str[6:i]
                         break
         # Parse DDL and deduplicate fields (instead of falling back to single sample)
-        _test_st = StructType.fromDDL(raw_schema_str)
-        _seen = set()
-        _unique_fields = []
-        for _f in _test_st.fields:
-            _sn = _sanitize_col_name(_f.name)
-            if _sn not in _seen:
-                _seen.add(_sn)
-                _unique_fields.append(_f)
-        # Build clean StructType with ORIGINAL field names (avoids DDL parsing issues with dots in nested field names)
-        deduped_st = StructType()
-        for _f in _unique_fields:
-            deduped_st = deduped_st.add(_f.name, _f.dataType, _f.nullable)
-        _dup_count = len(_test_st.fields) - len(_unique_fields)
-        print(f"  🔍 Discovered schema (random {len(json_samples)} samples, {len(_unique_fields)} top-level fields"
-              + (f", {_dup_count} duplicates removed" if _dup_count else "") + ")")
+        try:
+            _test_st = StructType.fromDDL(raw_schema_str)
+            _seen = set()
+            _unique_fields = []
+            for _f in _test_st.fields:
+                _sn = _sanitize_col_name(_f.name)
+                if _sn not in _seen:
+                    _seen.add(_sn)
+                    _unique_fields.append(_f)
+            # Build clean StructType with ORIGINAL field names (avoids DDL parsing issues with dots in nested field names)
+            deduped_st = StructType()
+            for _f in _unique_fields:
+                deduped_st = deduped_st.add(_f.name, _f.dataType, _f.nullable)
+        except Exception:
+            # fromDDL failed on complex nested schema — use DDL string directly
+            # (from_json accepts DDL strings, so this is safe)
+            deduped_st = raw_schema_str
     except Exception as e:
         # Fall back to single sample if merged schema has issues
         print(f"  ⚠️ Multi-sample schema failed ({str(e)[:80]}), falling back to single sample")
         sample = df.filter(col("raw_data_repaired").isNotNull()).select("raw_data_repaired").first()
-        _fb_ddl = df.select(schema_of_json(lit(sample["raw_data_repaired"])).alias("s")).collect()[0]["s"]
-        deduped_st = StructType.fromDDL(_fb_ddl)
-        print(f"  🔍 Discovered schema (single sample, fallback): {_fb_ddl[:120]}...")
+        sample_str = sample["raw_data_repaired"]
+        # Check if single sample is a JSON array (set _udf_returns_array accordingly)
+        try:
+            _sample_parsed = json.loads(sample_str)
+            if isinstance(_sample_parsed, list):
+                _udf_returns_array = True
+        except Exception:
+            pass
+        _fb_ddl = spark.range(1).select(schema_of_json(lit(sample_str)).alias("s")).collect()[0]["s"]
+        # Strip ARRAY<...> wrapper if present (same as main path)
+        _fb_upper = _fb_ddl.upper()
+        if _fb_upper.startswith("ARRAY<") and not _fb_upper.startswith("ARRAY<ARRAY<"):
+            depth = 0
+            for i, c in enumerate(_fb_ddl):
+                if c == '<':
+                    depth += 1
+                elif c == '>':
+                    depth -= 1
+                    if depth == 0:
+                        _fb_ddl = _fb_ddl[6:i]
+                        break
+        try:
+            deduped_st = StructType.fromDDL(_fb_ddl)
+        except Exception:
+            # fromDDL failed — use DDL string directly
+            deduped_st = _fb_ddl
 
     # Parse (fast — reads from temp table, only from_json is computed)
-    _from_json_schema = ArrayType(deduped_st) if _udf_returns_array else deduped_st
+    if isinstance(deduped_st, str):
+        # DDL string fallback — from_json accepts DDL strings directly
+        _from_json_schema = f"ARRAY<{deduped_st}>" if _udf_returns_array else deduped_st
+    else:
+        _from_json_schema = ArrayType(deduped_st) if _udf_returns_array else deduped_st
     df_parsed = df.withColumn("parsed", from_json(col("raw_data_repaired"), _from_json_schema))
     valid = df_parsed.filter(col("parsed").isNotNull()).count()
     print(f"  Parsed: {valid:,} ({valid/total*100:.1f}%)")
@@ -378,28 +458,28 @@ def find_pk(df):
 # COMMAND ----------
 
 # DBTITLE 1,Schema Printing
-# ============================================================================
-# SCHEMA PRINTING
-# ============================================================================
+# # ============================================================================
+# # SCHEMA PRINTING
+# # ============================================================================
 
 
-def print_schema_summary(df, label):
-    """Print schema with data types, highlighting arrays and structs."""
-    print(f"\n  📘 SCHEMA — {label}")
-    for f in df.schema.fields:
-        type_name = str(f.dataType)
-        if isinstance(f.dataType, ArrayType):
-            print(f"    🟠 ARRAY  {f.name}: {type_name}")
-        elif isinstance(f.dataType, StructType):
-            print(f"    🔵 STRUCT {f.name}: {type_name}")
-        else:
-            print(f"    🟢 {f.name}: {type_name}")
+# def print_schema_summary(df, label):
+#     """Print schema with data types, highlighting arrays and structs."""
+#     # print(f"\n  📘 SCHEMA — {label}")
+#     for f in df.schema.fields:
+#         type_name = str(f.dataType)
+#         if isinstance(f.dataType, ArrayType):
+#             print(f"    🟠 ARRAY  {f.name}: {type_name}")
+#         elif isinstance(f.dataType, StructType):
+#             print(f"    🔵 STRUCT {f.name}: {type_name}")
+#         else:
+#             print(f"    🟢 {f.name}: {type_name}")
 
 
-def print_physical_schema(df, label):
-    """Print full physical schema tree."""
-    print(f"\n  🌳 PHYSICAL SCHEMA TREE — {label}")
-    df.printSchema()
+# def print_physical_schema(df, label):
+#     """Print full physical schema tree."""
+#     print(f"\n  🌳 PHYSICAL SCHEMA TREE — {label}")
+#     df.printSchema()
 
 # COMMAND ----------
 
@@ -460,21 +540,20 @@ def write_silver(df, table_name):
     print(f"  ✅ {table_name}: {cnt:,} rows")
     return cnt
 
+
+
 # COMMAND ----------
 
 # DBTITLE 1,Array Explosion
 # ============================================================================
-# ARRAY EXPLOSION
+# ARRAY EXPLOSION (dry_run mode — prints schema without writing tables)
 # ============================================================================
 
 
-def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None):
+def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None, dry_run=False):
     """Explode an array column into a child table. Recurse on nested arrays until scalar.
 
-    parent_pk: The PK column name of the immediate parent. This is ALWAYS renamed
-    to {parent_name}_{parent_pk} in the child table so it's a clear foreign key.
-    At deeper levels, parent_pk is the child element's own PK (from struct fields),
-    not a carried FK from above — so only the immediate parent's PK gets renamed.
+    When dry_run=True: prints the child table name and columns without writing.
     """
     child_name = f"{parent_name}_{array_col}"
 
@@ -493,16 +572,14 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
         carry = []
         for c in dict.fromkeys(carry_cols):
             if c in df.columns and c != array_col:
-                # Rename parent's PK to {parent_name}_{pk} — always, not just on collision
                 if c in element_field_names or c == parent_pk:
                     carry.append(col(c).alias(f"{parent_name}_{c}"))
                 else:
                     carry.append(col(c))
         element_fields = [col(f"_element.`{f.name}`").alias(safe) for f, safe in zip(element_type.fields, elem_names)]
         df_child = df_child.select(*carry, *element_fields)
-        print(f"  {'  '*depth}📦 {array_col}: array of objects — extracted {len(element_type.fields)} fields")
     else:
-        element_pk = None  # Scalar arrays have no struct PK
+        element_pk = None
         carry = []
         for c in dict.fromkeys(carry_cols):
             if c in df.columns and c != array_col:
@@ -511,19 +588,19 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
                 else:
                     carry.append(col(c))
         df_child = df_child.select(*carry, col("_element").alias(array_col))
-        print(f"  {'  '*depth}📦 {array_col}: array of scalars")
 
     # Flatten any structs from the explosion (keep custom for separate extraction)
     df_child = flatten_structs(df_child, skip_custom=True)
 
-    print_schema_summary(df_child, f"{child_name} (depth {depth})")
-    print_physical_schema(df_child, child_name)
+    if dry_run:
+        indent = "    " * (depth + 1)
+        print(f"{indent}📦 {child_name} ({len(df_child.columns)} cols): {df_child.columns}")
+    else:
+        write_silver(df_child, child_name)
 
-    write_silver(df_child, child_name)
     _lineage_tree.append((num_path, depth + 1, child_name))
 
-    # Build carry for downstream tables: original carry_cols that survived,
-    # PLUS parent-prefixed columns (renamed FKs), PLUS child's own PK
+    # Build carry for downstream tables
     child_pk = find_pk(df_child)
     child_carry = list(dict.fromkeys(
         [c for c in carry_cols if c in df_child.columns] +
@@ -534,7 +611,7 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
     has_child_cf = any(c.startswith("custom_cf_") for c in df_child.columns)
     if has_child_custom or has_child_cf:
         custom_num = f"{num_path}_0"
-        df_child = extract_custom(df_child, child_name, child_carry, custom_num, parent_pk=element_pk)
+        df_child = extract_custom(df_child, child_name, child_carry, custom_num, parent_pk=element_pk, dry_run=dry_run)
 
     # Recurse on nested arrays
     _, child_arrays, _ = categorize_fields(df_child)
@@ -549,32 +626,24 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
     for ca in child_arrays:
         grandchild_idx += 1
         grandchild_num = f"{num_path}_{grandchild_idx}"
-        explode_to_child(df_child, child_name, ca, new_carry, depth + 1, grandchild_num, parent_pk=element_pk)
+        explode_to_child(df_child, child_name, ca, new_carry, depth + 1, grandchild_num, parent_pk=element_pk, dry_run=dry_run)
 
 # COMMAND ----------
 
 # DBTITLE 1,Custom Field Extraction
 # ============================================================================
-# CUSTOM FIELD EXTRACTION
+# CUSTOM FIELD EXTRACTION (dry_run — prints child tables without writing)
 # ============================================================================
 
 
-def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
+def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_run=False):
     """Extract custom struct AND custom_cf_ columns.
 
-    THREE outputs:
-    1. _custom table: regular custom struct scalars → individual columns
-    2. Each named custom array → separate child table (via explode_to_child)
-    3. custom_fields MAP column: ALL cf_ fields → single MAP<STRING, STRING> column added to parent
-
-    cf_ fields are dynamic field identifiers (like user_id), NOT structural entities.
-    They never become their own tables — they stay as values in the custom_fields MAP.
+    When dry_run=True: prints _custom and named custom array table info without writing.
+    The custom_fields MAP is always built on the parent regardless of dry_run.
     """
     # Detect cf_ from TWO sources:
-    # Source 1: Top-level columns starting with "custom_cf_" (from JSON keys like "custom.cf_xxx")
     top_cf_cols = [c for c in df.columns if c.startswith("custom_cf_")]
-
-    # Source 2: cf_ fields inside the custom struct
     has_custom_struct = "custom" in df.columns and isinstance(df.schema["custom"].dataType, StructType)
 
     if not has_custom_struct and not top_cf_cols:
@@ -613,11 +682,11 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
         df_custom = df.select(*select_exprs)
         df_custom = flatten_structs(df_custom, skip_custom=False)
 
-        print(f"\n  📦 CUSTOM TABLE — {custom_name}")
-        print(f"     Regular custom scalar fields: {len(struct_scalar_fields)}")
-        print_schema_summary(df_custom, custom_name)
-        print_physical_schema(df_custom, custom_name)
-        write_silver(df_custom, custom_name)
+        if dry_run:
+            print(f"    📦 {custom_name} ({len(df_custom.columns)} cols): {df_custom.columns}")
+        else:
+            print(f"\n  📦 CUSTOM TABLE — {custom_name}")
+            write_silver(df_custom, custom_name)
         _lineage_tree.append((num_path, 1, custom_name))
 
         # Explode arrays that survived flatten in the custom table
@@ -632,11 +701,11 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
             grandchild_idx += 1
             grandchild_num = f"{num_path}_{grandchild_idx}"
             explode_to_child(df_custom, custom_name, ca, custom_carry, depth=1, num_path=grandchild_num,
-                             parent_pk=(custom_pk if custom_pk and custom_pk not in carry_cols else None))
+                             parent_pk=(custom_pk if custom_pk and custom_pk not in carry_cols else None),
+                             dry_run=dry_run)
 
     # -- 1a. Explode each named custom array into its own table --
     if has_custom_struct and struct_array_fields:
-        # Build carry expressions for array explosion (from original df)
         array_carry_names = []
         array_carry_exprs = []
         for c in dict.fromkeys(carry_cols):
@@ -653,15 +722,13 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
             grandchild_idx += 1
             grandchild_num = f"{num_path}_{grandchild_idx}"
             df_one_array = df.select(*array_carry_exprs, col(f"custom.`{orig_name}`").alias(safe_name))
-            print(f"\n  📦 NAMED CUSTOM ARRAY — {custom_name}_{safe_name}")
+            print(f"    📦 NAMED CUSTOM ARRAY — {custom_name}_{safe_name}")
             explode_to_child(df_one_array, custom_name, safe_name, array_carry_names,
-                           depth=1, num_path=grandchild_num, parent_pk=parent_pk)
+                           depth=1, num_path=grandchild_num, parent_pk=parent_pk, dry_run=dry_run)
 
     # -- 2. Build custom_fields MAP column from ALL cf_ fields --
-    # cf_ fields are dynamic identifiers — they become values in a MAP, NOT separate tables
     map_entries = []
 
-    # Top-level cf_ columns (may be scalars or arrays)
     for c in top_cf_cols:
         cf_key = c.replace("custom_cf_", "cf_", 1)
         if isinstance(df.schema[c].dataType, ArrayType):
@@ -669,7 +736,6 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
         else:
             map_entries.extend([lit(cf_key), col(c).cast("string")])
 
-    # Custom struct cf_ fields (may be scalars or arrays)
     if has_custom_struct:
         for f_name in struct_cf_fields:
             field_type = df.schema["custom"].dataType[f_name].dataType
@@ -680,7 +746,7 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
 
     if map_entries:
         df = df.withColumn("custom_fields", create_map(*map_entries))
-        print(f"\n  📝 CUSTOM_FIELDS MAP — {len(map_entries) // 2} cf_ keys added to parent as MAP column")
+        print(f"  📝 custom_fields MAP — {len(map_entries) // 2} cf_ keys added to parent")
 
     # -- Drop everything custom-related from parent --
     cols_to_drop = list(top_cf_cols)
@@ -703,13 +769,8 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None):
 def _discover_lineage_tree(silver_name, pipeline, existing_table_names):
     """Auto-discover hierarchical lineage tree from silver table schemas.
     
-    Two-pass discovery per table:
-    1. Schema-based: read table schema → array columns → child tables (most accurate)
-    2. Prefix-based: check for {parent}_* tables not found via schema (handles custom arrays
-       where extract_custom() explodes arrays from the original struct, not the silver table)
-    
-    Also checks for _custom tables (extracted from struct, not array).
-    Recurses into children to find grandchildren.
+    NOTE: Child table creation runs in dry_run mode — lineage is discovered and printed
+    but child tables are not written. This function is used for CDC no-new-data path.
     """
     tree = [(f"{pipeline}", 0, silver_name)]
     table_set = set(existing_table_names)
@@ -773,12 +834,13 @@ def print_lineage_tree(silver_name=None):
 
 
 def process_table(bronze_name, silver_name=None, only_arrays=None):
-    """Full Bronze → Silver pipeline: parse, flatten structs, extract custom, explode arrays.
+    """Full Bronze → Silver pipeline: parse, flatten structs, write parent table.
+    Child tables are discovered and printed (dry_run) but NOT written.
 
     Args:
         bronze_name:  Bronze source table name
         silver_name:  Silver target table name (defaults to bronze_name)
-        only_arrays:  List of array column names to explode. None = explode all (default).
+        only_arrays:  List of array column names to explode. None = all (default).
                       [] = don't explode any arrays. ["contacts"] = only explode contacts.
     """
     global _pipeline_counter, _lineage_tree, _CDC_WATERMARK
@@ -830,8 +892,8 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
                 for tname, cnt in related:
                     try:
                         tdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}")
-                        print_physical_schema(tdf, tname)
-                        print_schema_summary(tdf, tname)
+                        # print_physical_schema(tdf, tname)
+                        # print_schema_summary(tdf, tname)
                     except:
                         pass
 
@@ -848,37 +910,37 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
         _CDC_WATERMARK = None
         return
 
-    # Flatten structs (keep custom for separate extraction)
+    # Flatten structs (keep custom struct as-is on parent)
     df_flat = flatten_structs(df_flat, skip_custom=True)
 
-    # Find PK for carry
+    # Find PK (carry was used for child tables — retained for re-enablement)
     pk = find_pk(df_flat)
     carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
 
-    # Extract custom as child table if present (struct or flat custom.cf_ columns)
+    # Extract custom fields into MAP + print potential _custom child tables (dry_run)
     child_idx = 0
     has_custom = "custom" in df_flat.columns and isinstance(df_flat.schema["custom"].dataType, StructType)
     has_custom_cf = any(c.startswith("custom_cf_") for c in df_flat.columns)
     if has_custom or has_custom_cf:
         child_idx += 1
         custom_num = f"{pipeline}_{child_idx}"
-        df_flat = extract_custom(df_flat, silver_name, carry, custom_num, parent_pk=pk)
+        df_flat = extract_custom(df_flat, silver_name, carry, custom_num, parent_pk=pk, dry_run=True)
 
-    # Print physical schema tree and summary for parent (after custom removal)
-    print_physical_schema(df_flat, silver_name)
-    print_schema_summary(df_flat, f"{silver_name} (parent)")
+    # Print physical schema tree and summary for parent
+    # print_physical_schema(df_flat, silver_name)
+    # print_schema_summary(df_flat, f"{silver_name} (parent)")
     write_silver(df_flat, silver_name)
 
-    # Explode arrays (filtered by only_arrays if specified)
+    # Explode arrays (dry_run — print schema without writing child tables)
     scalars, arrays, structs = categorize_fields(df_flat)
     if only_arrays is not None:
         arrays = [a for a in arrays if a in only_arrays]
     if arrays:
-        print(f"  Arrays to explode: {arrays}")
+        print(f"\n  🔍 DRY RUN — potential child tables (not written):")
         for arr in arrays:
             child_idx += 1
             child_num = f"{pipeline}_{child_idx}"
-            explode_to_child(df_flat, silver_name, arr, carry, depth=0, num_path=child_num, parent_pk=pk)
+            explode_to_child(df_flat, silver_name, arr, carry, depth=0, num_path=child_num, parent_pk=pk, dry_run=True)
 
     # Print lineage tree
     print_lineage_tree(silver_name)

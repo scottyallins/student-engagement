@@ -65,6 +65,7 @@ Step 2: 1_Bronze/Bronze_ingestion
             | Creates: 9 Bronze Delta tables
             v
 Step 3: 2_Silver/leads_processed              <- Reads: bronze.leads_raw
+
 Step 4: 2_Silver/close_crm_users_processed     <- Reads: bronze.close_crm_users_raw
 Step 5: 2_Silver/leads_activities_summary      <- Reads: bronze.lead_activites_raw, custom_activites_raw, close_crm_users_raw
             | Creates: 3 Silver Delta tables
