@@ -873,32 +873,24 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
         if _CDC_WATERMARK:
             print(f"  ✅ CDC: No new rows since {_CDC_WATERMARK}")
             try:
-                tables = spark.sql(f"SHOW TABLES IN {CATALOG}.{SILVER_SCHEMA}").collect()
+                all_tables = spark.catalog.listTables(f"{CATALOG}.{SILVER_SCHEMA}")
                 related = []
-                for t in tables:
-                    tname = t['tableName']
+                for t in all_tables:
+                    tname = t.name
                     if tname == silver_name or tname.startswith(f"{silver_name}_"):
                         try:
-                            cnt = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}").count()
-                            related.append((tname, cnt))
+                            tdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}")
+                            cnt = tdf.count()
+                            related.append((tname, cnt, tdf.columns))
                         except:
-                            related.append((tname, -1))
+                            related.append((tname, -1, []))
 
                 print(f"\n  📊 Existing silver tables ({len(related)}):")
-                for tname, cnt in related:
-                    print(f"     {tname}: {cnt:,} rows")
-
-                # Print physical schema and summary for each table
-                for tname, cnt in related:
-                    try:
-                        tdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}")
-                        # print_physical_schema(tdf, tname)
-                        # print_schema_summary(tdf, tname)
-                    except:
-                        pass
+                for tname, cnt, cols in related:
+                    print(f"     📦 {tname} ({len(cols)} cols, {cnt:,} rows): {cols}")
 
                 # Auto-discover lineage tree from existing silver table schemas
-                table_names = [tname for tname, _ in related]
+                table_names = [tname for tname, _, _ in related]
                 _lineage_tree = _discover_lineage_tree(silver_name, pipeline, table_names)
                 print_lineage_tree()
             except Exception as e:
