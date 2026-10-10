@@ -8,11 +8,11 @@ A Databricks Medallion Architecture (Bronze → Silver → Gold) pipeline that t
 
 The pipeline uses a three-layer medallion architecture:
 
-**Bronze** — Raw data landing zone. PostgreSQL source tables are loaded into Delta tables via JDBC with no business transformations. Only current-day records are loaded each run, providing a lightweight incremental load without CDC or MERGE.
+**Bronze** — Raw data landing zone. 9 PostgreSQL source tables are loaded into Delta tables via JDBC. Only current-day records are loaded each run (daily append, no CDC or MERGE).
 
-**Silver** — Cleaned and normalized data. JSON payloads are parsed, nested structures are flattened, custom fields are resolved, and source snapshots are deduplicated. Three analytics-ready datasets are produced.
+**Silver** — Cleaned and normalized data. Each bronze table is processed by a pipeline notebook that calls shared utils to parse JSON, flatten structs, extract custom fields, explode arrays into child tables, and deduplicate snapshots. Additional silver tables were built for specific Gold-layer needs (email body text, custom lead fields).
 
-**Gold** — Business-ready reporting. Engagement metrics, health scores, and sales context are computed. The final output is a single Customer Health Profile per coaching client, lookupable by email.
+**Gold** — Business-ready reporting. A base view filters to coaching clients and joins pre-calculated CRM custom fields. Engagement metrics are calculated step-by-step from raw activity data. Currently 2 of the spec's engagement metrics have been self-calculated; the rest remain to be built.
 
 ### Data Flow
 
@@ -20,13 +20,13 @@ The pipeline uses a three-layer medallion architecture:
 PostgreSQL (raw schema)
     |
     v  JDBC, daily append (WHERE DATE(INSERT_DATE) = CURRENT_DATE)
-BRONZE (crm_ingestion.bronze)    9 raw Delta tables - append-only landing zone
+BRONZE (crm_ingestion.bronze)    9 raw Delta tables
     |
-    v  JSON repair, flatten structs, extract custom fields, deduplicate
-SILVER (crm_ingestion.silver)    3 normalized datasets
+    v  %run utils -> parse_bronze_table -> flatten_structs -> write_silver + explode children
+SILVER (crm_ingestion.silver)    9 parent tables + child tables + 2 additional tables
     |
-    v  Engagement metrics, health scoring, sales context
-GOLD (crm_ingestion.gold)        2 reporting tables -> Customer Health Profile
+    v  Deduplicate, LEFT JOIN custom fields, calculate engagement metrics from raw activities
+GOLD (crm_ingestion.gold)        view_customer_health_base (1,584 coaching clients) + metric queries
 ```
 
 ---
@@ -34,430 +34,293 @@ GOLD (crm_ingestion.gold)        2 reporting tables -> Customer Health Profile
 ## 2. Folder Structure
 
 ```
-Dea Student Engagement Pipeline/
-+- 0_READme/
-|  +- readme                            <- Project overview notebook (spec source of truth)
-+- 1_Bronze/
-|  +- Bronze_config                     <- Creates ingestion metadata table
-|  +- Bronze_ingestion                  <- Loads 9 PostgreSQL tables into Bronze
+student-engagement/
++- 00_README_.md                           <- This file
++- utils                                  <- Shared utility notebook (JSON repair, schema discovery, silver writing)
++- Dea Student Engagement Pipeline/
+|  +- Silver_table_pipeline_9_raw/        <- 9 silver pipeline notebooks (one per bronze table)
+|  |  +- 1_leads_raw                       <- Pipeline 1: leads_raw -> leads_processed + 17 child tables
+|  |  +- 2_lead_activites_raw              <- Pipeline 2: lead_activites_raw -> lead_activites_processed + child tables
+|  |  +- 3_close_crm_users_raw             <- Pipeline 3: close_crm_users_raw -> close_crm_users_processed
+|  |  +- 4_custom_activites_raw            <- Pipeline 4: custom_activites_raw -> custom_activites_processed
+|  |  +- 5_all_payments                    <- Pipeline 5
+|  |  +- 6_calendly_scheduled_events       <- Pipeline 6
+|  |  +- 7_student_sentiment               <- Pipeline 7
+|  |  +- 8_mdl_users_raw                   <- Pipeline 8
+|  |  +- 9_lead_merges                      <- Pipeline 9
 +- 2_Silver/
-|  +- leads_processed                   <- Flattened lead dimension
-|  +- close_crm_users_processed          <- User dimension
-|  +- leads_activities_summary          <- Deduplicated activity records
+|  +- 2_1_02_Silver_leads_processed_custom  <- Additional: custom fields extracted from leads_processed
+|  +- 2_2_02_Silver_lead_activites_body_text <- Additional: email body text extracted from body_text_quoted
 +- 3_Gold/
-|  +- sales_details                     <- Sales context per coaching client
-|  +- leads_account_details_updates     <- Final Customer Health Profile
-+- silver_engine_utils                  <- Shared utility functions (JSON repair, schema discovery, silver writing)
-+- README.md                            <- This file
+   +- 3_3_Gold_Customer_Health_Profile      <- Customer Health Profile (current focus)
 ```
 
 ---
 
 ## 3. Full Execution Order
 
-The pipeline must run in this order due to table dependencies:
-
 ```
-Step 1: 1_Bronze/Bronze_config
-            | Creates: crm_ingestion.config.bronze_config
+Step 1: Bronze config + ingestion (9 tables from PostgreSQL)
+            |
             v
-Step 2: 1_Bronze/Bronze_ingestion
-            | Creates: 9 Bronze Delta tables
+Step 2: 9 Silver pipeline notebooks (one per bronze table)
+            Each calls: %run utils -> process_table('bronze_table', 'silver_table')
+            Creates: parent silver table + child tables (arrays exploded, custom fields extracted)
+            |
             v
-Step 3: 2_Silver/leads_processed              <- Reads: bronze.leads_raw
-
-Step 4: 2_Silver/close_crm_users_processed     <- Reads: bronze.close_crm_users_raw
-Step 5: 2_Silver/leads_activities_summary      <- Reads: bronze.lead_activites_raw, custom_activites_raw, close_crm_users_raw
-            | Creates: 3 Silver Delta tables
+Step 3: Additional silver notebooks (as needed for Gold)
+            - 2_1_02: leads_processed_custom (custom fields for health profile)
+            - 2_2_02: lead_activites_email_body (email body text for meeting detection)
+            |
             v
-Step 6: 3_Gold/sales_details                  <- Reads: silver.leads_activities_summary, close_crm_users_processed
-Step 7: 3_Gold/leads_account_details_updates    <- Reads: all 3 silver tables + bronze engagement tables
-            | Creates: Final Customer Health Profile
+Step 4: Gold notebook (3_3_Gold_Customer_Health_Profile)
+            - Create view_customer_health_base (coaching clients + custom fields)
+            - Calculate engagement metrics from raw activities (in progress)
+            - Join all metrics to base view (pending)
 ```
 
-Steps 3-5 can run in parallel (no interdependencies). Step 6 must complete before Step 7.
+---
+
+## 4. Bronze Layer (9 tables)
+
+| # | Bronze Table | Source | Used Downstream | Description |
+|---|---|---|:---:|---|
+| 1 | `crm_ingestion.bronze.leads_raw` | `raw.leads_raw` | Yes | Lead/contact/account data |
+| 2 | `crm_ingestion.bronze.lead_activites_raw` | `raw.lead_activites_raw` | Yes | CRM activities (Email, Call, Meeting, Note, CustomActivity, SMS) |
+| 3 | `crm_ingestion.bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | Yes | CRM user dimension |
+| 4 | `crm_ingestion.bronze.custom_activites_raw` | `raw.custom_activites_raw` | Yes | Custom activity metadata (types, fields, outcomes) |
+| 5 | `crm_ingestion.bronze.all_payments` | `raw.all_payments` | No | Payment records |
+| 6 | `crm_ingestion.bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Yes | Scheduled meeting events |
+| 7 | `crm_ingestion.bronze.student_sentiment` | `raw.student_sentiment` | Yes | Sentiment and Slack message data |
+| 8 | `crm_ingestion.bronze.mdl_users_raw` | `raw.mdl_users_raw` | Yes | Moodle platform users |
+| 9 | `crm_ingestion.bronze.lead_merges` | `raw.lead_merges` | No | Lead merge history |
+
+All bronze tables have 3 columns: `raw_data` (JSON string), `insert_date`, `bronze_updated_at`.
 
 ---
 
-## 4. File-by-File Documentation
+## 5. Silver Layer
 
-### 4.1 00_READme
+### 5.1 Utils Notebook (`utils`)
 
 | Field | Value |
 |---|---|
-| **Type** | File |
-| **Purpose** | Project overview and specification document |
+| **Type** | Notebook (Python utility library, 10 cells) |
+| **Path** | `/Users/scottsbv@gmail.com/student-engagement/utils` |
+| **Purpose** | Shared functions for JSON repair, schema discovery, and silver table writing |
 
-This is the source of truth for the project. It defines the architecture, source tables, silver datasets, gold datasets, deduplication rules, health score logic, and final deliverable. All other notebooks should be consistent with what is defined here.
+**Key functions:**
+
+| Function | Cell | Description |
+|---|---|---|
+| `repair_json_udf` | 3 | UDF that repairs malformed JSON: handles JSON_OBJECT wrapper, "data" key extraction, single-quote → double-quote conversion, apostrophe preservation, and problem key nulling |
+| `parse_bronze_table()` | 4 | Reads bronze table, runs UDF to repair JSON, writes to temp table, infers schema via `schema_of_json()` on 20 sampled records, parses with `from_json()`, explodes top-level array |
+| `flatten_structs()` | 5 | Flattens StructType columns into individual columns (skips `custom` struct for separate extraction) |
+| `write_silver()` | 7 | Writes DataFrame to silver Delta table with MD5 `record_hash` column; supports CDC mode (delete+insert) |
+| `explode_to_child()` | 8 | Explodes array columns into child tables (recurses on nested arrays) |
+| `extract_custom()` | 9 | Extracts custom struct + `custom_cf_` fields into child table; builds `custom_fields` MAP column on parent |
+| `process_table()` | 10 | Orchestrator: parse → flatten → write parent → explode children → extract custom |
+
+**`_PROBLEM_KEYS`** — The UDF intentionally nulls these free-text keys to prevent JSON parsing failures: `description`, `notes`, `body_text`, `subject`, `text`, `note`. These fields contain single quotes and special characters that break JSON parsing. Note: for `lead_activites_raw` specifically, the UDF takes the "data" path which skips problem key nulling — the fields are lost during schema inference instead, not by problem key nulling.
+
+**Schema discovery limitation** — `schema_of_json()` infers the schema from 20 random records. If those records don't include all activity types, type-specific fields (e.g., email body fields) are missing from the inferred schema. `lead_activites_processed` has 76 of the 135 fields that `parse_bronze_table` discovers — the missing 59 are email-specific fields lost to random sampling.
+
+**Usage:** Pipeline notebooks call `%run /Users/scottsbv@gmail.com/student-engagement/utils` then `process_table('bronze_table', 'silver_table')`.
 
 ---
 
-### 4.2 1_Bronze/Bronze_config
+### 5.2 Pipeline Silver Tables (9 parent tables + child tables)
+
+Each pipeline notebook reads one bronze table, parses JSON via utils, and writes a parent silver table plus child tables for array columns and custom fields.
+
+| # | Pipeline Notebook | Bronze Table | Silver Parent Table | Key Child Tables |
+|---|---|---|---|---|
+| 1 | `1_leads_raw` | `leads_raw` | `leads_processed` | addresses, contacts (emails, phones, urls, integration_links), opportunities (attachments, integration_links), tasks, custom (Add_ons, HADES TYPE, Lead Source, Objections Faced, Reactivation Campaign) — 17 child tables total |
+| 2 | `2_lead_activites_raw` | `lead_activites_raw` | `lead_activites_processed` | 27 child tables + 2 grandchildren (attendees, attachments, coach_legs, recording_history, integrations, etc.) |
+| 3 | `3_close_crm_users_raw` | `close_crm_users_raw` | `close_crm_users_processed` | (child tables from user arrays) |
+| 4 | `4_custom_activites_raw` | `custom_activites_raw` | `custom_activites_processed` | (3,530 rows — activity type metadata) |
+| 5 | `5_all_payments` | `all_payments` | `all_payments` | (payment records) |
+| 6 | `6_calendly_scheduled_events` | `calendly_scheduled_events` | `calendly_scheduled_events` | (12.2M rows — meeting events) |
+| 7 | `7_student_sentiment` | `student_sentiment` | `student_sentiment` | (sentiment + Slack data) |
+| 8 | `8_mdl_users_raw` | `mdl_users_raw` | `mdl_users` | (platform users) |
+| 9 | `9_lead_merges` | `lead_merges` | `lead_merges` | (lead merge history) |
+
+**`lead_activites_processed` key columns (76 total):** `id`, `lead_id`, `type`, `status`, `activity_at`, `date_updated`, `date_created`, `bronze_insert_date`, `bronze_updated_at`, `note`, `note_html`, `text` (SMS text, NOT email body), `direction`, `duration`, `disposition`, `outcome_id`, `phone`, `users`, `coach_legs`, `recording_history`, `record_hash`, etc.
+
+**Important:** The `text` column in `lead_activites_processed` is SMS text messages (3.2M rows have values). For emails, `text` is always NULL — email body text lives in `body_text_quoted` which was not captured by schema inference.
+
+---
+
+### 5.3 Additional Silver Tables
+
+#### `leads_processed_custom`
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | Metadata defined within the notebook |
-| **Writes to** | `crm_ingestion.config.bronze_config` |
-| **Purpose** | Creates the metadata table that controls Bronze ingestion |
+| **Notebook** | `2_1_02_Silver_leads_processed_custom` |
+| **Full Name** | `crm_ingestion.silver.leads_processed_custom` |
+| **Source** | `crm_ingestion.silver.leads_processed` (custom fields extracted) |
+| **Purpose** | Pre-calculated CRM custom fields for the health profile |
 
-**Logic (plain English):**
+**Key columns:** `leads_processed_id` (FK to `leads_processed.id`), `DAYS_SINCE_LAST_EMAIL`, `DAYS_SINCE_LAST_LOGIN`, `DAYS_SINCE_LAST_MEETING`, `DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT`, `DAYS_SINCE_LAST_MESSAGE_FROM_TEAM_MEMBER`, `SLACK_ENGAGED_FLAG`, `PLATFORM_ENGAGED_FLAG`, `MEETING_ENGAGED_FLAG`, `TOTAL_MISSED_CALLS`, `ENGAGEMENT_PATTERN`, `FINAL_SCORE`, `HEALTH_BAND`, `CSM`, `Contracted_Value`, `Tier`, `SENTIMENTS_LAST_30_DAYS`, `Avatar`.
 
-1. Create the `crm_ingestion.config` schema if it does not exist
-2. Create the `bronze_config` table with columns for source table, target table, active flag, and load order
-3. Insert source-to-target mappings for all 9 PostgreSQL tables
-4. Validate the configuration by querying the table
-
-**Key output columns:**
-
-| Column | Description |
-|---|---|
-| `source_table` | PostgreSQL source table name (e.g., `raw.leads_raw`) |
-| `target_table` | Bronze Delta table name (e.g., `bronze.leads_raw`) |
-| `active` | Boolean flag indicating whether the table should be loaded |
-| `load_order` | Integer controlling the order of ingestion |
-
-**Business meaning:** This table drives the Bronze ingestion process. Adding or removing a source table only requires updating this config table, not changing ingestion code.
+**Note:** These are Close CRM's pre-calculated values. The Gold layer is building self-calculated versions from raw activity data to validate and replace these.
 
 ---
 
-### 4.3 1_Bronze/Bronze_ingestion
+#### `lead_activites_email_body` (NEW)
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `crm_ingestion.config.bronze_config`, PostgreSQL `raw.*` schema |
-| **Writes to** | `crm_ingestion.bronze.*` (9 Delta tables) |
-| **Purpose** | Loads PostgreSQL source tables into Bronze Delta tables |
+| **Notebook** | `2_2_02_Silver_lead_activites_body_text` |
+| **Full Name** | `crm_ingestion.silver.lead_activites_email_body` |
+| **Source** | `crm_ingestion.bronze.lead_activites_raw` (parsed via `parse_bronze_table`) |
+| **Row count** | 1,553,927 |
+| **Purpose** | Extracts email body text from the nested `body_text_quoted` array field that `lead_activites_processed` misses |
 
-**Logic (plain English):**
+**Key columns:** `bronze_insert_date`, `bronze_updated_at`, `activity_id` (FK to `lead_activites_processed.id`), `lead_id`, `activity_at`, `status`, `body_text`, `record_hash`.
 
-1. Configure JDBC connection to PostgreSQL (host, port, database, credentials)
-2. Read active ingestion metadata from `bronze_config` (where `active = true`)
-3. Define a reusable `load_postgres_table(source_table, target_table)` function that:
-   - Builds a SQL query: `SELECT * FROM {source_table} WHERE DATE(INSERT_DATE) = CURRENT_DATE`
-   - Reads via Spark JDBC into a DataFrame
-   - Appends to a Delta table using `mode("append")`
-4. Execute the function for each active table in load order
-
-**Load rule:** Only current-day records are loaded (`WHERE DATE(INSERT_DATE) = CURRENT_DATE`). This provides a lightweight incremental load without MERGE or CDC. Each run grabs only today's rows and appends them.
-
-**Key output tables (9 total):**
-
-| # | Bronze Table | Source | Purpose |
-|---|---|---|---|
-| 1 | `bronze.leads_raw` | `raw.leads_raw` | Lead/contact/account data |
-| 2 | `bronze.lead_activites_raw` | `raw.lead_activites_raw` | CRM activities (Email, Call, Meeting, Note, CustomActivity) |
-| 3 | `bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | CRM user dimension |
-| 4 | `bronze.custom_activites_raw` | `raw.custom_activites_raw` | Custom activity metadata (types, fields, outcomes) |
-| 5 | `bronze.all_payments` | `raw.all_payments` | Payment records (loaded but not used downstream) |
-| 6 | `bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Scheduled meeting events |
-| 7 | `bronze.student_sentiment` | `raw.student_sentiment` | Sentiment and Slack message data |
-| 8 | `bronze.mdl_users_raw` | `raw.mdl_users_raw` | Moodle platform users |
-| 9 | `bronze.lead_merges` | `raw.lead_merges` | Lead merge history (loaded but not used downstream) |
-
-**Business meaning:** This is the raw landing zone. Data is stored exactly as it appears in PostgreSQL with no transformations. The 9 tables provide the source material for all downstream silver and gold processing.
+**Why this table exists:** `lead_activites_processed` drops `body_text_quoted` during schema inference (76 of 135 fields captured). The `body_text_quoted[0].text` field contains the actual email body, including Calendly's "A new event has been scheduled." message used to detect meetings. This table fills the gap by using `parse_bronze_table` (which DOES discover `body_text_quoted` in its 135-field schema) and extracting `body_text_quoted[0].text` as `body_text`.
 
 ---
 
-### 4.4 2_Silver/leads_processed
+## 6. Gold Layer (Current State)
+
+### 6.1 Notebook: `3_3_Gold_Customer_Health_Profile`
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `crm_ingestion.bronze.leads_raw` |
-| **Writes to** | `crm_ingestion.silver.leads_processed` |
-| **Purpose** | Creates a flattened lead dimension with customer, account, contact, and status information |
+| **Type** | Notebook (SQL + Python) |
+| **Path** | `/Users/scottsbv@gmail.com/student-engagement/3_Gold/3_3_Gold_Customer_Health_Profile` |
+| **Purpose** | Build the Customer Health Profile step-by-step from raw activity data |
 
-**Logic (plain English):**
-
-1. Read `bronze.leads_raw`
-2. Parse and repair malformed JSON payloads (single-quoted JSON, Python literals like `None`)
-3. Flatten nested structures (contacts array, account details, custom fields)
-4. Extract custom fields into a usable format
-5. Deduplicate by `LEAD_ID` — keep the latest record using `DATE_UPDATED` then `INSERT_DATE` as tiebreaker
-6. Write to `silver.leads_processed`
-
-**Key output columns:**
-
-| Column | Description |
-|---|---|
-| `LEAD_ID` | Unique lead identifier |
-| `NAME` | Lead name (masked in source) |
-| `STATUS_LABEL` | Lead status (e.g., "Coaching Client") |
-| `EMAIL` | Lead email (masked in source) |
-| `ACCOUNT_NAME` | Account/display name |
-| `CUSTOMER_NAME` | Customer display name |
-| `CSM` | Customer Success Manager |
-| `lead_created_date` | Lead creation timestamp |
-| `lead_updated_date` | Lead last update timestamp |
-| Custom fields | Program, contract value, date of sale, closer, setter, etc. |
-
-**Business meaning:** This is the lead dimension table. It carries the account information needed for the final health profile. The `STATUS_LABEL` field is used to filter to Coaching Clients in the gold layer.
-
----
-
-### 4.5 2_Silver/close_crm_users_processed
+### 6.2 Base View: `view_customer_health_base`
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `crm_ingestion.bronze.close_crm_users_raw` |
-| **Writes to** | `crm_ingestion.silver.close_crm_users_processed` |
-| **Purpose** | Creates the user dimension used for ownership and attribution |
+| **Full Name** | `crm_ingestion.gold.view_customer_health_base` |
+| **Cell** | 5 (CREATE OR REPLACE VIEW) |
+| **Row count** | 1,584 coaching clients |
+| **Purpose** | Foundation for the health profile — deduplicated coaching clients with pre-calculated CRM custom fields |
 
-**Logic (plain English):**
+**Logic:**
+1. Deduplicate `leads_processed` by `id` (ROW_NUMBER, latest by `date_updated DESC, bronze_insert_date DESC`), filter to `status_label = 'Coaching Client'`
+2. Deduplicate `leads_processed_custom` by `leads_processed_id` (ROW_NUMBER, latest by `bronze_insert_date DESC`)
+3. LEFT JOIN leads to custom fields on `id = leads_processed_id`
+4. Clean `\N` values to NULL using `NULLIF` on all custom field columns
 
-1. Read `bronze.close_crm_users_raw`
-2. Parse and repair JSON payloads
-3. Flatten nested structures
-4. Deduplicate by `USER_ID` — keep the latest record using `DATE_UPDATED`
-5. Write to `silver.close_crm_users_processed`
-
-**Key output columns:**
-
-| Column | Description |
-|---|---|
-| `USER_ID` | Unique user identifier |
-| `FIRST_NAME` | User first name |
-| `LAST_NAME` | User last name |
-| `EMAIL` | User email |
-| `ROLE` | User role (e.g., Setter, Closer, CSM) |
-| `STATUS` | User status (active/inactive) |
-| `date_updated` | Last update timestamp |
-
-**Business meaning:** This dimension resolves who owns each lead and activity. It is used to attribute sales to setters and closers and to identify Customer Success Managers in the gold layer.
+**Key columns:** `id`, `status_label`, `date_updated`, `bronze_insert_date`, plus all pre-calculated CRM custom fields (DAYS_SINCE_LAST_EMAIL, DAYS_SINCE_LAST_MEETING, TOTAL_MISSED_CALLS, ENGAGEMENT_PATTERN, FINAL_SCORE, HEALTH_BAND, CSM, Contracted_Value, Tier, etc.)
 
 ---
 
-### 4.6 2_Silver/leads_activities_summary
+### 6.3 Self-Calculated Engagement Metric: DAYS_SINCE_LAST_EMAIL
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `crm_ingestion.bronze.lead_activites_raw`, `bronze.custom_activites_raw`, `bronze.close_crm_users_raw` |
-| **Writes to** | `crm_ingestion.silver.leads_activities_summary` |
-| **Purpose** | Creates one current record per `ACTIVITY_ID` with flattened activity data and resolved activity outcomes |
+| **Cell** | 12 |
+| **Row count** | 5,497 leads |
+| **Source tables** | `lead_activites_processed` + `lead_activites_email_body` (LEFT JOIN) |
 
-**Logic (plain English):**
+**Logic:**
+1. Filter `lead_activites_processed` to `type = 'Email' AND status = 'inbox'`
+2. LEFT JOIN to `lead_activites_email_body` on `id = activity_id` to get email body text
+3. Exclude Calendly/system emails: `body_text NOT ILIKE '%A new event has been scheduled.%'`, `NOT ILIKE '%is requesting access to the following folder%'`, `NOT ILIKE '%requests access to an item%'`
+4. Deduplicate by activity `id` (ROW_NUMBER, `PARTITION BY id ORDER BY date_updated DESC, bronze_insert_date DESC`, keep rn=1)
+5. Find latest email per lead (ROW_NUMBER, `PARTITION BY lead_id ORDER BY activity_at DESC`, keep rn=1)
+6. Calculate `DATEDIFF(CURRENT_DATE, DATE(activity_at)) AS days_since_last_email`
 
-1. Read `bronze.lead_activites_raw`
-2. Parse and repair JSON payloads (using the `parse_activity_final` SQL UDF or Python equivalent)
-3. Flatten nested structures (attendees, contacts, body text, envelope data)
-4. Join with `custom_activites_raw` to resolve activity type metadata and custom field definitions
-5. Join with `close_crm_users_raw` to resolve user names (replacing masked user IDs with real names)
-6. Deduplicate by `ACTIVITY_ID` — keep the latest record using `DATE_UPDATED` then `INSERT_DATE` as tiebreaker
-7. Write to `silver.leads_activities_summary`
-
-**Key output columns:**
-
-| Column | Description |
-|---|---|
-| `ACTIVITY_ID` | Unique activity identifier |
-| `LEAD_ID` | Associated lead |
-| `ACTIVITY_AT` | Activity timestamp |
-| `TYPE` | Activity type (Email, Call, Meeting, Note, CustomActivity) |
-| `OUTCOME` | Activity outcome (New Sale, No-answer, etc.) |
-| `OWNER` | Activity owner name (resolved from user dimension) |
-| `USER` | Activity user name (resolved from user dimension) |
-| `date_updated` | Last update timestamp (used for deduplication) |
-| `insert_date` | Source insert timestamp (tiebreaker for deduplication) |
-
-**Deduplication rule:** Keep the latest version of each `ACTIVITY_ID` using `DATE_UPDATED` then `INSERT_DATE` (latest wins).
-
-**Business meaning:** This is the activity fact table. It feeds engagement metrics (email recency, meeting recency, missed calls) and sales qualification (outcome = "New Sale"). Resolving user names here avoids joins in the gold layer.
+**Impact of exclusions:** Without the `body_text` join, Calendly scheduling emails were counted as "last email" for 1,844 leads. The exclusion reduced the result from 7,341 to 5,497 leads.
 
 ---
 
-### 4.7 3_Gold/sales_details
+### 6.4 Self-Calculated Engagement Metric: DAYS_SINCE_LAST_MEETING
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `crm_ingestion.silver.leads_activities_summary`, `crm_ingestion.silver.close_crm_users_processed` |
-| **Writes to** | `crm_ingestion.gold.sales_details` |
-| **Purpose** | Creates sales context for each coaching client |
+| **Cell** | 15 |
+| **Row count** | 6,226 leads |
+| **Source table** | `lead_activites_email_body` |
 
-**Logic (plain English):**
+**Logic:**
+1. Filter `lead_activites_email_body` to `body_text ILIKE '%A new event has been scheduled.%'` (Calendly scheduling emails)
+2. Deduplicate by `activity_id` (ROW_NUMBER, `PARTITION BY activity_id ORDER BY bronze_updated_at DESC, bronze_insert_date DESC`, keep rn=1)
+3. Find latest meeting per lead (ROW_NUMBER, `PARTITION BY lead_id ORDER BY activity_at DESC`, keep rn=1)
+4. Calculate `DATEDIFF(CURRENT_DATE, DATE(activity_at)) AS days_since_last_meeting`
 
-1. Read `silver.leads_activities_summary`
-2. Filter to qualifying sales outcomes only:
-   - "New Sale"
-   - "New Sale [Custom Payment Plan]"
-3. Join with `close_crm_users_processed` to resolve setter and closer names from user IDs
-4. Extract sale date, program, and contract value from custom fields
-5. Keep the latest sale per lead (if multiple sales exist)
-6. Write to `gold.sales_details`
-
-**Key output columns:**
-
-| Column | Description |
-|---|---|
-| `LEAD_ID` | Associated lead |
-| `SALE_DATE` | Date of sale |
-| `PROGRAM` | Program type |
-| `CONTRACT_VALUE` | Contract value |
-| `SETTER` | Sales setter name |
-| `CLOSER` | Sales closer name |
-
-**Business rule:** Only outcomes "New Sale" and "New Sale [Custom Payment Plan]" qualify as sales.
-
-**Business meaning:** This table provides the sales context for each coaching client: when they bought, what program, how much, and who sold it. This is joined into the final health profile.
+**Key finding:** The spec says to search for "A new event has been scheduled" in the activity text. This text does NOT exist in `lead_activites_processed.text` (which is SMS text, NULL for emails). It lives inside `body_text_quoted[0].text` in the raw JSON — a nested array field that was lost during silver schema inference. The `lead_activites_email_body` table was created specifically to extract this text.
 
 ---
 
-### 4.8 3_Gold/leads_account_details_updates
-
-| Field | Value |
-|---|---|
-| **Type** | Notebook (Python) |
-| **Reads from** | `silver.leads_processed`, `silver.close_crm_users_processed`, `silver.leads_activities_summary`, `gold.sales_details`, `bronze.calendly_scheduled_events`, `bronze.mdl_users_raw`, `bronze.student_sentiment` |
-| **Writes to** | `crm_ingestion.gold.leads_account_details_updates` |
-| **Purpose** | Creates the final Customer Health Profile with engagement metrics, health score, and health band |
-
-**Logic (plain English):**
-
-1. Start with `silver.leads_processed`, filter to Coaching Clients only
-2. Join with `gold.sales_details` for sales context (sale date, program, contract value, setter, closer)
-3. Join with `silver.close_crm_users_processed` to resolve CSM name
-4. Compute engagement metrics from multiple sources:
-   - **CRM activities** (`silver.leads_activities_summary`) -> days since last email, days since last meeting, missed calls in 14-day window
-   - **Calendly** (`bronze.calendly_scheduled_events`) -> days since last Calendly meeting, days until next scheduled meeting
-   - **Platform** (`bronze.mdl_users_raw`) -> days since last platform login
-   - **Sentiment** (`bronze.student_sentiment`) -> sentiment label, Slack engagement flag
-5. Compute engagement flags:
-   - `SLACK_ENGAGED_FLAG` — sentiment activity within threshold
-   - `PLATFORM_ENGAGED_FLAG` — platform login within threshold
-   - `MEETING_ENGAGED_FLAG` — meeting activity within threshold
-6. Determine engagement pattern (8 possible combinations of the 3 flags, plus NO DATA)
-7. Calculate final health score: `Base Engagement Score + Missed Call Adjustment + Sentiment Adjustment`
-8. Assign health band: GOOD (>=75), AVERAGE (>=50 and <75), POOR (<50), or NO DATA
-9. Write the final profile to `gold.leads_account_details_updates`
-
-**Key output columns:**
-
-**Account Information:**
-
-| Column | Description |
-|---|---|
-| `LEAD_ID` | Unique lead identifier |
-| `CUSTOMER_NAME` | Customer display name |
-| `ACCOUNT_NAME` | Account name |
-| `STATUS` | Lead status (Coaching Client) |
-| `CSM` | Customer Success Manager |
-| `EMAIL` | Email for lookup |
-
-**Sales Information:**
-
-| Column | Description |
-|---|---|
-| `SALE_DATE` | Date of sale |
-| `PROGRAM` | Program type |
-| `CONTRACT_VALUE` | Contract value |
-| `SETTER` | Sales setter |
-| `CLOSER` | Sales closer |
-
-**Engagement Metrics:**
-
-| Column | Description |
-|---|---|
-| `DAYS_SINCE_LAST_EMAIL` | Days since last CRM email activity |
-| `DAYS_SINCE_LAST_MEETING` | Days since last CRM meeting activity |
-| `DAYS_SINCE_LAST_MEETING_CALENDLY` | Days since last Calendly event |
-| `UPCOMING_MEETING_DAYS` | Days until next scheduled meeting |
-| `DAYS_SINCE_LAST_LOGIN` | Days since last platform login |
-| `MISSED_CALLS_14_DAYS` | Count of missed inbound calls in 14-day window |
-| `SENTIMENT` | Sentiment label from Slack channels |
-
-**Health Metrics:**
-
-| Column | Description |
-|---|---|
-| `SLACK_ENGAGED_FLAG` | Boolean: sentiment activity within threshold |
-| `PLATFORM_ENGAGED_FLAG` | Boolean: platform login within threshold |
-| `MEETING_ENGAGED_FLAG` | Boolean: meeting activity within threshold |
-| `ENGAGEMENT_PATTERN` | One of 8 patterns (or NO DATA) |
-| `FINAL_HEALTH_SCORE` | Numeric score (20-90, adjusted for missed calls and sentiment) |
-| `HEALTH_BAND` | GOOD, AVERAGE, POOR, or NO DATA |
-
-**Business meaning:** This is the primary business-facing dataset. It provides a complete health profile for each coaching client, supporting email lookup and proactive outreach decisions. The health score and band enable prioritization of at-risk clients.
-
----
-
-### 4.9 silver_engine_utils
-
-| Field | Value |
-|---|---|
-| **Type** | Notebook (Python utility library) |
-| **Reads from** | Nothing (utility functions only) |
-| **Writes to** | Nothing (utility functions only) |
-| **Purpose** | Shared utility functions for JSON repair, schema discovery, and silver table writing |
-
-**Usage:** Called via `%run` by silver notebooks. Provides:
-
-- **JSON Repair UDF** — handles single-quoted JSON, Python literals (`None` to `null`), and stray quotes in free-text fields
-- **Schema Discovery** — auto-detects JSON structure using `schema_of_json()` on sampled rows
-- **`write_silver()`** — writes a DataFrame to a silver Delta table with `overwriteSchema`
-- **`process_table()`** — orchestrator function that runs the full Bronze to Silver flow for a single table
-- **`add_record_hash()`** — computes MD5 hash of record for deduplication
-
-**How it fits:** Silver notebooks call `%run` on this notebook to load these functions, then call `process_table()` or individual functions as needed.
-
----
-
-## 5. Full Table Reference
+## 7. Full Table Reference
 
 ### Config Layer
 
 | Table | Full Name | Description |
 |---|---|---|
-| `bronze_config` | `crm_ingestion.config.bronze_config` | Metadata table controlling Bronze ingestion (source-to-target mappings, active flags, load order) |
+| `bronze_config` | `crm_ingestion.config.bronze_config` | Metadata controlling Bronze ingestion |
 
 ### Bronze Layer (9 tables)
 
-| # | Table | Full Name | Source | Used Downstream | Description |
-|---|---|---|---|:---:|---|
-| 1 | `leads_raw` | `crm_ingestion.bronze.leads_raw` | `raw.leads_raw` | Yes | Lead/contact/account data |
-| 2 | `lead_activites_raw` | `crm_ingestion.bronze.lead_activites_raw` | `raw.lead_activites_raw` | Yes | CRM activities (Email, Call, Meeting, Note, CustomActivity) |
-| 3 | `close_crm_users_raw` | `crm_ingestion.bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | Yes | CRM user dimension |
-| 4 | `custom_activites_raw` | `crm_ingestion.bronze.custom_activites_raw` | `raw.custom_activites_raw` | Yes | Custom activity metadata (types, fields, outcomes) |
-| 5 | `all_payments` | `crm_ingestion.bronze.all_payments` | `raw.all_payments` | No | Payment records (loaded but excluded from Gold per spec) |
-| 6 | `calendly_scheduled_events` | `crm_ingestion.bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Yes | Scheduled meeting events (used in Gold for engagement metrics) |
-| 7 | `student_sentiment` | `crm_ingestion.bronze.student_sentiment` | `raw.student_sentiment` | Yes | Sentiment and Slack message data (used in Gold for engagement metrics) |
-| 8 | `mdl_users_raw` | `crm_ingestion.bronze.mdl_users_raw` | `raw.mdl_users_raw` | Yes | Moodle platform users (used in Gold for engagement metrics) |
-| 9 | `lead_merges` | `crm_ingestion.bronze.lead_merges` | `raw.lead_merges` | No | Lead merge history (loaded but excluded from Gold per spec) |
+All bronze tables: `raw_data` (string/JSON), `insert_date` (timestamp), `bronze_updated_at` (timestamp).
 
-### Silver Layer (3 tables)
+| # | Full Name | Source | Used |
+|---|---|---|:---:|
+| 1 | `crm_ingestion.bronze.leads_raw` | `raw.leads_raw` | Yes |
+| 2 | `crm_ingestion.bronze.lead_activites_raw` | `raw.lead_activites_raw` | Yes |
+| 3 | `crm_ingestion.bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | Yes |
+| 4 | `crm_ingestion.bronze.custom_activites_raw` | `raw.custom_activites_raw` | Yes |
+| 5 | `crm_ingestion.bronze.all_payments` | `raw.all_payments` | No |
+| 6 | `crm_ingestion.bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Yes |
+| 7 | `crm_ingestion.bronze.student_sentiment` | `raw.student_sentiment` | Yes |
+| 8 | `crm_ingestion.bronze.mdl_users_raw` | `raw.mdl_users_raw` | Yes |
+| 9 | `crm_ingestion.bronze.lead_merges` | `raw.lead_merges` | No |
 
-| # | Table | Full Name | Source(s) | Description |
-|---|---|---|---|---|
-| 1 | `leads_processed` | `crm_ingestion.silver.leads_processed` | `bronze.leads_raw` | Flattened lead dimension (one row per LEAD_ID) |
-| 2 | `close_crm_users_processed` | `crm_ingestion.silver.close_crm_users_processed` | `bronze.close_crm_users_raw` | User dimension (one row per USER_ID) |
-| 3 | `leads_activities_summary` | `crm_ingestion.silver.leads_activities_summary` | `bronze.lead_activites_raw`, `custom_activites_raw`, `close_crm_users_raw` | Deduplicated activities (one current row per ACTIVITY_ID) |
+### Silver Layer (9 parent + child + 2 additional tables)
 
-### Gold Layer (2 tables)
+| # | Full Name | Source | Description |
+|---|---|---|---|
+| 1 | `crm_ingestion.silver.leads_processed` | `bronze.leads_raw` | Flattened lead dimension + 17 child tables |
+| 2 | `crm_ingestion.silver.lead_activites_processed` | `bronze.lead_activites_raw` | Deduplicated activities (76 fields) + 27 child tables |
+| 3 | `crm_ingestion.silver.close_crm_users_processed` | `bronze.close_crm_users_raw` | User dimension |
+| 4 | `crm_ingestion.silver.custom_activites_processed` | `bronze.custom_activites_raw` | Custom activity metadata |
+| 5 | `crm_ingestion.silver.all_payments` | `bronze.all_payments` | Payment records |
+| 6 | `crm_ingestion.silver.calendly_scheduled_events` | `bronze.calendly_scheduled_events` | 12.2M meeting events |
+| 7 | `crm_ingestion.silver.student_sentiment` | `bronze.student_sentiment` | Sentiment + Slack data |
+| 8 | `crm_ingestion.silver.mdl_users` | `bronze.mdl_users_raw` | Platform users |
+| 9 | `crm_ingestion.silver.lead_merges` | `bronze.lead_merges` | Lead merge history |
+| + | `crm_ingestion.silver.leads_processed_custom` | `silver.leads_processed` | CRM custom fields for health profile |
+| + | `crm_ingestion.silver.lead_activites_email_body` | `bronze.lead_activites_raw` | Email body text from `body_text_quoted` (1,553,927 rows) |
 
-| # | Table | Full Name | Source(s) | Description |
-|---|---|---|---|---|
-| 1 | `sales_details` | `crm_ingestion.gold.sales_details` | `silver.leads_activities_summary`, `silver.close_crm_users_processed` | Sales context per coaching client (latest qualifying sale) |
-| 2 | `leads_account_details_updates` | `crm_ingestion.gold.leads_account_details_updates` | All 3 silver tables + `gold.sales_details` + `bronze.calendly_scheduled_events` + `bronze.mdl_users_raw` + `bronze.student_sentiment` | Final Customer Health Profile (one row per Coaching Client) |
+### Gold Layer (current)
+
+| # | Full Name | Type | Description |
+|---|---|---|---|
+| 1 | `crm_ingestion.gold.view_customer_health_base` | VIEW | 1,584 coaching clients with pre-calculated CRM custom fields |
+| 2 | *(metric query)* | SQL cell 12 | `DAYS_SINCE_LAST_EMAIL` — 5,497 leads, self-calculated from raw activities |
+| 3 | *(metric query)* | SQL cell 15 | `DAYS_SINCE_LAST_MEETING` — 6,226 leads, self-calculated from email body text |
 
 ---
 
-## 6. Deduplication Rules
+## 8. Deduplication Rules
+
+All deduplication uses ROW_NUMBER with `PARTITION BY <primary key> ORDER BY <timestamp> DESC` and keeps `rn = 1` (latest wins).
 
 | Dataset | Primary Key | Ordering (latest wins) |
 |---|---|---|
-| CRM Activities | `ACTIVITY_ID` | `DATE_UPDATED` -> `INSERT_DATE` |
-| Calendly Events | `EVENT_URI` | `INVITEE_UPDATED_AT` -> `EVENT_CREATED_AT` -> `INSERT_DATE` |
+| Leads | `id` | `date_updated DESC` → `bronze_insert_date DESC` |
+| CRM Activities (by ID) | `id` / `activity_id` | `date_updated DESC` → `bronze_insert_date DESC` |
+| CRM Activities (per lead, latest) | `lead_id` | `activity_at DESC` |
+| Custom Fields | `leads_processed_id` | `bronze_insert_date DESC` |
+| Calendly Events | `EVENT_URI` | `INVITEE_UPDATED_AT` → `EVENT_CREATED_AT` → `INSERT_DATE` |
 | Platform Users | `USER_ID` | `TIMEMODIFIED` |
 | Student Sentiment | `CHANNEL_ID` | `INSERT_DATE` |
-| Leads | `LEAD_ID` | `lead_updated_date` -> `source_insert_date` |
 | CRM Users | `USER_ID` | `date_updated` |
 
 ---
 
-## 7. Health Score Logic
+## 9. Health Score Logic (Spec — Not Yet Implemented)
+
+The self-calculated metrics will eventually feed into the health score. The spec defines:
 
 **Formula:** `FINAL_HEALTH_SCORE = Base Engagement Score + Missed Call Adjustment + Sentiment Adjustment`
 
@@ -485,16 +348,27 @@ This is the source of truth for the project. It defines the architecture, source
 
 ---
 
-## 8. Final Deliverable
+## 10. Current Status
 
-The final output of this pipeline is a single **Customer Health Profile** (`crm_ingestion.gold.leads_account_details_updates`) that supports lookup by Coaching Client email and provides:
+### Completed
 
-* **Customer information** — name, account, status, CSM
-* **Sales context** — sale date, program, contract value, setter, closer
-* **Communication engagement** — email recency, meeting recency, missed calls
-* **Meeting engagement** — Calendly recency, upcoming meetings
-* **Platform engagement** — login recency
-* **Sentiment metrics** — Slack sentiment label
-* **Health scoring** — engagement pattern, final score, health band
+* Bronze layer: 9 tables ingested from PostgreSQL
+* Silver layer: 9 pipeline notebooks processing all bronze tables via `process_table()`
+* Silver layer: `leads_processed_custom` (CRM custom fields for health profile)
+* Silver layer: `lead_activites_email_body` (email body text extraction — fills gap in `lead_activites_processed`)
+* Gold layer: `view_customer_health_base` (1,584 coaching clients with pre-calculated CRM fields)
+* Gold metric: `DAYS_SINCE_LAST_EMAIL` (5,497 leads, self-calculated with Calendly exclusions)
+* Gold metric: `DAYS_SINCE_LAST_MEETING` (6,226 leads, self-calculated from Calendly scheduling emails)
 
-This is the primary business-facing dataset produced by the DEA Student Engagement Pipeline.
+### Remaining (per spec)
+
+* `TOTAL_MISSED_CALLS` — count missed inbound calls from `lead_activites_processed` where `type = 'Call'`
+* `DAYS_SINCE_LAST_LOGIN` — from `mdl_users` (platform login recency)
+* `DAYS_SINCE_LAST_MEETING_CALENDLY` — from `calendly_scheduled_events` (separate from CRM meeting metric)
+* `DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT` — from Slack sentiment data
+* `DAYS_SINCE_LAST_MESSAGE_FROM_TEAM_MEMBER` — from Slack sentiment data
+* `UPCOMING_MEETING_DAYS` — from Calendly (future meetings)
+* Join all metrics to `view_customer_health_base` by `lead_id`
+* Calculate engagement flags, engagement pattern, health score, and health band
+* Write final `gold.leads_account_details_updates` table
+* Gold notebooks `3_1_Gold_Leads_Activities_Summary` and `3_2_Gold_Sales_Details` (not yet started)
