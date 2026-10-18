@@ -609,14 +609,16 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
 
 # DBTITLE 1,Custom Field Extraction
 # ============================================================================
-# CUSTOM FIELD EXTRACTION (dry_run — prints child tables without writing)
+# CUSTOM FIELD EXTRACTION — custom_fields MAP + _custom table (no child tables)
 # ============================================================================
 
 
 def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_run=False):
     """Extract custom struct AND custom_cf_ columns.
 
-    When dry_run=True: prints _custom and named custom array table info without writing.
+    - cf_ fields (inside custom struct OR as top-level custom_cf_ columns) → custom_fields MAP
+    - Non-cf_ scalar fields → _custom child table (one table, no further children)
+    - Non-cf_ array fields → array columns in _custom table (preserved for future use, NOT exploded)
     The custom_fields MAP is always built on the parent regardless of dry_run.
     """
     # Detect cf_ from TWO sources:
@@ -649,12 +651,15 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_ru
                 struct_scalar_fields.append((f.name, _sanitize_col_name(f.name)))
 
     custom_name = f"{parent_name}_custom"
-    grandchild_idx = 0
 
-    # -- 1. Build _custom table (regular scalar fields from custom struct only) --
-    if has_custom_struct and struct_scalar_fields:
+    # -- 1. Build _custom table (scalars as columns, arrays as array columns) --
+    # No child tables are ever created from fields inside custom.
+    # Arrays stay as array columns for future use if needed.
+    if has_custom_struct and (struct_scalar_fields or struct_array_fields):
         select_exprs = list(carry) + [
             col(f"custom.`{orig}`").alias(safe) for orig, safe in struct_scalar_fields
+        ] + [
+            col(f"custom.`{orig}`").alias(safe) for orig, safe in struct_array_fields
         ]
         df_custom = df.select(*select_exprs)
         df_custom = flatten_structs(df_custom, skip_custom=False)
@@ -665,43 +670,6 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_ru
             print(f"\n  📦 CUSTOM TABLE — {custom_name}")
             write_silver(df_custom, custom_name)
         _lineage_tree.append((num_path, 1, custom_name))
-
-        # Explode arrays that survived flatten in the custom table
-        custom_pk = find_pk(df_custom)
-        custom_carry = list(dict.fromkeys(
-            [c for c in carry_cols if c in df_custom.columns] +
-            [c for c in df_custom.columns if c.startswith(f"{parent_name}_")] +
-            ([custom_pk] if custom_pk else [])
-        ))
-        _, custom_arrays_in_table, _ = categorize_fields(df_custom)
-        for ca in custom_arrays_in_table:
-            grandchild_idx += 1
-            grandchild_num = f"{num_path}_{grandchild_idx}"
-            explode_to_child(df_custom, custom_name, ca, custom_carry, depth=1, num_path=grandchild_num,
-                             parent_pk=(custom_pk if custom_pk and custom_pk not in carry_cols else None),
-                             dry_run=dry_run)
-
-    # -- 1a. Explode each named custom array into its own table --
-    if has_custom_struct and struct_array_fields:
-        array_carry_names = []
-        array_carry_exprs = []
-        for c in dict.fromkeys(carry_cols):
-            if c in df.columns:
-                if c == parent_pk:
-                    renamed = f"{parent_name}_{c}"
-                    array_carry_names.append(renamed)
-                    array_carry_exprs.append(col(c).alias(renamed))
-                else:
-                    array_carry_names.append(c)
-                    array_carry_exprs.append(col(c))
-
-        for orig_name, safe_name in struct_array_fields:
-            grandchild_idx += 1
-            grandchild_num = f"{num_path}_{grandchild_idx}"
-            df_one_array = df.select(*array_carry_exprs, col(f"custom.`{orig_name}`").alias(safe_name))
-            print(f"    📦 NAMED CUSTOM ARRAY — {custom_name}_{safe_name}")
-            explode_to_child(df_one_array, custom_name, safe_name, array_carry_names,
-                           depth=1, num_path=grandchild_num, parent_pk=parent_pk, dry_run=dry_run)
 
     # -- 2. Build custom_fields MAP column from ALL cf_ fields --
     map_entries = []
@@ -810,7 +778,7 @@ def print_lineage_tree(silver_name=None):
         print(f"  # * {indent}{num}_{name}")
 
 
-def process_table(bronze_name, silver_name=None, only_arrays=None):
+def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False):
     """Full Bronze → Silver pipeline: parse, flatten structs, write parent table.
     Child tables are discovered and printed (dry_run) but NOT written.
 
@@ -819,6 +787,8 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
         silver_name:  Silver target table name (defaults to bronze_name)
         only_arrays:  List of array column names to explode. None = all (default).
                       [] = don't explode any arrays. ["contacts"] = only explode contacts.
+        flatten:       If True, flatten struct columns into individual columns (default False).
+                      Keep False to preserve first-level JSON keys only.
     """
     global _pipeline_counter, _lineage_tree, _CDC_WATERMARK
     _pipeline_counter += 1
@@ -874,7 +844,8 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
             print(f"\n  🔍 DRY RUN — re-parsing 200 sample rows for full lineage tree:")
             df_sample = parse_bronze_table(bronze_name, limit=200)
             if df_sample is not None:
-                df_sample = flatten_structs(df_sample, skip_custom=True)
+                if flatten:
+                    df_sample = flatten_structs(df_sample, skip_custom=True)
                 pk = find_pk(df_sample)
                 carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
                 child_idx = 0
@@ -905,7 +876,8 @@ def process_table(bronze_name, silver_name=None, only_arrays=None):
         return
 
     # Flatten structs (keep custom struct as-is on parent)
-    df_flat = flatten_structs(df_flat, skip_custom=True)
+    if flatten:
+        df_flat = flatten_structs(df_flat, skip_custom=True)
 
     # Find PK (carry was used for child tables — retained for re-enablement)
     pk = find_pk(df_flat)
