@@ -12,7 +12,7 @@ The pipeline uses a three-layer medallion architecture:
 
 **Silver** — Cleaned and normalized data. Each bronze table is processed by a pipeline notebook that calls shared utils to parse JSON, flatten structs, extract custom fields, explode arrays into child tables, and deduplicate snapshots. Additional silver tables were built for specific Gold-layer needs (email body text, custom lead fields).
 
-**Gold** — Business-ready reporting. A base view filters to coaching clients and joins pre-calculated CRM custom fields. Engagement metrics are calculated step-by-step from raw activity data. Currently 2 of the spec's engagement metrics have been self-calculated; the rest remain to be built.
+**Gold** — Business-ready reporting. Three gold notebooks build: (1) Leads Activities Summary + CRM users, (2) Sales Details with CSM resolution, and (3) the Customer Health Profile with all 7 engagement/sentiment metrics, scoring logic, and health bands. Health is per-source LEAD_ID (no identity consolidation), with email array lookup support.
 
 ### Data Flow
 
@@ -22,11 +22,14 @@ PostgreSQL (raw schema)
     v  JDBC, daily append (WHERE DATE(INSERT_DATE) = CURRENT_DATE)
 BRONZE (crm_ingestion.bronze)    9 raw Delta tables
     |
-    v  %run utils -> parse_bronze_table -> flatten_structs -> write_silver + explode children
-SILVER (crm_ingestion.silver)    9 parent tables + child tables + 2 additional tables
+    v  %run utils -> process_table() -> parse_bronze_table -> flatten_structs -> write_silver
+SILVER (crm_ingestion.silver)    11 processing notebooks (parent + child + custom fields)
     |
-    v  Deduplicate, LEFT JOIN custom fields, calculate engagement metrics from raw activities
-GOLD (crm_ingestion.gold)        view_customer_health_base (1,584 coaching clients) + metric queries
+    v  3 Gold notebooks: metrics CTEs -> flags -> patterns -> scores -> health bands
+GOLD (crm_ingestion.gold)        close_crm_users, leads_activities_summary, sales_details,
+                                 customer_health_profile (per LEAD_ID, email array lookup)
+    |
+    v  Databricks Job: 15 tasks, daily 8:00 AM EST (bronze -> 11 silver parallel -> 3 gold sequential)
 ```
 
 ---
@@ -35,24 +38,28 @@ GOLD (crm_ingestion.gold)        view_customer_health_base (1,584 coaching clien
 
 ```
 student-engagement/
-+- 00_README_.md                           <- This file
-+- utils                                  <- Shared utility notebook (JSON repair, schema discovery, silver writing)
-+- Dea Student Engagement Pipeline/
-|  +- Silver_table_pipeline_9_raw/        <- 9 silver pipeline notebooks (one per bronze table)
-|  |  +- 1_leads_raw                       <- Pipeline 1: leads_raw -> leads_processed + 17 child tables
-|  |  +- 2_lead_activites_raw              <- Pipeline 2: lead_activites_raw -> lead_activites_processed + child tables
-|  |  +- 3_close_crm_users_raw             <- Pipeline 3: close_crm_users_raw -> close_crm_users_processed
-|  |  +- 4_custom_activites_raw            <- Pipeline 4: custom_activites_raw -> custom_activites_processed
-|  |  +- 5_all_payments                    <- Pipeline 5
-|  |  +- 6_calendly_scheduled_events       <- Pipeline 6
-|  |  +- 7_student_sentiment               <- Pipeline 7
-|  |  +- 8_mdl_users_raw                   <- Pipeline 8
-|  |  +- 9_lead_merges                      <- Pipeline 9
-+- 2_Silver/
-|  +- 2_1_02_Silver_leads_processed_custom  <- Additional: custom fields extracted from leads_processed
-|  +- 2_2_02_Silver_lead_activites_body_text <- Additional: email body text extracted from body_text_quoted
++- 00_README_.md                              <- This file
++- utils.py                                   <- Shared utility (process_table, parse_bronze_table, etc.)
++- 1_Bronze/
+|  +- 1_1_Bronze_config                       <- JDBC connection settings
+|  +- 1_2_Bronze_ingestion                    <- Loop over 9 source tables, append-only load
++- 2_Silver/                                  <- 11 processing notebooks (all call %run ../utils)
+|  +- 2_1_01_Silver_leads_processed            <- leads_raw -> leads_processed
+|  +- 2_1_02_Silver_leads_processed_custom     <- leads_processed -> custom fields extracted
+|  +- 2_1_03_01_Silver_leads_processed_contacts <- leads_raw -> contacts array exploded
+|  +- 2_1_03_02_Silver_leads_processed_contacts_emails <- contacts -> emails exploded
+|  +- 2_2_01_Silver_lead_activites_processed    <- lead_activites_raw -> lead_activites_processed
+|  +- 2_2_02_Silver_lead_activites_email_body   <- Email body text from body_text_quoted
+|  +- 2_3_Silver_close_crm_users_processed      <- close_crm_users_raw -> close_crm_users_processed
+|  +- 2_4_Silver_custom_activites_processed     <- custom_activites_raw -> custom_activites_processed
+|  +- 2_5_Silver_calendly_scheduled_events_processed <- calendly events processed
+|  +- 2_6_Silver_student_sentiment_processed    <- student sentiment processed
+|  +- 2_7_Silver_mdl_users_processed            <- mdl_users_raw -> mdl_users_processed
+|  +- 2_8_Silver_user_mapping                   <- Exploratory identity analysis (not in job)
 +- 3_Gold/
-   +- 3_3_Gold_Customer_Health_Profile      <- Customer Health Profile (current focus)
+   +- 3_1_Gold_Leads_Activities_Summary         <- CRM users + leads activities summary
+   +- 3_2_Gold_Sales_Details                    <- Sales details with CSM resolution
+   +- 3_3_Gold_Customer_Health_Profile           <- Customer Health Profile (all 7 metrics + scoring)
 ```
 
 ---
@@ -60,23 +67,39 @@ student-engagement/
 ## 3. Full Execution Order
 
 ```
-Step 1: Bronze config + ingestion (9 tables from PostgreSQL)
+Step 1: Bronze ingestion (1_2_Bronze_ingestion)
+            9 PostgreSQL tables -> crm_ingestion.bronze (append-only)
             |
             v
-Step 2: 9 Silver pipeline notebooks (one per bronze table)
-            Each calls: %run utils -> process_table('bronze_table', 'silver_table')
-            Creates: parent silver table + child tables (arrays exploded, custom fields extracted)
+Step 2: 11 Silver notebooks (all run in parallel, depend on Bronze)
+            Each calls: %run ../utils -> process_table('bronze_table', 'silver_table')
+            - 2_1_01: leads_processed
+            - 2_1_02: leads_processed_custom
+            - 2_1_03_01/02: contacts + emails
+            - 2_2_01: lead_activites_processed
+            - 2_2_02: lead_activites_email_body
+            - 2_3: close_crm_users_processed
+            - 2_4: custom_activites_processed
+            - 2_5: calendly_scheduled_events_processed
+            - 2_6: student_sentiment_processed
+            - 2_7: mdl_users_processed
             |
             v
-Step 3: Additional silver notebooks (as needed for Gold)
-            - 2_1_02: leads_processed_custom (custom fields for health profile)
-            - 2_2_02: lead_activites_email_body (email body text for meeting detection)
+Step 3: Gold (sequential dependencies)
+            3_1_Gold_Leads_Activities_Summary (depends on all silver)
+                -> gold.close_crm_users_processed, gold.leads_activities_summary
+                |
+                v
+            3_2_Gold_Sales_Details (depends on 3_1)
+                -> gold.sales_details
+                |
+                v
+            3_3_Gold_Customer_Health_Profile (depends on 3_2 + all silver)
+                -> gold.customer_health_profile (7 metrics + scoring + health bands)
             |
             v
-Step 4: Gold notebook (3_3_Gold_Customer_Health_Profile)
-            - Create view_customer_health_base (coaching clients + custom fields)
-            - Calculate engagement metrics from raw activities (in progress)
-            - Join all metrics to base view (pending)
+Orchestrated by: Databricks Job (ID: 299306717398586)
+            15 tasks, daily 8:00 AM EST, serverless compute
 ```
 
 ---
@@ -184,70 +207,85 @@ Each pipeline notebook reads one bronze table, parses JSON via utils, and writes
 
 ---
 
-## 6. Gold Layer (Current State)
-
-### 6.1 Notebook: `3_3_Gold_Customer_Health_Profile`
+### 5.4 `2_8_Silver_user_mapping` (Exploratory — Not in Pipeline)
 
 | Field | Value |
 |---|---|
-| **Type** | Notebook (SQL + Python) |
-| **Path** | `/Users/scottsbv@gmail.com/student-engagement/3_Gold/3_3_Gold_Customer_Health_Profile` |
-| **Purpose** | Build the Customer Health Profile step-by-step from raw activity data |
+| **Notebook** | `2_8_Silver_user_mapping` |
+| **Full Name** | N/A (outputs to temp views, no persistent table) |
+| **Purpose** | Exploratory identity analysis to determine if different LEAD_IDs could be linked to the same person |
 
-### 6.2 Base View: `view_customer_health_base`
+**What it does:**
+1. Compares leads by email, phone, and display_name to find potential duplicate identities across LEAD_IDs
+2. Explores whether a `master_user_id` grouping could consolidate related leads into a single customer record
+3. Analyzes match rates between `leads_processed`, `leads_processed_contacts`, `mdl_users`, and `student_sentiment`
+4. Tests join feasibility between sentiment data (Channel_ID) and CRM leads (LEAD_ID)
 
-| Field | Value |
-|---|---|
-| **Full Name** | `crm_ingestion.gold.view_customer_health_base` |
-| **Cell** | 5 (CREATE OR REPLACE VIEW) |
-| **Row count** | 1,584 coaching clients |
-| **Purpose** | Foundation for the health profile — deduplicated coaching clients with pre-calculated CRM custom fields |
+**Why it's NOT used in the pipeline:**
+* Project requirements explicitly prohibit merging or canonicalizing Lead IDs — each LEAD_ID must remain independent
+* The Customer Health Profile is built per-source LEAD_ID (one row per lead, no grouping or consolidation)
+* Health scores and metrics are calculated independently for each LEAD_ID
+* Email lookup is handled via `array_contains(emails, email)` on the emails array column in `customer_health_profile` — no identity merge needed
+* Direct `student_sentiment` join was found infeasible (Channel_ID formats don't match LEAD_ID or contact IDs), so sentiment metrics use `leads_processed_custom` instead
 
-**Logic:**
-1. Deduplicate `leads_processed` by `id` (ROW_NUMBER, latest by `date_updated DESC, bronze_insert_date DESC`), filter to `status_label = 'Coaching Client'`
-2. Deduplicate `leads_processed_custom` by `leads_processed_id` (ROW_NUMBER, latest by `bronze_insert_date DESC`)
-3. LEFT JOIN leads to custom fields on `id = leads_processed_id`
-4. Clean `\N` values to NULL using `NULLIF` on all custom field columns
-
-**Key columns:** `id`, `status_label`, `date_updated`, `bronze_insert_date`, plus all pre-calculated CRM custom fields (DAYS_SINCE_LAST_EMAIL, DAYS_SINCE_LAST_MEETING, TOTAL_MISSED_CALLS, ENGAGEMENT_PATTERN, FINAL_SCORE, HEALTH_BAND, CSM, Contracted_Value, Tier, etc.)
+**Status:** Retained for reference and future exploratory analysis only. NOT included in the Databricks Job (15 tasks) and does NOT produce any silver or gold tables. The notebook documents why identity consolidation was explored and ultimately rejected per spec.
 
 ---
 
-### 6.3 Self-Calculated Engagement Metric: DAYS_SINCE_LAST_EMAIL
+## 6. Gold Layer (Complete)
 
-| Field | Value |
+### 6.1 Notebooks (3 total)
+
+| # | Notebook | Purpose | Outputs |
+|---|---|---|---|
+| 1 | `3_1_Gold_Leads_Activities_Summary` | CRM users + leads activities summary | `gold.close_crm_users_processed`, `gold.leads_activities_summary` |
+| 2 | `3_2_Gold_Sales_Details` | Sales context with CSM name resolution | `gold.sales_details` |
+| 3 | `3_3_Gold_Customer_Health_Profile` | All 7 metrics + scoring + health bands | `gold.customer_health_profile` |
+
+Dependencies: 3_1 → 3_2 → 3_3 (sequential). All 3 depend on Silver layer.
+
+### 6.2 Engagement Metrics (7 CTEs, Cells 2-8 in 3_3)
+
+All metrics are per-source LEAD_ID (no identity consolidation). Email lookup via `array_contains(emails, email)` on collected emails array.
+
+| # | Metric | Source | Description |
+|---|---|---|---|
+| 1 | Email recency | `lead_activites_processed` + `lead_activites_email_body` | Days since last inbox email (excludes Calendly/system emails) |
+| 2 | Meeting recency (CRM) | `lead_activites_email_body` | Days since last Calendly scheduling email |
+| 3 | Meeting recency (Calendly) | `calendly_scheduled_events` | Days since last Calendly event |
+| 4 | Missed calls | `lead_activites_processed` | Count of missed inbound calls |
+| 5 | Upcoming meetings | `calendly_scheduled_events` | Days to next upcoming meeting |
+| 6 | Platform login | `mdl_users` | Days since last login (matched via contacts.name = USERNAME) |
+| 7 | Sentiment/Message recency | `leads_processed_custom` | Days since last message from client/team + sentiment |
+
+**Note:** Direct `student_sentiment` join is not possible — Channel_ID formats are incompatible. Sentiment metrics use `leads_processed_custom` (CRM pre-calculated values).
+
+### 6.3 Health Score Logic (Cell 9 in 3_3)
+
+The final query combines all 7 metrics with sales context via multi-level CTE layering:
+
+1. **health_metrics** — Join all metrics + sales details + lead names/emails array
+2. **flags** — Binary flags: email_engaged (≤14d), meeting_engaged (≤30d), platform_engaged (≤30d), slack_engaged (sentiment present)
+3. **patterns** — Engagement pattern from flag combinations
+4. **scores** — Base score + missed call adjustment (-5/call, min 0) + sentiment adjustment
+
+### 6.4 Health Bands
+
+| Score | Band |
 |---|---|
-| **Cell** | 12 |
-| **Row count** | 5,497 leads |
-| **Source tables** | `lead_activites_processed` + `lead_activites_email_body` (LEFT JOIN) |
+| >= 75 | GOOD |
+| 50-74 | AVERAGE |
+| < 50 | POOR |
+| No data | NO DATA |
 
-**Logic:**
-1. Filter `lead_activites_processed` to `type = 'Email' AND status = 'inbox'`
-2. LEFT JOIN to `lead_activites_email_body` on `id = activity_id` to get email body text
-3. Exclude Calendly/system emails: `body_text NOT ILIKE '%A new event has been scheduled.%'`, `NOT ILIKE '%is requesting access to the following folder%'`, `NOT ILIKE '%requests access to an item%'`
-4. Deduplicate by activity `id` (ROW_NUMBER, `PARTITION BY id ORDER BY date_updated DESC, bronze_insert_date DESC`, keep rn=1)
-5. Find latest email per lead (ROW_NUMBER, `PARTITION BY lead_id ORDER BY activity_at DESC`, keep rn=1)
-6. Calculate `DATEDIFF(CURRENT_DATE, DATE(activity_at)) AS days_since_last_email`
+### 6.5 Table Schema
 
-**Impact of exclusions:** Without the `body_text` join, Calendly scheduling emails were counted as "last email" for 1,844 leads. The exclusion reduced the result from 7,341 to 5,497 leads.
-
----
-
-### 6.4 Self-Calculated Engagement Metric: DAYS_SINCE_LAST_MEETING
-
-| Field | Value |
-|---|---|
-| **Cell** | 15 |
-| **Row count** | 6,226 leads |
-| **Source table** | `lead_activites_email_body` |
-
-**Logic:**
-1. Filter `lead_activites_email_body` to `body_text ILIKE '%A new event has been scheduled.%'` (Calendly scheduling emails)
-2. Deduplicate by `activity_id` (ROW_NUMBER, `PARTITION BY activity_id ORDER BY bronze_updated_at DESC, bronze_insert_date DESC`, keep rn=1)
-3. Find latest meeting per lead (ROW_NUMBER, `PARTITION BY lead_id ORDER BY activity_at DESC`, keep rn=1)
-4. Calculate `DATEDIFF(CURRENT_DATE, DATE(activity_at)) AS days_since_last_meeting`
-
-**Key finding:** The spec says to search for "A new event has been scheduled" in the activity text. This text does NOT exist in `lead_activites_processed.text` (which is SMS text, NULL for emails). It lives inside `body_text_quoted[0].text` in the raw JSON — a nested array field that was lost during silver schema inference. The `lead_activites_email_body` table was created specifically to extract this text.
+`gold.customer_health_profile` supports direct `array_contains(email)` lookup:
+- `lead_id` — primary key (per-source, no consolidation)
+- `lead_name`, `display_name`, `emails` (array) — identity + lookup
+- `csm_name` — resolved from `gold.close_crm_users_processed`
+- 7 metric columns + engagement flags + pattern + base_score + adjustments
+- `final_health_score`, `health_band`, `sentiment` (normalized for display)
 
 ---
 
@@ -289,15 +327,18 @@ All bronze tables: `raw_data` (string/JSON), `insert_date` (timestamp), `bronze_
 | 8 | `crm_ingestion.silver.mdl_users` | `bronze.mdl_users_raw` | Platform users |
 | 9 | `crm_ingestion.silver.lead_merges` | `bronze.lead_merges` | Lead merge history |
 | + | `crm_ingestion.silver.leads_processed_custom` | `silver.leads_processed` | CRM custom fields for health profile |
+| + | `crm_ingestion.silver.leads_processed_contacts` | `silver.leads_processed` | Contacts array exploded (one row per contact) |
+| + | `crm_ingestion.silver.leads_processed_contacts_emails` | `silver.leads_processed_contacts` | Contact emails exploded (one row per email) |
 | + | `crm_ingestion.silver.lead_activites_email_body` | `bronze.lead_activites_raw` | Email body text from `body_text_quoted` (1,553,927 rows) |
 
-### Gold Layer (current)
+### Gold Layer (complete)
 
 | # | Full Name | Type | Description |
 |---|---|---|---|
-| 1 | `crm_ingestion.gold.view_customer_health_base` | VIEW | 1,584 coaching clients with pre-calculated CRM custom fields |
-| 2 | *(metric query)* | SQL cell 12 | `DAYS_SINCE_LAST_EMAIL` — 5,497 leads, self-calculated from raw activities |
-| 3 | *(metric query)* | SQL cell 15 | `DAYS_SINCE_LAST_MEETING` — 6,226 leads, self-calculated from email body text |
+| 1 | `crm_ingestion.gold.close_crm_users_processed` | TABLE | CRM user dimension (from 3_1) |
+| 2 | `crm_ingestion.gold.leads_activities_summary` | TABLE | Activities summary per lead (from 3_1) |
+| 3 | `crm_ingestion.gold.sales_details` | TABLE | Sales context with CSM resolution (from 3_2) |
+| 4 | `crm_ingestion.gold.customer_health_profile` | TABLE | Customer Health Profile — all metrics + scoring (from 3_3) |
 
 ---
 
@@ -318,9 +359,30 @@ All deduplication uses ROW_NUMBER with `PARTITION BY <primary key> ORDER BY <tim
 
 ---
 
-## 9. Health Score Logic (Spec — Not Yet Implemented)
+## 8.5 Databricks Job Orchestration
 
-The self-calculated metrics will eventually feed into the health score. The spec defines:
+| Field | Value |
+|---|---|
+| **Job Name** | Student Engagement Pipeline |
+| **Job ID** | 299306717398586 |
+| **Schedule** | Daily at 8:00 AM EST (`0 0 8 * * ?`, America/New_York) |
+| **Compute** | Serverless (auto-provisioned per task) |
+| **Tasks** | 15 total (1 bronze + 11 silver + 3 gold) |
+| **Dependencies** | Bronze → 11 silver (parallel) → 3 gold (sequential: 3_1 → 3_2 → 3_3) |
+| **Run if** | ALL_SUCCESS (downstream tasks skip if any upstream fails) |
+| **Max concurrent runs** | 1 |
+
+**How to run manually:** Click "Run" on the job page, or use `databricks jobs run-now 299306717398586`.
+
+**How to repair a failed run:** `databricks jobs repair-run <run_id> --rerun-all-failed-tasks --rerun-dependent-tasks` — re-runs only failed tasks and their dependents, preserving successful results.
+
+**Note:** The job is a Databricks workspace asset — it is NOT stored in the Git repo. Only the notebook files are version-controlled. The job references notebooks by their workspace paths.
+
+---
+
+## 9. Health Score Logic (Implemented)
+
+The self-calculated metrics feed into the health score. The spec defines:
 
 **Formula:** `FINAL_HEALTH_SCORE = Base Engagement Score + Missed Call Adjustment + Sentiment Adjustment`
 
@@ -352,23 +414,20 @@ The self-calculated metrics will eventually feed into the health score. The spec
 
 ### Completed
 
-* Bronze layer: 9 tables ingested from PostgreSQL
-* Silver layer: 9 pipeline notebooks processing all bronze tables via `process_table()`
-* Silver layer: `leads_processed_custom` (CRM custom fields for health profile)
-* Silver layer: `lead_activites_email_body` (email body text extraction — fills gap in `lead_activites_processed`)
-* Gold layer: `view_customer_health_base` (1,584 coaching clients with pre-calculated CRM fields)
-* Gold metric: `DAYS_SINCE_LAST_EMAIL` (5,497 leads, self-calculated with Calendly exclusions)
-* Gold metric: `DAYS_SINCE_LAST_MEETING` (6,226 leads, self-calculated from Calendly scheduling emails)
+* Bronze layer: 9 tables ingested from PostgreSQL (append-only, 3-cell notebook)
+* Silver layer: 11 processing notebooks + `utils.py` (shared `process_table` function)
+* Gold layer: 3 notebooks — 3_1 (activities + CRM users), 3_2 (sales details), 3_3 (customer health profile)
+* All 7 engagement/sentiment metrics implemented and verified in 3_3 (Cells 2-8)
+* Health score logic fully implemented (flags → patterns → base score → adjustments → bands)
+* `gold.customer_health_profile` table supports email array lookup
+* Databricks Job created (ID: 299306717398586): 15 tasks, daily 8:00 AM EST, serverless compute
+* Pipeline successfully tested end-to-end (all 15 tasks succeeded)
+* All changes committed and pushed to GitHub (commit `209f3fe`, Oct 18)
 
-### Remaining (per spec)
+### Notes
 
-* `TOTAL_MISSED_CALLS` — count missed inbound calls from `lead_activites_processed` where `type = 'Call'`
-* `DAYS_SINCE_LAST_LOGIN` — from `mdl_users` (platform login recency)
-* `DAYS_SINCE_LAST_MEETING_CALENDLY` — from `calendly_scheduled_events` (separate from CRM meeting metric)
-* `DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT` — from Slack sentiment data
-* `DAYS_SINCE_LAST_MESSAGE_FROM_TEAM_MEMBER` — from Slack sentiment data
-* `UPCOMING_MEETING_DAYS` — from Calendly (future meetings)
-* Join all metrics to `view_customer_health_base` by `lead_id`
-* Calculate engagement flags, engagement pattern, health score, and health band
-* Write final `gold.leads_account_details_updates` table
-* Gold notebooks `3_1_Gold_Leads_Activities_Summary` and `3_2_Gold_Sales_Details` (not yet started)
+* Health is per-source LEAD_ID — no identity consolidation per spec requirements
+* Sentiment metrics use `leads_processed_custom` — direct `student_sentiment` join not possible (incompatible Channel_ID formats)
+* Platform login matches 23 Coaching Clients via `contacts.name = mdl_users.USERNAME` (emails are masked)
+* Upcoming meetings metric may return 0 rows if all upcoming events are in the past relative to run date
+* `2_8_Silver_user_mapping` notebook (section 5.4) explores whether different LEAD_IDs could be linked to the same person via email/phone/name matching, and tests sentiment-to-lead join feasibility. It is NOT part of the job or deliverables — project requirements prohibit Lead ID consolidation, and the notebook documents why this approach was explored and rejected
