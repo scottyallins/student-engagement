@@ -22,7 +22,7 @@
 from pyspark.sql.functions import (
     col, lit, from_json, schema_of_json, explode_outer, udf,
     get_json_object, regexp_replace, to_json, expr, create_map,
-    md5, concat_ws, coalesce
+    md5, concat_ws, coalesce, when, sum as spark_sum
 )
 from pyspark.sql.types import (
     StructType, ArrayType, StringType, IntegerType, LongType
@@ -30,7 +30,9 @@ from pyspark.sql.types import (
 from builtins import round, max, min
 import time, re, json
 
-# JSON repair UDF defined in cell 3 (teacher's parse_activity_final logic)
+# JSON repair UDF defined in cell 3.
+# NOTE: _PROBLEM_KEYS (in cell 3) is DOMAIN-SPECIFIC to Close CRM, not universal.
+# It was discovered empirically by profiling source data — see cell 3 for methodology.
 
 CATALOG = "crm_ingestion"
 BRONZE_SCHEMA = "bronze"
@@ -61,19 +63,64 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 
 # DBTITLE 1,JSON Repair UDF
 # ============================================================================
-# JSON REPAIR UDF — one-size-fits-all JSON normalization
+# JSON REPAIR UDF — universal JSON normalization with type-based wrapper detection
 # ============================================================================
-# Handles ALL Close CRM table shapes:
-#   1. JSON_OBJECT wrapper → extracts + repairs inner JSON
-#   2. "data" key → returns just the data array
-#   3. Preserves apostrophes in words (e.g. Prospect's Name)
-#   4. Nulls problem keys (description, notes, etc.) via scan-based string match
-#   5. Converts single quotes → double quotes (delimiters only)
-#   6. Also nulls problem keys programmatically as a safety net
-#   7. Returns clean JSON string ready for from_json()
+# Detects and unwraps JSON wrappers by TYPE INSPECTION, not by hardcoded key names.
+# This makes the UDF universal: it works on any table regardless of what the
+# source system names its wrapper keys (JSON_OBJECT, data, payload, records, etc.).
+#
+# Wrapper detection rules (applied recursively):
+#   1. If a dict has a value that is a STRING starting with '{' or '[' → stringified
+#      inner JSON. Extract, repair single quotes if needed, re-parse, recurse.
+#   2. If a dict has exactly ONE key whose value is a LIST → array wrapper.
+#      Extract the list.
+#   3. Otherwise → actual record. Null problem keys and return.
+#
+# Additional normalization:
+#   - Preserves apostrophes in words (e.g. Prospect's Name)
+#   - Nulls problem keys (description, notes, etc.) via scan-based string match
+#   - Converts single quotes → double quotes (delimiters only)
+#   - Also nulls problem keys programmatically as a safety net
+#   - Returns clean JSON string ready for from_json()
 
 
+# ----------------------------------------------------------------------------
+# PROBLEM KEYS — DOMAIN-SPECIFIC, NOT UNIVERSAL
+# ----------------------------------------------------------------------------
+# These 6 field names are free-text fields in Close CRM's schema that contain
+# unparseable characters (apostrophes, emojis, special chars, very long strings)
+# that break JSON parsing. They were NOT known in advance — they were discovered
+# empirically during pipeline development by profiling source data:
+#
+#   1. First version of the UDF parsed everything without nulling any keys.
+#   2. Some rows returned NULL (json.loads failed) on fields like 'text', 'subject'.
+#   3. Inspection of failing rows showed free-text content with apostrophes,
+#      emojis, pipes, dollar signs, newlines — any of which break quote repair.
+#   4. The specific field names causing failures were added to this set.
+#
+# To discover problem keys for a NEW project/source system:
+#   - Profile the source data: sample rows, attempt json.loads, collect failures
+#   - Inspect which field names appear across failed parses
+#   - Check source API docs for fields typed as TEXT/VARCHAR (free-text candidates)
+#   - Start with an empty set, add fields as parse failures reveal them
+#   - The all-NULL field validation in parse_bronze_table catches silent failures
+#
+# What makes a field a problem key:
+#   - It contains user-entered or system-generated free text (not structured data)
+#   - Its content is not needed for downstream joins, metrics, or identity resolution
+#   - Nulling it costs nothing; keeping it risks losing the entire row on parse failure
+#
+# This set is Close CRM-specific. A different CRM (Salesforce, HubSpot) would have
+# different field names. A non-CRM system (IoT, finance) would have entirely
+# different fields. The FUNCTION is universal; the SET is not.
+# ----------------------------------------------------------------------------
 _PROBLEM_KEYS = {"description", "notes", "body_text", "subject", "text", "note"}
+# Fields in Close CRM:  text = task descriptions, email bodies (leads_raw, lead_activites_raw)
+#   body_text = meeting/event body text (lead_activites_raw) — NOT body_text_quoted (different field)
+#   subject = email/meeting subject lines (lead_activites_raw)
+#   note = meeting notes (lead_activites_raw)
+#   description = lead descriptions (leads_raw)
+#   notes = plural variant of note (safety net, may appear in some records)
 
 
 def _null_problem_keys(obj):
@@ -113,53 +160,98 @@ def _null_problem_keys_in_string(s):
     return s
 
 
+def _repair_single_quotes(s):
+    """Repair Python-style single-quoted JSON to valid double-quoted JSON.
+    Preserves apostrophes in words, nulls problem keys before quote replacement.
+    """
+    # Preserve apostrophes in words (e.g. Prospect's Name)
+    repaired = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROPHE\2", s)
+    # Null out problem keys (scan-based, before quote replacement)
+    repaired = _null_problem_keys_in_string(repaired)
+    # Replace remaining single quotes with double quotes, restore apostrophes
+    repaired = repaired.replace("'", '"').replace("APOSTROPHE", "'")
+    return repaired
+
+
+def _detect_and_unwrap(parsed):
+    """Recursively unwrap JSON wrappers by TYPE INSPECTION (not by key name).
+
+    Detection rules (applied recursively until actual records are reached):
+      1. If a dict has a value that is a string starting with '{' or '[' → stringified
+         inner JSON. Try to parse it (with single-quote repair fallback). If successful,
+         recurse on the inner data.
+      2. If a dict has exactly ONE key whose value is a list → array wrapper. Extract the list.
+      3. Otherwise → actual record, return as-is.
+
+    This is universal: it does not check for specific key names like 'JSON_OBJECT' or 'data'.
+    It detects wrappers by inspecting value types, so it works on any source system
+    regardless of what they name their wrapper keys.
+    """
+    if isinstance(parsed, dict):
+        # Rule 1: Check for stringified inner JSON wrapper (any value that looks like JSON)
+        for key, val in parsed.items():
+            if isinstance(val, str) and val.strip() and val.strip()[0] in ('{', '['):
+                # Try parsing as-is first (might already be valid JSON)
+                try:
+                    inner = json.loads(val.strip())
+                    return _detect_and_unwrap(inner)
+                except (json.JSONDecodeError, TypeError):
+                    # Try repairing single quotes and re-parsing
+                    try:
+                        repaired = _repair_single_quotes(val)
+                        inner = json.loads(repaired)
+                        return _detect_and_unwrap(inner)
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # Not a JSON wrapper, continue checking other keys
+
+        # Rule 2: Single-key array wrapper (dict with exactly one key whose value is a list)
+        if len(parsed) == 1:
+            val = next(iter(parsed.values()))
+            if isinstance(val, list):
+                # Recurse on the extracted list — elements may have their own wrappers
+                return _detect_and_unwrap(val)
+
+        # No wrapper detected — actual record
+        return parsed
+
+    elif isinstance(parsed, list):
+        # Recurse into each element — an element may itself have a wrapper.
+        # For example [{"payload": "{ 'records': [...] }"}] needs each element unwrapped.
+        # Clean records (dicts with multiple keys, no stringified values) pass through
+        # unchanged — _detect_and_unwrap returns them as-is via Rule 3.
+        return [_detect_and_unwrap(item) for item in parsed]
+
+    return parsed
+
+
 def _parse_activity_final(raw):
-    """Normalize Close CRM JSON and return a valid JSON string for ALL tables."""
+    """Normalize JSON and return a valid JSON string for ALL tables.
+    Uses universal wrapper detection by type inspection, not by hardcoded key names.
+
+    Problem keys: _PROBLEM_KEYS is domain-specific to Close CRM (see comment above).
+    For a new source system, profile the data to discover which free-text fields
+    break parsing, then populate _PROBLEM_KEYS with those field names.
+    """
     if not raw:
         return None
 
     try:
         outer = json.loads(raw.strip())
+    except (json.JSONDecodeError, TypeError):
+        # Outer JSON has single quotes — try repairing
+        try:
+            repaired = _repair_single_quotes(raw.strip())
+            outer = json.loads(repaired)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
-        # Custom-activity / close_crm_users path: JSON_OBJECT contains a stringified payload
-        if isinstance(outer, dict) and "JSON_OBJECT" in outer:
-            json_obj_str = outer["JSON_OBJECT"]
+    # Universal wrapper unwrapping (type-based, not name-based)
+    unwrapped = _detect_and_unwrap(outer)
 
-            if not isinstance(json_obj_str, str) or not json_obj_str:
-                return None
+    # Null problem keys on the final unwrapped result (safety net)
+    _null_problem_keys(unwrapped)
 
-            # Step 1: Try parsing as-is (already valid JSON)
-            try:
-                inner = json.loads(json_obj_str)
-            except (json.JSONDecodeError, TypeError):
-                # Step 2: Repair single-quoted JSON
-                # 2a: Preserve apostrophes in words (e.g. Prospect's Name)
-                repaired = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROPHE\2", json_obj_str)
-                # 2b: Null out problem keys (scan-based, before quote replacement)
-                repaired = _null_problem_keys_in_string(repaired)
-                # 2c: Replace remaining single quotes with double quotes, restore apostrophes
-                repaired = repaired.replace("'", '"').replace("APOSTROPHE", "'")
-                try:
-                    inner = json.loads(repaired)
-                except (json.JSONDecodeError, TypeError):
-                    return None
-
-            # Step 3: Null out problem keys programmatically (safety net for already-valid JSON)
-            _null_problem_keys(inner)
-
-            # Step 4: Unwrap "data" array if present
-            if isinstance(inner, dict) and "data" in inner:
-                return json.dumps(inner["data"])
-            return json.dumps(inner)
-
-        # Lead-activity path: return only the data array
-        if isinstance(outer, dict) and "data" in outer:
-            return json.dumps(outer["data"])
-
-        return json.dumps(outer)
-
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        return None
+    return json.dumps(unwrapped)
 
 
 repair_json_udf = udf(StringType())(_parse_activity_final)
@@ -202,12 +294,23 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
     if not sample_row:
         return None
 
-    # Detect if data needs UDF repair (JSON_OBJECT wrapper, data key, or single-quote delimiters)
+    # Detect if data needs UDF repair — universal wrapper detection by type inspection
+    # Checks for: (a) unparseable JSON (single quotes), (b) stringified inner JSON wrapper,
+    # (c) single-key array wrapper. Does NOT check for specific key names.
     _needs_repair = False
     try:
         _sample_parsed = json.loads(sample_row["raw_data"].strip())
-        if isinstance(_sample_parsed, dict) and ("JSON_OBJECT" in _sample_parsed or "data" in _sample_parsed):
-            _needs_repair = True
+        if isinstance(_sample_parsed, dict):
+            # Check for stringified inner JSON (any value starting with '{' or '[')
+            for _val in _sample_parsed.values():
+                if isinstance(_val, str) and _val.strip() and _val.strip()[0] in ('{', '['):
+                    _needs_repair = True
+                    break
+            # Check for single-key array wrapper
+            if not _needs_repair and len(_sample_parsed) == 1:
+                _val = next(iter(_sample_parsed.values()))
+                if isinstance(_val, list):
+                    _needs_repair = True
     except (json.JSONDecodeError, TypeError):
         # Can't parse as standard JSON — likely single-quote delimiters, needs UDF
         _needs_repair = True
@@ -327,8 +430,35 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
     if valid == 0:
         return None
 
-    # Handle top-level type: struct → star-expand, array → explode first
+    # All-NULL field validation — catches silent from_json schema mismatches.
+    # A full table where EVERY field is NULL on EVERY row means the schema is wrong
+    # (wrong type, field name mismatch, UDF returned unexpected shape).
+    # Individual rows being all NULL or individual columns being all NULL is legitimate —
+    # only a full table of all-NULL indicates a problem and should prevent the write
+    # so previous silver data is preserved instead of being overwritten with garbage.
     parsed_type = df_parsed.schema["parsed"].dataType
+    _check_type = parsed_type.elementType if isinstance(parsed_type, ArrayType) else parsed_type
+    if isinstance(_check_type, StructType) and len(_check_type.fields) > 0:
+        # For ArrayType, explode first so we check element fields, not the array container
+        if isinstance(parsed_type, ArrayType):
+            _df_check = df_parsed.withColumn("_element", explode_outer(col("parsed"))).filter(col("_element").isNotNull())
+            _field_ref = lambda f: col(f"_element.`{f.name}`")
+        else:
+            _df_check = df_parsed.filter(col("parsed").isNotNull())
+            _field_ref = lambda f: col(f"parsed.`{f.name}`")
+        _null_counts = _df_check.select(*[
+            spark_sum(when(_field_ref(f).isNotNull(), 1).otherwise(0)).alias(f"_nc_{i}")
+            for i, f in enumerate(_check_type.fields)
+        ]).collect()[0]
+        _all_null = all(_null_counts[f"_nc_{i}"] == 0 for i, f in enumerate(_check_type.fields))
+        if _all_null:
+            print(f"  ⛔ ABORT: All {len(_check_type.fields)} fields are NULL across {valid:,} rows — schema mismatch")
+            print(f"  ⛔ Previous silver data preserved (write skipped)")
+            return None
+        _populated = sum(1 for i, f in enumerate(_check_type.fields) if _null_counts[f"_nc_{i}"] > 0)
+        print(f"  ✓ Field health: {_populated}/{len(_check_type.fields)} fields have data")
+
+    # Handle top-level type: struct → star-expand, array → explode first
     if isinstance(parsed_type, StructType):
         field_names = _dedup_names([_sanitize_col_name(f.name) for f in parsed_type.fields])
         select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at")]
