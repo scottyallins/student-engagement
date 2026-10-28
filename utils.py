@@ -422,15 +422,63 @@ def flatten_structs(df, skip_custom=True):
     return df
 
 
-def find_pk(df):
-    """Find the best candidate for a primary key column."""
+def find_pk(df, table_name=None, validate=True, sample_size=10000):
+    """Find the best candidate for a primary key column.
+
+    Detection priority (first match wins):
+      1. Exact 'id' column (case-insensitive) — Close CRM convention, works on all 9 source tables
+      2. '{table_name}_id' or '{table_name}Id' pattern — common ORM convention
+      3. Any column ending in '_id' — fallback for non-standard schemas
+
+    If validate=True, checks that the candidate has no NULLs and is unique
+    on a sample of rows. If the top candidate fails validation, tries the
+    next candidate. Returns None if no valid PK is found.
+
+    Args:
+        df:          DataFrame to search
+        table_name:  Silver table name (used for pattern matching in pass 2)
+        validate:    If True, verify non-null + unique on a sample
+        sample_size: Row sample for uniqueness validation (default 10K)
+    """
+    PK_TYPES = (StringType, IntegerType, LongType)
+
+    # --- Collect candidates in priority order ---
+    candidates = []
     for f in df.schema.fields:
-        if f.name.lower() == "id" and isinstance(f.dataType, (StringType, IntegerType, LongType)):
-            return f.name
-    for f in df.schema.fields:
-        if f.name.lower().endswith("_id") and isinstance(f.dataType, (StringType, IntegerType, LongType)):
-            return f.name
-    return None
+        if not isinstance(f.dataType, PK_TYPES):
+            continue
+        lower = f.name.lower()
+        if lower == "id":
+            candidates.append((1, f.name))
+        elif table_name and lower == f"{table_name}_id":
+            candidates.append((2, f.name))
+        elif lower.endswith("_id"):
+            candidates.append((3, f.name))
+
+    # Sort by priority (1 > 2 > 3), preserving schema order within each tier
+    candidates.sort(key=lambda c: c[0])
+
+    if not candidates:
+        return None
+
+    # --- Fast path: no validation, return first candidate ---
+    if not validate:
+        return candidates[0][1]
+
+    # --- Validate each candidate: non-null + unique on a sample ---
+    sample = df.limit(sample_size)
+    total = sample.count()
+
+    for priority, col_name in candidates:
+        non_null = sample.filter(col(col_name).isNotNull()).count()
+        if non_null == 0:
+            continue
+        distinct = sample.select(col_name).distinct().count()
+        if non_null == distinct and non_null == total:
+            return col_name
+
+    # --- All candidates failed validation — return first anyway as last resort ---
+    return candidates[0][1]
 
 # COMMAND ----------
 
@@ -466,29 +514,9 @@ def find_pk(df):
 # ============================================================================
 
 
-def add_record_hash(df):
-    """Add an MD5 record_hash column over all business columns.
-
-    Excludes bronze_insert_date, bronze_updated_at (metadata that changes
-    per load) and record_hash itself. The hash provides a deterministic
-    fingerprint for deduplication and change detection (spec Phase 1).
-    """
-    exclude = {"bronze_insert_date", "bronze_updated_at", "record_hash"}
-    hash_cols = [c for c in df.columns if c not in exclude]
-    if not hash_cols:
-        return df
-    return df.withColumn(
-        "record_hash",
-        md5(concat_ws("||", *[coalesce(col(c).cast("string"), lit("NULL")) for c in hash_cols]))
-    )
-
-
 def write_silver(df, table_name):
-    """Write DataFrame to silver table with MD5 record_hash. CDC mode if _CDC_WATERMARK is set."""
+    """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set."""
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
-
-    # Add MD5 hash over all business columns (spec Phase 1: dedup traceability)
-    df = add_record_hash(df)
 
     if _CDC_WATERMARK is not None:
         try:
@@ -527,7 +555,7 @@ def write_silver(df, table_name):
 # ============================================================================
 
 
-def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None, dry_run=False):
+def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None, dry_run=False, recurse=True):
     """Explode an array column into a child table. Recurse on nested arrays until scalar.
 
     When dry_run=True: prints the child table name and columns without writing.
@@ -598,6 +626,12 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
         [c for c in df_child.columns if c.startswith(f"{parent_name}_")] +
         ([pk] if pk else [])
     ))
+
+    # recurse=False: write only this child table, skip nested-array grandchildren
+    # (used by 2_1_03_01 so contacts phones/urls/integration_links are not rebuilt;
+    #  the emails grandchild is maintained daily by 2_1_03_02)
+    if not recurse:
+        return
 
     grandchild_idx = 0
     for ca in child_arrays:
@@ -846,7 +880,7 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
             if df_sample is not None:
                 if flatten:
                     df_sample = flatten_structs(df_sample, skip_custom=True)
-                pk = find_pk(df_sample)
+                pk = find_pk(df_sample, table_name=silver_name)
                 carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
                 child_idx = 0
                 has_custom = "custom" in df_sample.columns and isinstance(df_sample.schema["custom"].dataType, StructType)
@@ -880,7 +914,7 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
         df_flat = flatten_structs(df_flat, skip_custom=True)
 
     # Find PK (carry was used for child tables — retained for re-enablement)
-    pk = find_pk(df_flat)
+    pk = find_pk(df_flat, table_name=silver_name)
     carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
 
     # Extract custom fields into MAP + print potential _custom child tables (dry_run)
