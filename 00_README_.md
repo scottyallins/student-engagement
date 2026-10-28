@@ -8,7 +8,7 @@ A Databricks Medallion Architecture (Bronze → Silver → Gold) pipeline that t
 
 The pipeline uses a three-layer medallion architecture:
 
-**Bronze** — Raw data landing zone. 9 PostgreSQL source tables are loaded into Delta tables via JDBC. Only current-day records are loaded each run (daily append, no CDC or MERGE).
+**Bronze** — Raw data landing zone. 9 PostgreSQL source tables are loaded into Delta tables via JDBC. Incremental watermark loads rows after the max insert_date already in bronze, automatically recovering missed days. Optional backfill widgets allow manual date-range loads. No CDC or MERGE.
 
 **Silver** — Cleaned and normalized data. Each bronze table is processed by a pipeline notebook that calls shared utils to parse JSON, flatten structs, extract custom fields, explode arrays into child tables, and deduplicate snapshots. Additional silver tables were built for specific Gold-layer needs (email body text, custom lead fields).
 
@@ -21,7 +21,7 @@ The pipeline uses a three-layer medallion architecture:
 ```
 PostgreSQL (raw schema)
     |
-    v  JDBC, daily append (WHERE DATE(INSERT_DATE) = CURRENT_DATE)
+    v  JDBC, incremental watermark (insert_date > MAX(insert_date) in bronze), optional backfill widgets
 BRONZE (crm_ingestion.bronze)    9 raw Delta tables
     |
     v  %run utils -> process_table() -> parse_bronze_table -> flatten_structs -> write_silver
@@ -44,7 +44,7 @@ student-engagement/
 +- utils.py                                   <- Shared utility (process_table, parse_bronze_table, etc.)
 +- 1_Bronze/
 |  +- 1_1_Bronze_config                       <- JDBC connection settings
-|  +- 1_2_Bronze_ingestion                    <- Loop over 9 source tables, append-only load
+|  +- 1_2_Bronze_ingestion                    <- Loop over 9 source tables, incremental watermark + backfill widgets
 +- 2_Silver/                                  <- 11 processing notebooks (all call %run ../utils)
 |  +- 2_1_01_Silver_leads_processed            <- leads_raw -> leads_processed
 |  +- 2_1_02_Silver_leads_processed_custom     <- leads_processed -> custom fields extracted
@@ -72,7 +72,7 @@ student-engagement/
 
 ```
 Step 1: Bronze ingestion (1_2_Bronze_ingestion)
-            9 PostgreSQL tables -> crm_ingestion.bronze (append-only)
+            9 PostgreSQL tables -> crm_ingestion.bronze (incremental watermark)
             |
             v
 Step 2: 11 Silver notebooks (all run in parallel, depend on Bronze)
@@ -441,7 +441,7 @@ The self-calculated metrics feed into the health score. The spec defines:
 
 ### Production
 
-* Bronze layer: 9 tables ingested from PostgreSQL (append-only, config-driven JDBC)
+* Bronze layer: 9 tables ingested from PostgreSQL (incremental watermark, config-driven JDBC, backfill widgets)
 * Silver layer: 11 processing notebooks + shared `utils` notebook (type-based JSON repair, 200-row schema discovery, field-level NULL validation, selective array explosion)
 * Gold layer: 5 notebooks — 3_1 (activities + CRM users), 3_2 (sales details with CSM resolution), 3_3 (7 engagement metrics), 3_4 (lookups), 3_5 (customer health profile, MERGE SCD Type 1 on lead_id)
 * All 7 engagement/sentiment metrics implemented and verified in 3_3 (Cells 2-8)
