@@ -235,6 +235,7 @@ def _parse_activity_final(raw):
     if not raw:
         return None
 
+    repaired_row = False
     try:
         outer = json.loads(raw.strip())
     except (json.JSONDecodeError, TypeError):
@@ -242,14 +243,23 @@ def _parse_activity_final(raw):
         try:
             repaired = _repair_single_quotes(raw.strip())
             outer = json.loads(repaired)
+            repaired_row = True
         except (json.JSONDecodeError, TypeError):
             return None
 
     # Universal wrapper unwrapping (type-based, not name-based)
     unwrapped = _detect_and_unwrap(outer)
 
-    # Null problem keys on the final unwrapped result (safety net)
-    _null_problem_keys(unwrapped)
+    # Null problem keys ONLY on rows that needed single-quote repair.
+    # Rows whose JSON parsed cleanly are valid — nulling their free-text fields
+    # (text, body_text, subject, ...) destroys good data. This regressed Oct 28:
+    # universal wrapper detection started routing {"data": [...]} rows through this
+    # UDF, and the unconditional nulling wiped body_text_quoted[].text from every
+    # email, zeroing silver.lead_activites_email_body on each daily run.
+    # Clean rows keep their content; the quote-repair path still nulls the fields
+    # that originally broke parsing.
+    if repaired_row:
+        _null_problem_keys(unwrapped)
 
     return json.dumps(unwrapped)
 
@@ -651,7 +661,10 @@ def write_silver(df, table_name):
     if _CDC_WATERMARK is not None:
         try:
             spark.sql(f"DESCRIBE TABLE {full}")
-            wm_str = _CDC_WATERMARK.strftime("%Y-%m-%d %H:%M:%S")
+            # Keep microseconds: the DELETE window must exactly match the parse filter
+            # (bronze_updated_at > watermark). Truncating to seconds made the DELETE
+            # wider than the read, silently dropping the previous batch's newest rows.
+            wm_str = _CDC_WATERMARK.strftime("%Y-%m-%d %H:%M:%S.%f")
             spark.sql(f"DELETE FROM {full} WHERE bronze_updated_at > '{wm_str}'")
             df.write.format("delta").mode("append") \
                 .option("mergeSchema", "true") \
@@ -1004,7 +1017,7 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
                 print(f"  ⚠️ Could not read existing silver tables: {str(e)[:80]}")
 
             # Re-parse a small sample to discover full schema and lineage tree (dry run)
-            _CDC_WATERMARK = None
+            #_CDC_WATERMARK = None
             print(f"\n  🔍 DRY RUN — re-parsing 200 sample rows for full lineage tree:")
             df_sample = parse_bronze_table(bronze_name, limit=200)
             if df_sample is not None:
