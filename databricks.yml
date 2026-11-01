@@ -1,5 +1,5 @@
 # Student Engagement Pipeline — Declarative Automation Bundle (DAB).
-# The nightly job (29 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
+# The nightly job (32 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
 # Deploy from a local clone: databricks bundle deploy --target prod   (see DEPLOY.md)
 
 bundle:
@@ -279,3 +279,24 @@ resources:
             - task_key: gold_health_profile
           notebook_task:
             notebook_path: 3_Gold/3_15_Gold_customer_health_history.ipynb
+        # ---------- GOLD: communication state (context table — NOT a health-score input) ----------
+        - task_key: gold_communication_state
+          depends_on:
+            - task_key: gold_leads_activity_fact
+            - task_key: gold_sentiment
+          notebook_task:
+            notebook_path: 3_Gold/3_16_Gold_communication_state.ipynb
+        - task_key: gold_communication_recency
+          depends_on:
+            - task_key: gold_leads_activity_fact
+            - task_key: gold_sentiment
+            - task_key: gold_health_profile
+          notebook_task:
+            notebook_path: 3_Gold/3_16_Gold_communication_recency.ipynb
+        # ---------- GOLD: company service scorecard (grades the COMPANY, not the client — NOT a health-score input) ----------
+        - task_key: gold_coaching_score
+          depends_on:
+            - task_key: gold_communication_recency
+            - task_key: gold_health_profile
+          notebook_task:
+            notebook_path: 3_Gold/3_17_Gold_coaching_score_by_client_health.ipynb
