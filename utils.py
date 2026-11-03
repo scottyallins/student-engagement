@@ -20,7 +20,7 @@
 # ============================================================================
 
 from pyspark.sql.functions import (
-    col, lit, from_json, schema_of_json, explode_outer, udf,
+    col, lit, from_json, schema_of_json, explode, explode_outer, udf,
     get_json_object, regexp_replace, to_json, expr, create_map,
     md5, concat_ws, coalesce, when, sum as spark_sum
 )
@@ -63,126 +63,160 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 
 # DBTITLE 1,JSON Repair UDF
 # ============================================================================
-# JSON REPAIR UDF — universal JSON normalization with type-based wrapper detection
+# JSON REPAIR UDF — universal normalization with type-based wrapper detection
 # ============================================================================
-# Detects and unwraps JSON wrappers by TYPE INSPECTION, not by hardcoded key names.
-# This makes the UDF universal: it works on any table regardless of what the
-# source system names its wrapper keys (JSON_OBJECT, data, payload, records, etc.).
+# ESCALATION LADDER — first success wins, fail-safe NULL at the end.
+# This ladder is the accumulated reasoning from the repair design sessions;
+# keep it in sync with _parse_activity_final:
+#   Rung 1. Direct parse (fast path). Clean double-quoted JSON needs no
+#      surgery — apostrophes are legal inside values, so free text survives
+#      untouched. Wrapper unwrap happens AFTER any successful parse (a
+#      wrapper IS valid JSON; you cannot extract it from a string you
+#      cannot parse without fragile regex surgery) — see _detect_and_unwrap.
+#   Rung 2. String-level unwrap (bounded insurance): a row that is exactly
+#      a single-key single-quoted wrapper {'key': '<stringified JSON>'}
+#      gets its inner string extracted and the WHOLE ladder run recursively
+#      on it. This rescues the one shape the quote flip can never reach:
+#      a single-quoted outer holding a double-quoted inner, because
+#      flipping the outer quotes corrupts the inner ones before the inner
+#      is ever seen. Anchored pattern, one key only, skip on no-match,
+#      fall through to the flip on any failure.
+#   Rung 3. Quote flip: APOSTROWORD protects word apostrophes (letter'
+#      letter, e.g. O'Brien, it's) globally BEFORE any quote is flipped;
+#      then all ' → " and APOSTROWORD → ' (reverted in TEXT space before
+#      parse — safe because ' is legal inside double-quoted values).
+#   Rung 4. Wrap+token: problem-key values are wrapped in a single-element
+#      array and every ' inside is replaced with (*APOSTROPHE*) — catching
+#      the apostrophes APOSTROWORD cannot (non-word-adjacent, e.g. girls'
+#      night). Reverted in OBJECT space after parse, where every character
+#      is legal — that post-parse revert point is what makes the token
+#      scheme sound.
+#   Rung 5. NULL — fail-safe drop, visible in the engine's parse % line.
 #
-# Wrapper detection rules (applied recursively):
-#   1. If a dict has a value that is a STRING starting with '{' or '[' → stringified
-#      inner JSON. Extract, repair single quotes if needed, re-parse, recurse.
-#   2. If a dict has exactly ONE key whose value is a LIST → array wrapper.
-#      Extract the list.
-#   3. Otherwise → actual record. Null problem keys and return.
+# Wrapper detection (post-parse, recursive — every stringified inner JSON
+# re-runs the whole ladder on the inner string, so unwrap-then-parse
+# happens at every nesting level). Rules, by type inspection not key names:
+#   1. dict value that is a string starting with '{' or '[' → stringified JSON
+#   2. dict with exactly one key whose value is a list → array wrapper
+#      (guarded against the token scheme's own single-string wrap — see
+#      the inline comment in _detect_and_unwrap Rule 2)
+#   3. otherwise → actual record
 #
-# Additional normalization:
-#   - Preserves apostrophes in words (e.g. Prospect's Name)
-#   - Nulls problem keys (description, notes, etc.) via scan-based string match
-#   - Converts single quotes → double quotes (delimiters only)
-#   - Also nulls problem keys programmatically as a safety net
-#   - Returns clean JSON string ready for from_json()
+# Free-text fields (_PROBLEM_KEYS) are wrapped in a single-element array
+# only when quote repair is needed, then unwrapped after parse so the
+# original text is preserved. Clean rows are left untouched.
+#
+# _PROBLEM_KEYS is domain-specific (Close CRM free-text fields that break
+# quote repair). For a new source, profile failed parses and update the set.
+# The detection logic is universal; the key set is not.
 
-
-# ----------------------------------------------------------------------------
-# PROBLEM KEYS — DOMAIN-SPECIFIC, NOT UNIVERSAL
-# ----------------------------------------------------------------------------
-# These 6 field names are free-text fields in Close CRM's schema that contain
-# unparseable characters (apostrophes, emojis, special chars, very long strings)
-# that break JSON parsing. They were NOT known in advance — they were discovered
-# empirically during pipeline development by profiling source data:
-#
-#   1. First version of the UDF parsed everything without nulling any keys.
-#   2. Some rows returned NULL (json.loads failed) on fields like 'text', 'subject'.
-#   3. Inspection of failing rows showed free-text content with apostrophes,
-#      emojis, pipes, dollar signs, newlines — any of which break quote repair.
-#   4. The specific field names causing failures were added to this set.
-#
-# To discover problem keys for a NEW project/source system:
-#   - Profile the source data: sample rows, attempt json.loads, collect failures
-#   - Inspect which field names appear across failed parses
-#   - Check source API docs for fields typed as TEXT/VARCHAR (free-text candidates)
-#   - Start with an empty set, add fields as parse failures reveal them
-#   - The all-NULL field validation in parse_bronze_table catches silent failures
-#
-# What makes a field a problem key:
-#   - It contains user-entered or system-generated free text (not structured data)
-#   - Its content is not needed for downstream joins, metrics, or identity resolution
-#   - Nulling it costs nothing; keeping it risks losing the entire row on parse failure
-#
-# This set is Close CRM-specific. A different CRM (Salesforce, HubSpot) would have
-# different field names. A non-CRM system (IoT, finance) would have entirely
-# different fields. The FUNCTION is universal; the SET is not.
-# ----------------------------------------------------------------------------
 _PROBLEM_KEYS = {"description", "notes", "body_text", "subject", "text", "note"}
-# Fields in Close CRM:  text = task descriptions, email bodies (leads_raw, lead_activites_raw)
-#   body_text = meeting/event body text (lead_activites_raw) — NOT body_text_quoted (different field)
-#   subject = email/meeting subject lines (lead_activites_raw)
-#   note = meeting notes (lead_activites_raw)
-#   description = lead descriptions (leads_raw)
-#   notes = plural variant of note (safety net, may appear in some records)
 
-
-def _null_problem_keys(obj):
-    """Recursively null out free-text keys on parsed objects (not strings)."""
-    if isinstance(obj, dict):
-        for k in obj:
-            if k in _PROBLEM_KEYS:
-                obj[k] = None
-            else:
-                _null_problem_keys(obj[k])
-    elif isinstance(obj, list):
-        for item in obj:
-            _null_problem_keys(item)
-
-
-def _null_problem_keys_in_string(s):
-    """Null out problem key values in a single-quoted JSON string (before quote replacement).
-    Uses scan-based approach: finds 'key': ' then scans for closing ' followed by next key.
+def _wrap_problem_keys_in_string_and_tokenize(s, token="(*APOSTROPHE*)"):
+    """Wrap problem-key values and replace every ' in them with the token.
+    Example: 'key': 'O'Reilly' → 'key': ['O(*APOSTROPHE*)Reilly']
     """
     for key in _PROBLEM_KEYS:
-        marker = f"'{key}': '"
-        idx = s.find(marker)
-        while idx >= 0:
-            val_start = idx + len(marker)
-            # Find closing ' followed by next key: ', 'next_key':
-            m = re.search(r"'\s*,\s*'\w+'\s*:", s[val_start:])
-            if m:
-                closing_pos = val_start + m.start()
-                s = s[:idx] + f"'{key}': null" + s[closing_pos+1:]
-            else:
-                # Last key in object — look for ' followed by }
-                m2 = re.search(r"'\s*}", s[val_start:])
-                if m2:
-                    closing_pos = val_start + m2.start()
-                    s = s[:idx] + f"'{key}': null" + s[closing_pos+1:]
-            idx = s.find(marker, idx + len(f"'{key}': null"))
+        # Pattern: matches the problem key up to the next closing ', next key, or }
+        pattern = rf"('{key}'):\s*'(.*?)'(?=\s*,\s*'\w+'\s*:|\s*}})"
+        def _tokenize_apostrophe(match):
+            value = match.group(2).replace("'", token)
+            return f"{match.group(1)}: ['{value}']"
+        s = re.sub(pattern, _tokenize_apostrophe, s, flags=re.DOTALL)
     return s
 
 
-def _repair_single_quotes(s):
-    """Repair Python-style single-quoted JSON to valid double-quoted JSON.
-    Preserves apostrophes in words, nulls problem keys before quote replacement.
+def _restore_apostrophe_tokens(obj, token="(*APOSTROPHE*)"):
+    """In parsed dict/list, restore token to ' in problem keys after unwrapping."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _PROBLEM_KEYS:
+                if isinstance(v, list) and len(v) == 1:
+                    if isinstance(v[0], str):
+                        obj[k] = v[0].replace(token, "'")
+                elif isinstance(v, str):
+                    obj[k] = v.replace(token, "'")
+                else:
+                    _restore_apostrophe_tokens(v, token)
+            else:
+                _restore_apostrophe_tokens(v, token)
+    elif isinstance(obj, list):
+        for item in obj:
+            _restore_apostrophe_tokens(item, token)
+
+
+def _extract_single_quoted_wrapper(s):
+    """Ladder rung 2 — bounded string-level unwrap, pure insurance.
+    Matches ONLY a row that is exactly a single-key, single-quoted wrapper
+    whose value looks like stringified JSON:
+        {'payload': '{"id": "x"}'}
+    Returns the inner string, or None when the row is not that exact shape.
+    Bounded by construction:
+      - whole-string anchor: multi-key rows never match; they fall through
+        to the quote flip exactly as before this rung existed;
+      - the inner must start with '{' or '[' — a plain quoted value is a
+        string, not a wrapper;
+      - the greedy inner capture runs to the final quote of the string,
+        which is correct for a well-formed wrapper; any other ending fails
+        the anchor and falls through.
+    Why this rung exists: a single-quoted outer holding a double-quoted
+    stringified inner is the ONE shape the quote flip can never reach —
+    flipping the outer quotes corrupts the inner ones. Extracting the inner
+    first rescues it. Current bronze has zero rows in this shape; this rung
+    is insurance for future sources.
     """
-    # Preserve apostrophes in words (e.g. Prospect's Name)
-    repaired = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROPHE\2", s)
-    # Null out problem keys (scan-based, before quote replacement)
-    repaired = _null_problem_keys_in_string(repaired)
-    # Replace remaining single quotes with double quotes, restore apostrophes
-    repaired = repaired.replace("'", '"').replace("APOSTROPHE", "'")
-    return repaired
+    m = re.match(r"^\s*\{\s*'(\w+)'\s*:\s*'(.*)'\s*\}\s*$", s, flags=re.DOTALL)
+    if not m:
+        return None
+    inner = m.group(2).strip()
+    if inner and inner[0] in ("{", "["):
+        return m.group(2)
+    return None
+
+
+def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
+    """Try clean repair first. If parse fails: wrap problem keys, tokenize all ' inside them with token, then flip quotes.
+    """
+    # 1. Protect word apostrophes globally first (does not use token)
+    protected = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROWORD\2", s)
+
+    # 2. Try parse without wrap/token
+    attempt = protected.replace("'", '"').replace("APOSTROWORD", "'")
+    try:
+        json.loads(attempt)
+        return attempt          # clean success
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 3. Wrap & tokenize problem keys, then flip quotes
+    wrapped = _wrap_problem_keys_in_string_and_tokenize(protected, token=token)
+    attempt = wrapped.replace("'", '"').replace("APOSTROWORD", "'")
+    json.loads(attempt)         # validate
+    return attempt
+
+
+def _unwrap_problem_keys(obj):
+    """After successful parse, turn ['value'] back into 'value' for problem keys."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _PROBLEM_KEYS and isinstance(v, list) and len(v) == 1:
+                obj[k] = v[0]
+            else:
+                _unwrap_problem_keys(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            _unwrap_problem_keys(item)
 
 
 def _detect_and_unwrap(parsed):
     """Recursively unwrap JSON wrappers by TYPE INSPECTION (not by key name).
-
     Detection rules (applied recursively until actual records are reached):
       1. If a dict has a value that is a string starting with '{' or '[' → stringified
          inner JSON. Try to parse it (with single-quote repair fallback). If successful,
          recurse on the inner data.
-      2. If a dict has exactly ONE key whose value is a list → array wrapper. Extract the list.
+      2. If a dict has exactly ONE key whose value is a LIST → array wrapper.
+         Extract the list.
       3. Otherwise → actual record, return as-is.
-
     This is universal: it does not check for specific key names like 'JSON_OBJECT' or 'data'.
     It detects wrappers by inspecting value types, so it works on any source system
     regardless of what they name their wrapper keys.
@@ -200,78 +234,110 @@ def _detect_and_unwrap(parsed):
                     try:
                         repaired = _repair_single_quotes(val)
                         inner = json.loads(repaired)
+                        # Inner repair may have wrapped/tokenized problem keys —
+                        # restore HERE: the outer repaired_row flag in
+                        # _parse_activity_final never sees this nested repair,
+                        # so tokens would otherwise leak into the output.
+                        _unwrap_problem_keys(inner)
+                        _restore_apostrophe_tokens(inner)
                         return _detect_and_unwrap(inner)
                     except (json.JSONDecodeError, TypeError):
                         pass  # Not a JSON wrapper, continue checking other keys
-
         # Rule 2: Single-key array wrapper (dict with exactly one key whose value is a list)
+        # GUARD against the token scheme's own wrapping: a repaired problem-key
+        # value is a single-element list of a STRING ('text': ['girls' night']),
+        # which is exactly this wrapper's shape. Without the guard, a single-key
+        # record with one problem key is misread as a wrapper here, the extracted
+        # list dodges _unwrap_problem_keys/_restore_apostrophe_tokens (they only
+        # recurse through dicts), and the token LEAKS into silver. A list of
+        # DICTS is still a genuine wrapper even under a problem-key name, and a
+        # clean (unrepaired) single-string array under a problem key is kept
+        # as the record's value rather than unwrapped to a bare string.
         if len(parsed) == 1:
-            val = next(iter(parsed.values()))
-            if isinstance(val, list):
+            _k, val = next(iter(parsed.items()))
+            _is_token_wrap = (
+                _k in _PROBLEM_KEYS
+                and isinstance(val, list)
+                and len(val) == 1
+                and isinstance(val[0], str)
+            )
+            if isinstance(val, list) and not _is_token_wrap:
                 # Recurse on the extracted list — elements may have their own wrappers
                 return _detect_and_unwrap(val)
-
         # No wrapper detected — actual record
         return parsed
-
     elif isinstance(parsed, list):
         # Recurse into each element — an element may itself have a wrapper.
         # For example [{"payload": "{ 'records': [...] }"}] needs each element unwrapped.
         # Clean records (dicts with multiple keys, no stringified values) pass through
         # unchanged — _detect_and_unwrap returns them as-is via Rule 3.
         return [_detect_and_unwrap(item) for item in parsed]
-
     return parsed
 
-
 def _parse_activity_final(raw):
-    """Normalize JSON and return a valid JSON string for ALL tables.
-    Uses universal wrapper detection by type inspection, not by hardcoded key names.
-
-    Problem keys: _PROBLEM_KEYS is domain-specific to Close CRM (see comment above).
-    For a new source system, profile the data to discover which free-text fields
-    break parsing, then populate _PROBLEM_KEYS with those field names.
+    """
+    Normalize JSON and return a valid JSON string for ALL tables.
+    Escalation ladder — first success wins, fail-safe NULL at the end:
+      1. Direct parse (clean rows are left untouched)
+      2. String-level unwrap of a single-key single-quoted wrapper, then
+         the FULL ladder recursively on the inner string (insurance rung:
+         a single-quoted outer holding double-quoted inner JSON can never
+         be reached by the quote flip)
+      3. APOSTROWORD-protected quote flip (word apostrophes preserved)
+      4. Wrap problem keys + (*APOSTROPHE*) token (non-word apostrophes
+         preserved; reverted in object space after parse)
+      5. NULL — fail-safe drop, visible in the engine's parse %
+    Wrapper detection is by type inspection, not by hardcoded key names, and
+    runs post-parse recursively (see _detect_and_unwrap).
+    Problem keys: _PROBLEM_KEYS is domain-specific.
     """
     if not raw:
         return None
-
     repaired_row = False
+    token = "(*APOSTROPHE*)"
     try:
         outer = json.loads(raw.strip())
     except (json.JSONDecodeError, TypeError):
-        # Outer JSON has single quotes — try repairing
+        # Rung 2 — unwrap a single-key single-quoted wrapper at the STRING
+        # level and run the full ladder on the inner. Strictly additive
+        # insurance: no match, an unparseable inner, or any unexpected
+        # error falls through to the proven quote-repair rungs below, so
+        # this rung can only rescue rows, never break previously-working
+        # ones.
         try:
-            repaired = _repair_single_quotes(raw.strip())
+            _inner = _extract_single_quoted_wrapper(raw.strip())
+            if _inner is not None:
+                _nested = _parse_activity_final(_inner)
+                if _nested is not None:
+                    return _nested
+        except Exception:
+            pass  # insurance rung must never break the proven path — fall through
+        try:
+            repaired = _repair_single_quotes(raw.strip(), token=token)
             outer = json.loads(repaired)
             repaired_row = True
         except (json.JSONDecodeError, TypeError):
             return None
-
-    # Universal wrapper unwrapping (type-based, not name-based)
+    # Universal wrapper unwrap (unchanged)
     unwrapped = _detect_and_unwrap(outer)
-
-    # Null problem keys ONLY on rows that needed single-quote repair.
-    # Rows whose JSON parsed cleanly are valid — nulling their free-text fields
-    # (text, body_text, subject, ...) destroys good data. This regressed Oct 28:
-    # universal wrapper detection started routing {"data": [...]} rows through this
-    # UDF, and the unconditional nulling wiped body_text_quoted[].text from every
-    # email, zeroing silver.lead_activites_email_body on each daily run.
-    # Clean rows keep their content; the quote-repair path still nulls the fields
-    # that originally broke parsing.
+    # Restore apostrophe tokens after unwrapping problem keys
     if repaired_row:
-        _null_problem_keys(unwrapped)
-
+        _unwrap_problem_keys(unwrapped)
+        _restore_apostrophe_tokens(unwrapped, token=token)
     return json.dumps(unwrapped)
 
-
+from pyspark.sql.types import StringType
 repair_json_udf = udf(StringType())(_parse_activity_final)
+
+
+
 
 # COMMAND ----------
 
 # DBTITLE 1,Schema Discovery & Bronze Parsing
-# ============================================================================
+# ====================================================================
 # SCHEMA DISCOVERY & BRONZE PARSING
-# ============================================================================
+# ====================================================================
 
 
 def get_silver_watermark(silver_table):
@@ -288,8 +354,8 @@ def get_silver_watermark(silver_table):
         return None
 
 
-def parse_bronze_table(bronze_table, watermark=None, limit=None):
-    """Read Bronze, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse."""
+def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None):
+    """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse."""
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
 
     if watermark:
@@ -298,6 +364,64 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
 
     if limit:
         df = df.limit(limit)
+
+    # ------------------------------------------------------------------
+    # SNAPSHOT-DUMP DEDUPLICATION (Nov 3 2026 discovery)
+    # The Postgres extractor does not send changes — it re-dumps the
+    # current-state row set on every run (insert_date = dump timestamp),
+    # so a watermark pull appends full copies of data already in bronze.
+    # Measured: bronze.calendly_scheduled_events held 6,355,605 rows for
+    # only 101,064 distinct EVENT_URIs (~63 copies each; just 939 events
+    # ever changed payload). leads_raw: 540,298 rows / 70,811 distinct ids.
+    # The payload carries its own identity fields, so md5(raw_data) IS
+    # the universal dedup key — no per-table key needed:
+    #   - byte-identical re-dumps collapse to ONE row (first-seen copy)
+    #   - every distinct payload version survives (full history kept)
+    # Runs BEFORE the repair UDF, so the UDF also only runs on distinct
+    # rows. payload_hash is carried into silver so CDC batches can skip
+    # versions silver already holds (anti-join below).
+    # ------------------------------------------------------------------
+    from pyspark.sql.functions import md5, row_number
+    from pyspark.sql.window import Window
+    _raw_total = df.count()
+    df = (df.withColumn("payload_hash", md5(col("raw_data")))
+            .withColumn("_dedup_rn", row_number().over(
+                Window.partitionBy("payload_hash")
+                      .orderBy(col("insert_date").asc(), col("bronze_updated_at").asc())))
+            .filter(col("_dedup_rn") == 1)
+            .drop("_dedup_rn"))
+    _dedup_total = df.count()
+    if _dedup_total < _raw_total:
+        print(f"  🔁 Dedup: {_raw_total:,} → {_dedup_total:,} rows ({_raw_total - _dedup_total:,} byte-identical re-dumps skipped)")
+
+    # CDC guard: a re-dumped row is NEW to bronze (fresh bronze_updated_at)
+    # but may be a version silver already holds. Skip increments whose
+    # payload_hash already exists in silver, or every CDC batch would
+    # re-insert the whole snapshot as duplicates. CDC mode ONLY — a FULL
+    # load must read everything (it overwrites silver).
+    if silver_name and watermark:
+        # BUGFIX (Nov 3 2026, nightly failure): the old try/except built the
+        # anti-join lazily — the join definition SUCCEEDED, df.count() raised
+        # UNRESOLVED_COLUMN, the except caught it, but df kept the broken join
+        # in its lazy plan, so the NEXT action died. Fix: check the silver
+        # table's schema EAGERLY first (.columns never poisons a plan), and
+        # commit the anti-joined DataFrame only after a successful count on a
+        # TEMP variable — df is never left holding a failing plan.
+        try:
+            _silver_tbl = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}")
+            _silver_cols = _silver_tbl.columns  # eager schema resolution, no plan built
+        except Exception:
+            _silver_cols = None
+            print(f"  ℹ️ CDC dedup unavailable this run (silver table {silver_name} not readable yet)")
+        if _silver_cols is not None:
+            if "payload_hash" not in _silver_cols:
+                print(f"  ℹ️ CDC dedup unavailable this run ({silver_name} lacks payload_hash — one full rebuild enables it)")
+            else:
+                _anti = df.join(_silver_tbl.select("payload_hash"), on="payload_hash", how="left_anti")
+                _after = _anti.count()  # force full analysis on the temp variable FIRST
+                df = _anti              # commit only after the action succeeded
+                if _after < _dedup_total:
+                    print(f"  🔁 CDC dedup: {_dedup_total:,} → {_after:,} rows (versions already in silver skipped)")
 
     # Quick check for data
     sample_row = df.select("raw_data").filter(col("raw_data").isNotNull()).first()
@@ -336,7 +460,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
         full_temp = f"{CATALOG}.{SILVER_SCHEMA}._tmp_{bronze_table}"
         spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
         spark.sql(f"DROP TABLE IF EXISTS {full_temp}")
-        df.select("insert_date", "bronze_updated_at", "raw_data_repaired") \
+        df.select("insert_date", "bronze_updated_at", "payload_hash", "raw_data_repaired") \
             .write.format("delta").mode("overwrite") \
             .option("mergeSchema", "true") \
             .saveAsTable(full_temp)
@@ -360,72 +484,150 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
     if not _first_row:
         print(f"  ⏭️ SKIP: Could not find valid JSON after repair")
         return None
-    _first_parsed = json.loads(_first_row["raw_data_repaired"])
-    _udf_returns_array = isinstance(_first_parsed, list)
 
-    # Schema discovery via schema_of_json_agg — all parsing stays in Spark,
-    # only the schema DDL string comes to the driver (no .collect() of raw data rows)
-    _sample_df = df.filter(col("raw_data_repaired").isNotNull()).select("raw_data_repaired")
-    if total > 200:
-        _sample_df = _sample_df.sample(False, 200.0 / total).limit(200)
-    _sample_count = min(total, 200)
+    # ------------------------------------------------------------------
+    # SCHEMA SAMPLE — eliminate bad luck (custom_activites case: a 2-row CDC
+    # batch fed discovery, so any field absent from those 2 rows would be
+    # silently dropped by from_json). Rules: (a) the discovered schema must
+    # describe the WHOLE table, not this increment — when the batch is
+    # smaller than the sample target, AUGMENT with a random sample of the
+    # FULL bronze table (repaired via the UDF on just those rows, bounded
+    # at the sample size); (b) sample RANDOMLY, never first-N; (c) the
+    # datatype ground truth is the MAJORITY type across sample rows, not a
+    # single (possibly unrepresentative) first row.
+    # ------------------------------------------------------------------
+    _SCHEMA_SAMPLE = 200
+    _batch_df = df.filter(col("raw_data_repaired").isNotNull()).select("raw_data_repaired")
+    _sample_df = _batch_df
+    if total > _SCHEMA_SAMPLE:
+        _sample_df = _batch_df.sample(False, _SCHEMA_SAMPLE / total).limit(_SCHEMA_SAMPLE)
+    if total < _SCHEMA_SAMPLE:
+        # Small batch (typical CDC increment): pull extra random rows from full
+        # bronze so discovery sees fields that live outside this increment.
+        try:
+            _full_bronze = (spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
+                .select("raw_data").filter(col("raw_data").isNotNull()))
+            _full_total = _full_bronze.count()
+            _need = _SCHEMA_SAMPLE - total
+            if _full_total > total and _need > 0:
+                print(f"  🔀 Batch has only {total} row(s) — augmenting schema sample with random rows from full bronze ({_full_total:,} rows)")
+                _extra = (_full_bronze.sample(False, min(1.0, _need * 3.0 / _full_total)).limit(_need)
+                    .select(repair_json_udf(col("raw_data")).alias("raw_data_repaired"))
+                    .filter(col("raw_data_repaired").isNotNull()))
+                _sample_df = _batch_df.unionByName(_extra)
+        except Exception as _aug_e:
+            print(f"  ⚠️ Schema sample augmentation unavailable ({str(_aug_e)[:60]})")
+
+    _sample_count = _sample_df.count()
     print(f"  📊 Schema discovery via schema_of_json_agg on {_sample_count} sample rows")
 
-    try:
-        raw_schema_str = _sample_df.select(expr("schema_of_json_agg(raw_data_repaired)").alias("s")).collect()[0]["s"]
-        # If schema_of_json_agg returned ARRAY<STRING>, fall back to single-row schema_of_json
-        if raw_schema_str.upper() == "ARRAY<STRING>":
-            print(f"  ⚠️ schema_of_json_agg returned ARRAY<STRING>, falling back to single-row schema")
+    # Datatype ground truth: majority type across a handful of sample rows —
+    # a single first row can be unlucky (e.g. a dict row in a table of
+    # arrays, or vice versa). Still type inspection of the data itself;
+    # the discovered DDL is validated against it in the level loop below.
+    _type_votes = {"list": 0, "dict": 0}
+    for _r in _sample_df.limit(20).collect():
+        try:
+            _tv = type(json.loads(_r["raw_data_repaired"])).__name__
+            if _tv in _type_votes:
+                _type_votes[_tv] += 1
+        except Exception:
+            continue
+    _udf_returns_array = _type_votes["list"] >= _type_votes["dict"]
+
+    # ------------------------------------------------------------------
+    # DATATYPE DETECTION + RECURSIVE SCHEMA VALIDATION
+    # Ground truth for the datatype is the DATA ITSELF (type inspection of
+    # the first row, _udf_returns_array), never the discovered DDL:
+    # schema_of_json_agg SILENTLY DEGRADES to STRING / ARRAY<STRING> when a
+    # single input exceeds its size limit (~100KB) — e.g. Postgres dump rows
+    # whose JSON_OBJECT column stringifies hundreds of records (~178KB per
+    # row). A STRING result for data we KNOW is an array/object means
+    # DISCOVERY FAILED, not that the data is strings. On datatype change
+    # (DDL ≠ actual): descend one level — explode the array into element
+    # texts (from_json(..., 'ARRAY<STRING>') preserves each element's raw
+    # JSON text) and rediscover there, re-inspecting the element datatype.
+    # Recursion is bounded (MAX_SCHEMA_LEVELS); if every level degrades,
+    # FAIL LOUDLY and skip the write, so a wrong-schema 'value'-column table
+    # can never silently replace a good silver table.
+    # ------------------------------------------------------------------
+    def _strip_array_wrapper(ddl):
+        """Extract the inner type from ARRAY<...> via bracket-depth matching."""
+        depth = 0
+        for i, c in enumerate(ddl):
+            if c == '<':
+                depth += 1
+            elif c == '>':
+                depth -= 1
+                if depth == 0:
+                    return ddl[6:i]
+        return ddl
+
+    _MAX_SCHEMA_LEVELS = 3
+    _level_df = _sample_df
+    _expects_array = _udf_returns_array
+    _element_ddl = None
+    _fail_reason = None
+    for _level in range(_MAX_SCHEMA_LEVELS):
+        try:
+            raw_schema_str = _level_df.select(expr("schema_of_json_agg(raw_data_repaired)").alias("s")).collect()[0]["s"]
+        except Exception as e:
+            print(f"  ⚠️ Level {_level}: schema_of_json_agg failed ({str(e)[:70]}), falling back to single-row schema_of_json")
             raw_schema_str = spark.range(1).select(
                 schema_of_json(lit(_first_row["raw_data_repaired"])).alias("s")
             ).collect()[0]["s"]
-        # If wrapped in ARRAY<...>, extract the inner STRUCT using bracket-depth matching
-        schema_upper = raw_schema_str.upper()
-        if schema_upper.startswith("ARRAY<") and not schema_upper.startswith("ARRAY<ARRAY<"):
-            depth = 0
-            for i, c in enumerate(raw_schema_str):
-                if c == '<':
-                    depth += 1
-                elif c == '>':
-                    depth -= 1
-                    if depth == 0:
-                        raw_schema_str = raw_schema_str[6:i]
-                        break
-        # Parse DDL and deduplicate fields
-        try:
-            _test_st = StructType.fromDDL(raw_schema_str)
-            _seen = set()
-            _unique_fields = []
-            for _f in _test_st.fields:
-                _sn = _sanitize_col_name(_f.name)
-                if _sn not in _seen:
-                    _seen.add(_sn)
-                    _unique_fields.append(_f)
-            deduped_st = StructType()
-            for _f in _unique_fields:
-                deduped_st = deduped_st.add(_f.name, _f.dataType, _f.nullable)
-        except Exception:
-            deduped_st = raw_schema_str
-    except Exception as e:
-        print(f"  ⚠️ schema_of_json_agg failed ({str(e)[:80]}), falling back to single-row schema")
-        _fb_ddl = spark.range(1).select(
-            schema_of_json(lit(_first_row["raw_data_repaired"])).alias("s")
-        ).collect()[0]["s"]
-        _fb_upper = _fb_ddl.upper()
-        if _fb_upper.startswith("ARRAY<") and not _fb_upper.startswith("ARRAY<ARRAY<"):
-            depth = 0
-            for i, c in enumerate(_fb_ddl):
-                if c == '<':
-                    depth += 1
-                elif c == '>':
-                    depth -= 1
-                    if depth == 0:
-                        _fb_ddl = _fb_ddl[6:i]
-                        break
-        try:
-            deduped_st = StructType.fromDDL(_fb_ddl)
-        except Exception:
-            deduped_st = _fb_ddl
+        _upper = raw_schema_str.upper()
+
+        # --- datatype check: does the discovered DDL match what the data IS? ---
+        if _upper in ("STRING", "ARRAY<STRING>"):
+            if _expects_array:
+                # Degraded discovery on array-of-record texts (size limit hit).
+                # Descend: explode to element texts and re-inspect the datatype.
+                print(f"  ⚠️ Level {_level}: schema discovery degraded to {_upper} (inputs exceed schema_of_json size limit) — descending to element level")
+                _level_df = (_level_df
+                    .select(explode(from_json(col("raw_data_repaired"), "ARRAY<STRING>")).alias("raw_data_repaired"))
+                    .where(col("raw_data_repaired").isNotNull())
+                    .sample(False, 0.25)
+                    .limit(200))
+                _el_first = _level_df.select("raw_data_repaired").first()
+                if _el_first is None:
+                    _fail_reason = "element level is empty after explode"
+                    break
+                _expects_array = isinstance(json.loads(_el_first["raw_data_repaired"].strip()), list)
+                continue
+            _fail_reason = f"schema discovery degraded to {_upper} at level {_level} and no further descent is possible"
+            break
+
+        # --- DDL matches a real structured type at this level ---
+        if _upper.startswith("ARRAY<") and not _upper.startswith("ARRAY<ARRAY<"):
+            _element_ddl = _strip_array_wrapper(raw_schema_str)
+        else:
+            _element_ddl = raw_schema_str
+        break
+
+    if _element_ddl is None or _fail_reason is not None:
+        print(f"  ❌ SCHEMA DISCOVERY FAILED datatype validation: {_fail_reason or 'no structured schema found at any level'}")
+        print(f"     ⏭️ SKIP: refusing to write silver — a wrong-schema build would produce a stringified 'value' column")
+        for temp in _TEMP_TABLES:
+            spark.sql(f"DROP TABLE IF EXISTS {temp}")
+        _TEMP_TABLES.clear()
+        return None
+
+    # Parse DDL and deduplicate fields
+    try:
+        _test_st = StructType.fromDDL(_element_ddl)
+        _seen = set()
+        _unique_fields = []
+        for _f in _test_st.fields:
+            _sn = _sanitize_col_name(_f.name)
+            if _sn not in _seen:
+                _seen.add(_sn)
+                _unique_fields.append(_f)
+        deduped_st = StructType()
+        for _f in _unique_fields:
+            deduped_st = deduped_st.add(_f.name, _f.dataType, _f.nullable)
+    except Exception:
+        deduped_st = _element_ddl
 
     # Parse (fast — reads from temp table, only from_json is computed)
     if isinstance(deduped_st, str):
@@ -471,7 +673,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
     # Handle top-level type: struct → star-expand, array → explode first
     if isinstance(parsed_type, StructType):
         field_names = _dedup_names([_sanitize_col_name(f.name) for f in parsed_type.fields])
-        select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at")]
+        select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at"), col("payload_hash")]
         for f, safe_name in zip(parsed_type.fields, field_names):
             select_exprs.append(col(f"parsed.`{f.name}`").alias(safe_name))
         df_flat = df_parsed.select(*select_exprs)
@@ -481,7 +683,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
         element_type = df_exploded.schema["_element"].dataType
         if isinstance(element_type, StructType):
             elem_names = _dedup_names([_sanitize_col_name(f.name) for f in element_type.fields])
-            select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at")]
+            select_exprs = [col("insert_date").alias("bronze_insert_date"), col("bronze_updated_at"), col("payload_hash")]
             for f, safe_name in zip(element_type.fields, elem_names):
                 select_exprs.append(col(f"_element.`{f.name}`").alias(safe_name))
             df_flat = df_exploded.select(*select_exprs)
@@ -489,12 +691,14 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None):
             df_flat = df_exploded.select(
                 col("insert_date").alias("bronze_insert_date"),
                 col("bronze_updated_at"),
+                col("payload_hash"),
                 col("_element").alias("value")
             )
     else:
         df_flat = df_parsed.select(
             col("insert_date").alias("bronze_insert_date"),
             col("bronze_updated_at"),
+            col("payload_hash"),
             col("parsed").alias("value")
         )
     return df_flat
@@ -619,32 +823,6 @@ def find_pk(df, table_name=None, validate=True, sample_size=10000):
 
     # --- All candidates failed validation — return first anyway as last resort ---
     return candidates[0][1]
-
-# COMMAND ----------
-
-# DBTITLE 1,Schema Printing
-# # ============================================================================
-# # SCHEMA PRINTING
-# # ============================================================================
-
-
-# def print_schema_summary(df, label):
-#     """Print schema with data types, highlighting arrays and structs."""
-#     # print(f"\n  📘 SCHEMA — {label}")
-#     for f in df.schema.fields:
-#         type_name = str(f.dataType)
-#         if isinstance(f.dataType, ArrayType):
-#             print(f"    🟠 ARRAY  {f.name}: {type_name}")
-#         elif isinstance(f.dataType, StructType):
-#             print(f"    🔵 STRUCT {f.name}: {type_name}")
-#         else:
-#             print(f"    🟢 {f.name}: {type_name}")
-
-
-# def print_physical_schema(df, label):
-#     """Print full physical schema tree."""
-#     print(f"\n  🌳 PHYSICAL SCHEMA TREE — {label}")
-#     df.printSchema()
 
 # COMMAND ----------
 
@@ -991,7 +1169,7 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
     else:
         print(f"  FULL LOAD: first run")
 
-    df_flat = parse_bronze_table(bronze_name, watermark=_CDC_WATERMARK)
+    df_flat = parse_bronze_table(bronze_name, watermark=_CDC_WATERMARK, silver_name=silver_name)
     if df_flat is None:
         # CDC found no new data — print full existing silver table details
         if _CDC_WATERMARK:

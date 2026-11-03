@@ -1,5 +1,5 @@
 # Student Engagement Pipeline — Declarative Automation Bundle (DAB).
-# The nightly job (32 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
+# The nightly job (36 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
 # Deploy from a local clone: databricks bundle deploy --target prod   (see DEPLOY.md)
 
 bundle:
@@ -47,7 +47,7 @@ resources:
             - task_key: bronze_config
           notebook_task:
             notebook_path: 1_Bronze/1_2_Bronze_ingestion.ipynb
-        # ---------- SILVER (parallel after bronze) ----------
+        # ---------- SILVER SET 1: level-1 parents (parallel; bronze complete) ----------
         - task_key: silver_leads
           depends_on:
             - task_key: bronze_ingestion
@@ -55,17 +55,35 @@ resources:
             notebook_path: 2_Silver/2_1_01_Silver_leads_processed.ipynb
         - task_key: silver_leads_custom
           depends_on:
-            - task_key: bronze_ingestion
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_1_02_Silver_leads_processed_custom.ipynb
         - task_key: silver_contacts
           depends_on:
-            - task_key: bronze_ingestion
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_1_03_01_Silver_leads_processed_contacts.ipynb
+        # ---------- SILVER SET 3: grandchildren (wait for ALL children) ----------
         - task_key: silver_contacts_emails
           depends_on:
+            - task_key: silver_leads_custom
             - task_key: silver_contacts
+            - task_key: silver_email_body
+            - task_key: silver_activities_attendees
+            - task_key: silver_activities_envelope
+            - task_key: silver_activities_to
           notebook_task:
             notebook_path: 2_Silver/2_1_03_02_Silver_leads_processed_contacts_emails.ipynb
         - task_key: silver_activities
@@ -75,9 +93,49 @@ resources:
             notebook_path: 2_Silver/2_2_01_Silver_lead_activites_processed.ipynb
         - task_key: silver_email_body
           depends_on:
-            - task_key: bronze_ingestion
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_2_02_Silver_lead_activites_email_body.ipynb
+        # ---------- SILVER SET 2: children (each waits for ALL silver set-1 parents) ----------
+        - task_key: silver_activities_attendees
+          depends_on:
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
+          notebook_task:
+            notebook_path: 2_Silver/2_2_03_Silver_lead_activites_attendees.ipynb
+        - task_key: silver_activities_envelope
+          depends_on:
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
+          notebook_task:
+            notebook_path: 2_Silver/2_2_04_Silver_lead_activites_processed_envelope.ipynb
+        - task_key: silver_activities_to
+          depends_on:
+            - task_key: silver_leads
+            - task_key: silver_activities
+            - task_key: silver_crm_users
+            - task_key: silver_custom_activities
+            - task_key: silver_calendly
+            - task_key: silver_sentiment
+            - task_key: silver_mdl_users
+          notebook_task:
+            notebook_path: 2_Silver/2_2_05_Silver_lead_activites_processed_to.ipynb
         - task_key: silver_crm_users
           depends_on:
             - task_key: bronze_ingestion
@@ -103,163 +161,35 @@ resources:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_7_Silver_mdl_users_processed.ipynb
+        # ---------- SILVER SET 4: identity mapping (waits for ALL other silver) ----------
         - task_key: silver_user_mapping
           depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
             - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_8_Silver_user_mapping.ipynb
-        # ---------- GOLD: dims, metrics, lookups (parallel after silver) ----------
+        # ---------- GOLD SET 1: dims, metrics, lookups (parallel; depend ONLY on
+        # silver_user_mapping — the LAST silver task — so NO gold runs before ALL
+        # silver is complete; star schema leftmost set) ----------
         - task_key: gold_staff_dim
           depends_on:
-            - task_key: silver_crm_users
+            - task_key: silver_user_mapping
           notebook_task:
             notebook_path: 3_Gold/3_01_Gold_staff_dim.ipynb
         - task_key: gold_lead_dim
           depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
+            - task_key: silver_user_mapping
           notebook_task:
             notebook_path: 3_Gold/3_04_Gold_lead_dim.ipynb
+        - task_key: gold_staff_emails
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_00_Gold_staff_emails.ipynb
         - task_key: gold_lead_emails
           depends_on:
-            - task_key: silver_contacts_emails
-          notebook_task:
-            notebook_path: 3_Gold/3_12_Gold_lead_emails.ipynb
-        - task_key: gold_days_since_last_email
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_05_Gold_days_since_last_email.ipynb
-        - task_key: gold_days_since_last_meeting
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_06_Gold_days_since_last_meeting.ipynb
-        - task_key: gold_missed_calls
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_07_Gold_missed_calls_14_days.ipynb
-        - task_key: gold_days_until_next_meeting
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_08_Gold_days_until_next_meeting.ipynb
-        - task_key: gold_days_since_last_login
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_09_Gold_days_since_last_login.ipynb
-        - task_key: gold_calendly_metric
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_10_Gold_days_since_last_meeting_calendly.ipynb
-        - task_key: gold_sentiment
-          depends_on:
-            - task_key: silver_leads
-            - task_key: silver_leads_custom
-            - task_key: silver_contacts
-            - task_key: silver_contacts_emails
-            - task_key: silver_activities
-            - task_key: silver_email_body
-            - task_key: silver_crm_users
-            - task_key: silver_custom_activities
-            - task_key: silver_calendly
-            - task_key: silver_sentiment
-            - task_key: silver_mdl_users
-          notebook_task:
-            notebook_path: 3_Gold/3_11_Gold_sentiment.ipynb
-        # ---------- GOLD: facts (join staff_dim, so wait for it) ----------
-        - task_key: gold_leads_activity_fact
-          depends_on:
-            - task_key: silver_activities
-            - task_key: gold_staff_dim
-          notebook_task:
-            notebook_path: 3_Gold/3_02_Gold_leads_activity_fact.ipynb
-        - task_key: gold_sales_fact
-          depends_on:
-            - task_key: silver_activities
-            - task_key: gold_staff_dim
-          notebook_task:
-            notebook_path: 3_Gold/3_03_Gold_sales_fact.ipynb
-        # ---------- GOLD: health chain ----------
-        - task_key: gold_health_metrics
-          depends_on:
+            - task_key: gold_staff_emails
             - task_key: gold_staff_dim
             - task_key: gold_lead_dim
-            - task_key: gold_lead_emails
-            - task_key: gold_sales_fact
             - task_key: gold_days_since_last_email
             - task_key: gold_days_since_last_meeting
             - task_key: gold_missed_calls
@@ -268,35 +198,109 @@ resources:
             - task_key: gold_calendly_metric
             - task_key: gold_sentiment
           notebook_task:
+            notebook_path: 3_Gold/3_12_Gold_lead_emails.ipynb
+        - task_key: gold_days_since_last_email
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_05_Gold_days_since_last_email.ipynb
+        - task_key: gold_days_since_last_meeting
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_06_Gold_days_since_last_meeting.ipynb
+        - task_key: gold_missed_calls
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_07_Gold_missed_calls_14_days.ipynb
+        - task_key: gold_days_until_next_meeting
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_08_Gold_days_until_next_meeting.ipynb
+        - task_key: gold_days_since_last_login
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_09_Gold_days_since_last_login.ipynb
+        - task_key: gold_calendly_metric
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_10_Gold_days_since_last_meeting_calendly.ipynb
+        - task_key: gold_sentiment
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_11_Gold_sentiment.ipynb
+        # ---------- GOLD SET 2: facts + lead-email bridge (wait for ALL of gold set 1) ----------
+        - task_key: gold_leads_activity_fact
+          depends_on:
+            - task_key: gold_staff_emails
+            - task_key: gold_staff_dim
+            - task_key: gold_lead_dim
+            - task_key: gold_days_since_last_email
+            - task_key: gold_days_since_last_meeting
+            - task_key: gold_missed_calls
+            - task_key: gold_days_until_next_meeting
+            - task_key: gold_days_since_last_login
+            - task_key: gold_calendly_metric
+            - task_key: gold_sentiment
+          notebook_task:
+            notebook_path: 3_Gold/3_02_Gold_leads_activity_fact.ipynb
+        - task_key: gold_sales_fact
+          depends_on:
+            - task_key: gold_staff_emails
+            - task_key: gold_staff_dim
+            - task_key: gold_lead_dim
+            - task_key: gold_days_since_last_email
+            - task_key: gold_days_since_last_meeting
+            - task_key: gold_missed_calls
+            - task_key: gold_days_until_next_meeting
+            - task_key: gold_days_since_last_login
+            - task_key: gold_calendly_metric
+            - task_key: gold_sentiment
+          notebook_task:
+            notebook_path: 3_Gold/3_03_Gold_sales_fact.ipynb
+        # ---------- GOLD SET 3: health metrics (waits for ALL of gold set 2) ----------
+        - task_key: gold_health_metrics
+          depends_on:
+            - task_key: gold_leads_activity_fact
+            - task_key: gold_sales_fact
+            - task_key: gold_lead_emails
+          notebook_task:
             notebook_path: 3_Gold/3_13_Gold_health_metrics.ipynb
+        # ---------- GOLD SET 4: profile + communication state (wait for gold set 3) ----------
         - task_key: gold_health_profile
           depends_on:
             - task_key: gold_health_metrics
           notebook_task:
             notebook_path: 3_Gold/3_14_Gold_customer_health_profile.ipynb
+        # ---------- GOLD SET 5: history + recency (wait for ALL of gold set 4) ----------
         - task_key: gold_health_history
           depends_on:
             - task_key: gold_health_profile
+            - task_key: gold_communication_state
           notebook_task:
             notebook_path: 3_Gold/3_15_Gold_customer_health_history.ipynb
-        # ---------- GOLD: communication state (context table — NOT a health-score input) ----------
+        # ---------- GOLD SET 4 (continued): communication state ----------
         - task_key: gold_communication_state
           depends_on:
-            - task_key: gold_leads_activity_fact
-            - task_key: gold_sentiment
+            - task_key: gold_health_metrics
           notebook_task:
             notebook_path: 3_Gold/3_16_Gold_communication_state.ipynb
+        # ---------- GOLD SET 5 (continued): communication recency ----------
         - task_key: gold_communication_recency
           depends_on:
-            - task_key: gold_leads_activity_fact
-            - task_key: gold_sentiment
             - task_key: gold_health_profile
+            - task_key: gold_communication_state
           notebook_task:
-            notebook_path: 3_Gold/3_16_Gold_communication_recency.ipynb
-        # ---------- GOLD: company service scorecard (grades the COMPANY, not the client — NOT a health-score input) ----------
+            notebook_path: 3_Gold/3_17_Gold_communication_recency.ipynb
+        # ---------- GOLD SET 6: company service scorecard (waits for ALL of gold set 5) ----------
         - task_key: gold_coaching_score
           depends_on:
+            - task_key: gold_health_history
             - task_key: gold_communication_recency
-            - task_key: gold_health_profile
           notebook_task:
-            notebook_path: 3_Gold/3_17_Gold_coaching_score_by_client_health.ipynb
+            notebook_path: 3_Gold/3_18_Gold_coaching_score_by_client_health.ipynb
