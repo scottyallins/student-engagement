@@ -1,6 +1,6 @@
 # Deploying the Pipeline (Declarative Automation Bundle)
 
-The nightly job is defined as code in `databricks.yml`: 29 tasks, explicit dependency DAG, 8:00 AM EST schedule, serverless compute. The orchestration is version-controlled together with the notebooks it runs.
+The nightly job is defined as code in `databricks.yml`: 36 tasks, explicit dependency DAG, 8:00 AM EST schedule, serverless compute. The orchestration is version-controlled together with the notebooks it runs.
 
 ## One-time local setup
 
