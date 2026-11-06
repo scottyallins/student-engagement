@@ -83,7 +83,6 @@ student-engagement/
 +- DEPLOY.md                                      <- how to deploy the bundle
 +- DEPLOY_prod                                    <- deploy commands formatted for the web terminal
 +- utils                                          <- shared Silver engine (JSON repair, parsing, CDC writes)
-+- child_utils                                    <- optional shared child-table engine (not part of the nightly job)
 +- 1_Bronze/
 |  +- 1_1_Bronze_config                           <- creates crm_ingestion.config.bronze_config (source list)
 |  +- 1_2_Bronze_ingestion                        <- config-driven JDBC loader: 9 error-isolated incremental loads
@@ -264,7 +263,7 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 | 2 | `days_since_last_meeting` (3_06) | email_body | Days since the last Calendly 'A new event has been scheduled.' email (CRM meeting evidence) |
 | 3 | `missed_calls_14_days` (3_07) | activities | Count of inbound `no-answer` calls in the **trailing 14 days** (a window metric, not a lifetime total) |
 | 4 | `days_until_next_meeting` (3_08) | Calendly + spine | Days to the client's next **future** Calendly event. The CRM never records future meetings — Calendly is the only source; clients matched via spine hash or real email |
-| 5 | `days_since_last_login` (3_09) | mdl_users + contacts | Days since last platform login — contacts.name hash matched against `USERNAME` ∪ `FIRSTNAME` ∪ `LASTNAME` (the three-column UNION recovers roughly 15× more clients than any single column) |
+| 5 | `days_since_last_login` (3_09) | mdl_users + two hash bridges | Days since last platform login — the contact's hash AND the lead record's own hash, each matched against `USERNAME` ∪ `FIRSTNAME` ∪ `LASTNAME`. The platform's emails are 100% masked with zero overlap against the CRM's, so email matching is impossible — name-hash equality is the only bridge. Users whose Moodle `LASTACCESS` is the epoch default (1970) have never logged in; they score flag 0. Coverage: 633 of 1,371 clients; the remaining 738 are unlinkable by any key in the export. |
 | 6 | `days_since_last_meeting_calendly` (3_10) | Calendly + spine | Days since the client's latest **booking creation** (`EVENT_CREATED_AT` — booking recency, not event start; future bookings count) |
 | 7 | `sentiment` (3_11) | `leads_processed_custom` | Sentiment label + days since last message from client / from team. The raw `student_sentiment` table cannot be joined to leads (its `CHANNEL_ID` is a different identifier type than any CRM key), so the CRM's pre-calculated fields carry this metric; one Slack channel is excluded by spec |
 
@@ -276,8 +275,8 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 
 **Scoring (`3_14`):** three engagement flags → engagement pattern → base score → adjustments → band.
 
-* `slack_engaged` — sentiment data is present for the lead
-* `platform_engaged` — `days_since_last_login ≤ 30`
+* `slack_engaged` — sentiment record present and last client message ≤ 14 days (NULL when no sentiment record at all)
+* `platform_engaged` — `days_since_last_login ≤ 14`
 * `meeting_engaged` — both meeting sources (CRM email evidence and Calendly) must be present (cross-validation; NULL if either is missing); engaged when both are within 30 days
 
 | Engagement Pattern | Base Score |
@@ -425,7 +424,7 @@ Catalog: `crm_ingestion`. Schemas: `config` (1 table), `bronze` (9), `silver` (1
 | `days_since_last_meeting` | metric | 7,442 |
 | `missed_calls_14_days` | metric | 202 |
 | `days_until_next_meeting` | metric | 416 |
-| `days_since_last_login` | metric | 372 |
+| `days_since_last_login` | metric | 633 |
 | `days_since_last_meeting_calendly` | metric | 1,380 |
 | `sentiment` | metric | 1,674 |
 | `health_metrics` | staging join | 1,371 |

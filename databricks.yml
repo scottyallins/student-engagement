@@ -169,10 +169,15 @@ resources:
             notebook_path: 2_Silver/2_8_Silver_user_mapping.ipynb
         # ---------- GOLD SET 1: dims, metrics, lookups (parallel; depend ONLY on
         # silver_user_mapping — the LAST silver task — so NO gold runs before ALL
-        # silver is complete; star schema leftmost set) ----------
+        # silver is complete; star schema leftmost set)
+        # EXCEPTION: gold_staff_dim also waits for gold_staff_emails + gold_lead_dim
+        # because 3_01 additionally builds gold.staff_account_dim (person-grain
+        # staff account view) from both of them ----------
         - task_key: gold_staff_dim
           depends_on:
             - task_key: silver_user_mapping
+            - task_key: gold_staff_emails
+            - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_01_Gold_staff_dim.ipynb
         - task_key: gold_lead_dim

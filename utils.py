@@ -64,7 +64,7 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 # DBTITLE 1,JSON Repair UDF
 # ============================================================================
 # JSON REPAIR UDF — universal normalization with type-based wrapper detection
-# ============================================================================
+# One pre-existing limitation to be aware of, unrelated to the converter: a multi-key single-quoted outer holding a double-quoted stringified inner still can't be rescued (rung 2 only handles single-key wrappers; the quote flip corrupts nested doubles). That shape was already NULL before this change — current bronze has zero rows in it.============================================================================
 # ESCALATION LADDER — first success wins, fail-safe NULL at the end.
 # This ladder is the accumulated reasoning from the repair design sessions;
 # keep it in sync with _parse_activity_final:
@@ -174,11 +174,89 @@ def _extract_single_quoted_wrapper(s):
     return None
 
 
+def _convert_python_literals(s):
+    """Null handling (spec): convert Python-style None/True/False to JSON
+    null/true/false in a CONTROLLED manner — only in value positions and
+    only OUTSIDE quoted strings.
+
+    A character-level scanner tracks string spans (single or double quotes,
+    backslash-escaped), so words inside narrative text are never touched:
+        {'v': None, 'f': True}    -> {"v": null, "f": true}
+        {'ids': [None, False]}    -> {"ids": [null, false]}
+        {'text': 'None'}          -> {"text": "None"}   (string preserved)
+        {'note': 'x: None, [y]'}  -> string content unchanged
+
+    Value position = token preceded (after whitespace) by ':', ',', '[' or
+    '(' and followed (after whitespace) by ',', '}', ']' or ')'. Runs inside
+    the repair ladder BEFORE the quote flip, so a double-quoted row with an
+    unquoted None is also rescued.
+    """
+    VALUE_OPEN = ":,[("
+    VALUE_CLOSE = ",}])"
+    WS = " \t\r\n"
+
+    def _prev_value_char(j):
+        k = j - 1
+        while k >= 0 and s[k] in WS:
+            k -= 1
+        return s[k] if k >= 0 else None
+
+    def _next_value_char(j):
+        k = j
+        while k < n and s[k] in WS:
+            k += 1
+        return s[k] if k < n else None
+
+    out = []
+    i = 0
+    n = len(s)
+    in_str = None
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\" and i + 1 < n:
+                out.append(s[i:i + 2])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            out.append(c)
+            i += 1
+            continue
+        if c in ("'", '"'):
+            in_str = c
+            out.append(c)
+            i += 1
+            continue
+        if c in "NTF":
+            for tok, conv in (("None", "null"), ("True", "true"), ("False", "false")):
+                if s.startswith(tok, i):
+                    prev = _prev_value_char(i)
+                    nxt = _next_value_char(i + len(tok))
+                    if prev is not None and prev in VALUE_OPEN \
+                            and nxt is not None and nxt in VALUE_CLOSE:
+                        out.append(conv)
+                        i += len(tok)
+                        break
+            else:
+                out.append(c)
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
     """Try clean repair first. If parse fails: wrap problem keys, tokenize all ' inside them with token, then flip quotes.
     """
     # 1. Protect word apostrophes globally first (does not use token)
     protected = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROWORD\2", s)
+
+    # 1b. Controlled Python-literal conversion (spec: null handling) —
+    #     unquoted None/True/False -> null/true/false, outside quoted
+    #     strings only. Quoted 'None' strings are source data and survive.
+    protected = _convert_python_literals(protected)
 
     # 2. Try parse without wrap/token
     attempt = protected.replace("'", '"').replace("APOSTROWORD", "'")
@@ -283,7 +361,9 @@ def _parse_activity_final(raw):
          the FULL ladder recursively on the inner string (insurance rung:
          a single-quoted outer holding double-quoted inner JSON can never
          be reached by the quote flip)
-      3. APOSTROWORD-protected quote flip (word apostrophes preserved)
+      3. APOSTROWORD-protected quote flip (word apostrophes preserved), plus
+         controlled None/True/False -> null/true/false conversion outside
+         quoted strings (_convert_python_literals — spec: null handling)
       4. Wrap problem keys + (*APOSTROPHE*) token (non-word apostrophes
          preserved; reverted in object space after parse)
       5. NULL — fail-safe drop, visible in the engine's parse %
@@ -1281,3 +1361,80 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
 
 print("✅ Silver engine loaded")
 print("   Usage: process_table('bronze_table_name', 'silver_table_name')")
+
+# COMMAND ----------
+
+# DBTITLE 1,Raw Lineage Scan
+# ============================================================================
+# RAW LINEAGE SCAN — every column path from bronze payloads, datatypes attached
+# ============================================================================
+# Like the dry-run lineage tree, but from the RAW side and complete: scalars
+# are printed too (the dry-run only lists array/object child tables), and every
+# line carries its datatype. Arrays at the top level also show which silver
+# child table they WOULD become (dry-run naming convention).
+
+
+def _type_label(t):
+    try:
+        return t.simpleString()
+    except Exception:
+        return str(t)
+
+
+def _lineage_walk(field, prefix, depth, silver_name=None):
+    """Print one field path with its datatype; recurse into structs/arrays."""
+    name = f"{prefix}.{field.name}" if prefix else field.name
+    indent = "---" * depth
+    t = field.dataType
+    if isinstance(t, StructType):
+        print(f"  # * {indent}{name} : struct")
+        for sub in t.fields:
+            _lineage_walk(sub, name, depth + 1, silver_name)
+    elif isinstance(t, ArrayType):
+        elem = t.elementType
+        extra = f"  -> potential child: silver_{silver_name}_{field.name}" \
+            if (silver_name and depth == 0) else ""
+        print(f"  # * {indent}{name} : array<{_type_label(elem)}>{extra}")
+        if isinstance(elem, StructType):
+            for sub in elem.fields:
+                _lineage_walk(sub, f"{name}[]", depth + 1, silver_name)
+    else:
+        print(f"  # * {indent}{name} : {_type_label(t)} (scalar)")
+
+
+def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
+    """Scan bronze raw payloads and print EVERY column path with its datatype.
+
+    Scalars, structs, and arrays all appear; arrays recurse into their element
+    structs. Parse-only (limit rows sampled) — nothing is written.
+
+    Args:
+        bronze_name: one bronze table, or None to scan ALL 9 bronze tables.
+        silver_name:  optional, to label potential child tables.
+        limit:        sample rows used to infer the schema (default 200).
+    """
+    if bronze_name is None:
+        bronze_schema = globals().get("BRONZE_SCHEMA", "bronze")
+        names = sorted(t.name for t in spark.catalog.listTables(f"{CATALOG}.{bronze_schema}"))
+    else:
+        names = [bronze_name]
+
+    for tname in names:
+        print(f"\n{'=' * 80}")
+        print(f"🧬 RAW LINEAGE — bronze.{tname}")
+        print(f"{'=' * 80}")
+        try:
+            df = parse_bronze_table(tname, limit=limit,
+                                    silver_name=silver_name or tname)
+        except Exception as e:
+            print(f"  !! {type(e).__name__}: {str(e)[:120]}")
+            continue
+        if df is None:
+            print("  (no rows parsed — check the bronze table name)")
+            continue
+        for f in df.schema.fields:
+            _lineage_walk(f, "", 0, silver_name or tname)
+        scalars = sum(1 for f in df.schema.fields
+                      if not isinstance(f.dataType, (ArrayType, StructType)))
+        print(f"  -> {len(df.schema.fields)} top-level columns "
+              f"({scalars} scalar, {len(df.schema.fields) - scalars} complex)")
