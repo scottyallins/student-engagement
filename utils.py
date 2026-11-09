@@ -1356,6 +1356,174 @@ def print_lineage_tree(silver_name=None):
         print(f"  # * {indent}{num}_{name}")
 
 
+# --- Lineage key detail (CDC no-new-data diagnostic path only) ----------------
+# Mapping keys are CANDIDATES: unique + non-null on a <=10K sample, not proven
+# table-wide. One Spark action per table (sample fetched once, counted locally).
+
+
+def find_child_mapping_keys(df, carried_cols, sample_size=10000):
+    """Return candidate mapping/natural-key columns: non-null and unique on a
+    <=10K sample, NOT carried from the parent. Sampled candidates only."""
+    candidates = []
+    sample = df.limit(sample_size).toPandas()
+    if len(sample) == 0:
+        return candidates
+    carried = set(carried_cols or [])
+    for f in df.schema.fields:
+        if f.name in carried:
+            continue
+        if not isinstance(f.dataType, (StringType, IntegerType, LongType)):
+            continue
+        s = sample[f.name]
+        if s.isna().any():
+            continue
+        if s.nunique(dropna=False) == len(sample):
+            candidates.append(f.name)
+    return candidates
+
+
+def print_lineage_detail(df, num, depth, name, parent_keys=None):
+    """Print one table: PK, carried-FK and mapping-key candidates, every column
+    with its type. Returns (pk, carried, mapping) for a keys-only summary."""
+    indent = "---" * depth
+    parent_keys = parent_keys or []
+    pk = find_pk(df, validate=False)
+    carried = [c for c in df.columns
+               if any(c == k or c.endswith(f"_{k}") for k in parent_keys)]
+    # bronze control columns are pipeline bookkeeping, never mapping keys
+    mapping = find_child_mapping_keys(
+        df, carried + ["bronze_insert_date", "bronze_updated_at"]) if depth > 0 else []
+    label = f"{num}_{name}" if num else name
+    print(f"  # * {indent}{label}")
+    print(f"  {indent}   PK: {pk or '—'}")
+    if carried:
+        print(f"  {indent}   FK/carried: {carried}")
+    if mapping:
+        print(f"  {indent}   mapping candidates: {mapping}")
+    for f in df.schema.fields:
+        mark = ""
+        if f.name == pk:
+            mark = "  ← PK"
+        elif f.name in carried:
+            mark = "  ← FK"
+        elif f.name in mapping:
+            mark = "  ← mapping"
+        print(f"  {indent}   - {f.name}: {f.dataType.simpleString()}{mark}")
+    return (pk, carried, mapping)
+
+
+def print_keys_only(num, depth, name, pk, fks, mapping_keys):
+    """One-line keys summary for a table (PK | FK | mapping candidates)."""
+    indent = "---" * depth
+    keys = []
+    if pk:
+        keys.append(f"PK:{pk}")
+    if fks:
+        keys.append(f"FK:{','.join(fks)}")
+    if mapping_keys:
+        keys.append(f"map:{','.join(mapping_keys)}")
+    label = f"{num}_{name}" if num else name
+    print(f"  # * {indent}{label}  {' | '.join(keys) or '(no keys)'}")
+
+
+def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return_results=False):
+    """Value-verify FK→PK joins across ALL silver tables (read-only diagnostic).
+
+    FK side: pk-like / *_id scalar columns, sampled <= sample_cap rows per table.
+    PK side: the COMPLETE distinct value set of each table's PK candidate
+    (both-sides-sampling misses core joins — samples don't align on big tables).
+    A PK candidate whose values are contained in another table's PK domain is a
+    carried parent key (FK echo), not a join target — excluded here.
+    Prints one family per target PK with its verified FK members.
+    Labels: PK_FK_n [md5-8] — n renumbers per run; the hash is the stable
+    identity of the family's membership signature (same membership = same hash).
+    """
+    import hashlib
+    import pandas as pd
+
+    tables = sorted(t.name for t in spark.catalog.listTables(f"{CATALOG}.{SILVER_SCHEMA}"))
+    pk_cols, pk_domains, fk_cols = {}, {}, {}
+    for t in tables:
+        try:
+            df = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{t}")
+            schema = df.schema
+        except Exception:
+            continue
+        pk = find_pk(df, validate=False)
+        pk_cols[t] = pk
+        cand = []
+        for f in schema.fields:
+            if not isinstance(f.dataType, (StringType, IntegerType, LongType)):
+                continue
+            n = f.name
+            if n in ("bronze_insert_date", "bronze_updated_at", "payload_hash"):
+                continue
+            if n == pk or n.lower().endswith("_id") or (pk and n.endswith(f"_{pk}")):
+                cand.append(n)
+        cand = list(dict.fromkeys(cand))
+        if not cand:
+            continue
+        pdf = df.select(*cand).limit(sample_cap).toPandas()
+        for c in cand:
+            vals = {str(v) for v in pdf[c] if pd.notna(v) and str(v).strip() != ""}
+            vals -= {"None", "nan", "NaN"}
+            if vals:
+                fk_cols[(t, c)] = vals
+        if pk:
+            full = {str(v) for v in df.select(pk).distinct().toPandas()[pk]
+                    if pd.notna(v) and str(v).strip() != ""}
+            full -= {"None", "nan", "NaN"}
+            if full:
+                pk_domains[t] = full
+
+    # Echo exclusion: a PK candidate contained (>= min_containment) in another
+    # table's PK domain is a carried parent key, not a true join target.
+    echo = set()
+    for a, avals in pk_domains.items():
+        if a in echo:
+            continue
+        for b, bvals in pk_domains.items():
+            if b == a or b in echo:
+                continue
+            if len(avals & bvals) / max(len(avals), 1) >= min_containment:
+                if len(avals) < len(bvals):
+                    echo.add(a)   # a's domain sits inside b's — a is the echo
+                elif len(avals) == len(bvals):
+                    # equal domains: prefer the non-child (parent) table
+                    if b.startswith(a + "_"):
+                        echo.add(b)
+                    elif a.startswith(b + "_"):
+                        echo.add(a)
+    targets = {t: v for t, v in pk_domains.items() if t not in echo}
+
+    families = {}
+    for (ft, fc), fvals in fk_cols.items():
+        if len(fvals) < min_values:
+            continue
+        for pt, pvals in targets.items():
+            if pt == ft:
+                continue
+            frac = len(fvals & pvals) / len(fvals)
+            if frac >= min_containment:
+                families.setdefault((pt, pk_cols[pt]), []).append((frac, ft, fc, len(fvals)))
+
+    print(f"\n  🔗 JOIN KEYS (value-verified FK→PK; FK ≤{sample_cap:,} sampled rows, "
+          f"PK domain complete; ≥{int(min_containment*100)}% containment, ≥{min_values} distinct):")
+    n_fam = 0
+    for key in sorted(families, key=lambda k: (k[0], k[1])):
+        members = sorted(families[key], key=lambda m: (-m[0], m[1], m[2]))
+        sig = "|".join(sorted(f"{ft}.{fc}" for _, ft, fc, _ in members)) + f"->{key[0]}.{key[1]}"
+        h = hashlib.md5(sig.encode()).hexdigest()[:8]
+        n_fam += 1
+        print(f"  # * PK_FK_{n_fam} [{h}] → {key[0]}.{key[1]}   (PK domain {len(pk_domains[key[0]]):,})")
+        for frac, ft, fc, n in members:
+            print(f"  # *      {ft}.{fc}  ({frac*100:.1f}% of {n:,} sampled distinct)")
+    if not families:
+        print("  (none found at current thresholds)")
+    if return_results:
+        return families
+
+
 def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False):
     """Full Bronze → Silver pipeline: parse, flatten structs, write parent table.
     Child tables are discovered and printed (dry_run) but NOT written.
@@ -1439,6 +1607,39 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
                         child_idx += 1
                         child_num = f"{pipeline}_{child_idx}"
                         explode_to_child(df_sample, silver_name, arr, carry, depth=0, num_path=child_num, parent_pk=pk, dry_run=True)
+
+            # Key detail — PK / carried-FK / mapping-key candidates for the
+            # parent and every existing child table. Diagnostic only, sampled,
+            # wrapped in try/except so a failure here can never fail the task.
+            try:
+                print(f"\n  🗝️ KEY DETAIL (candidates, sampled ≤10K):")
+                pdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}")
+                pk_parent, _, _ = print_lineage_detail(
+                    pdf, f"{pipeline}", 0, silver_name, parent_keys=[])
+                key_summary = [(f"{pipeline}", 0, silver_name, pk_parent, [], [])]
+                for tname, cnt, cols in related:
+                    if tname == silver_name:
+                        continue
+                    try:
+                        cdf = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{tname}")
+                    except Exception:
+                        continue
+                    cpk, cfks, cmapping = print_lineage_detail(
+                        cdf, "", 1, tname,
+                        parent_keys=[pk_parent] if pk_parent else [])
+                    key_summary.append(("", 1, tname, cpk, cfks, cmapping))
+                print(f"\n  🗝️ KEYS SUMMARY:")
+                for k in key_summary:
+                    print_keys_only(*k)
+            except Exception as e:
+                print(f"  ⚠️ key detail skipped: {str(e)[:80]}")
+
+            # Value-verified join keys across the whole silver layer — FK→PK
+            # containment with complete PK domains (read-only diagnostic).
+            try:
+                find_join_keys()
+            except Exception as e:
+                print(f"  ⚠️ join keys skipped: {str(e)[:80]}")
 
             print_lineage_tree()
 
