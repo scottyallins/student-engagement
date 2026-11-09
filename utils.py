@@ -30,9 +30,9 @@ from pyspark.sql.types import (
 from builtins import round, max, min
 import time, re, json
 
-# JSON repair UDF defined in cell 3.
-# NOTE: _PROBLEM_KEYS (in cell 3) is DOMAIN-SPECIFIC to Close CRM, not universal.
-# It was discovered empirically by profiling source data — see cell 3 for methodology.
+# JSON repair UDF defined in the 'JSON Repair UDF' cell below (single source of truth — do not duplicate).
+# NOTE: _PROBLEM_KEYS (in the JSON Repair UDF cell) is DOMAIN-SPECIFIC to Close CRM, not universal.
+# It was discovered empirically by profiling source data — see that cell for methodology.
 
 CATALOG = "crm_ingestion"
 BRONZE_SCHEMA = "bronze"
@@ -64,7 +64,8 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 # DBTITLE 1,JSON Repair UDF
 # ============================================================================
 # JSON REPAIR UDF — universal normalization with type-based wrapper detection
-# One pre-existing limitation to be aware of, unrelated to the converter: a multi-key single-quoted outer holding a double-quoted stringified inner still can't be rescued (rung 2 only handles single-key wrappers; the quote flip corrupts nested doubles). That shape was already NULL before this change — current bronze has zero rows in it.============================================================================
+# RESOLVED Nov 9 2026 (was: pre-existing limitation, unrelated to the converter): a multi-key single-quoted outer holding a double-quoted stringified inner is now rescued — NOT by generalizing rung 2's anchored regex (multi-key breaks its boundedness), but by extending the rung-4 token scheme: the stringified inner's double quotes are tokenized (*DQUOTE*) in text space before the flip, then reverted in OBJECT space after parse, which turns the value back into a parseable '{...}' string that the existing post-parse wrapper detection (Rule 1) unwraps as usual. Current bronze has zero rows in this shape — insurance for future sources. See _protect_stringified_inner_quotes for the remaining documented residual (single-quoted inner inside a double-quoted value).
+# ============================================================================
 # ESCALATION LADDER — first success wins, fail-safe NULL at the end.
 # This ladder is the accumulated reasoning from the repair design sessions;
 # keep it in sync with _parse_activity_final:
@@ -91,7 +92,22 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 #      night). Reverted in OBJECT space after parse, where every character
 #      is legal — that post-parse revert point is what makes the token
 #      scheme sound.
-#   Rung 5. NULL — fail-safe drop, visible in the engine's parse % line.
+#      Extended Nov 9: single-quoted values that look like double-quoted
+#      stringified JSON ('{"id": 1}') get their inner " tokenized as
+#      (*DQUOTE*) before the same flip, rescuing the multi-key single-
+#      quoted outer (see _protect_stringified_inner_quotes); reverted in
+#      object space too, before wrapper detection. Both tokens assume the
+#      literal strings (*APOSTROPHE*)/(*DQUOTE*) never occur in source
+#      data — same collision assumption the scheme always had.
+#   Rung 5. Escape other breakers (string-level insurance, reached only
+#      after every repair above has failed on this row): quote unquoted
+#      values that start with a digit but contain letters (e.g. 12abc),
+#      double bare backslashes not already part of a valid escape, and
+#      remove trailing commas before } or ]. Deliberately NOT fixed
+#      (documented residual): digits-only invalid numbers (007) and bare
+#      dates (2026-11-06) still fall through — quoting those would turn a
+#      would-be number into a string.
+#   Rung 6. NULL — fail-safe drop, visible in the engine's parse % line.
 #
 # Wrapper detection (post-parse, recursive — every stringified inner JSON
 # re-runs the whole ladder on the inner string, so unwrap-then-parse
@@ -247,8 +263,105 @@ def _convert_python_literals(s):
     return "".join(out)
 
 
+def _protect_stringified_inner_quotes(s, token="(*DQUOTE*)"):
+    """Ladder rung 4 extension — tokenize the double quotes inside
+    stringified-JSON values so the quote flip cannot corrupt them.
+
+    Rescues the shape rung 2 deliberately does not reach: a MULTI-key
+    single-quoted outer holding a double-quoted stringified inner:
+        {'a': 'x', 'payload': '{"id": 1}'}
+    The flip would make the value's delimiters the same character as the
+    inner's quotes and corrupt the row. Tokenizing the inner " in TEXT
+    space lets the row parse; _restore_dquote_tokens reverts the token in
+    OBJECT space, the value is again a parseable '{...}' string, and the
+    post-parse wrapper detection (Rule 1) unwraps it — the rescue composes
+    with the existing machinery instead of generalizing rung 2's anchored
+    regex (multi-key would break its boundedness).
+
+    Bounded by construction:
+      - cheap guard: only single-quoted outers containing at least one
+        double quote are processed at all;
+      - per-value check: only single-quoted values that START with '{' or
+        '[' AND contain a " are tokenized (plain strings and numbers
+        never collide with the flip and are left untouched);
+      - the value-span pattern is the same key/value lookahead the
+        problem-key wrap uses (next-key or '}' anchor), so an apostrophe
+        inside the inner JSON does not end the span early.
+    Residual, documented: a single-quoted inner inside a DOUBLE-quoted
+    value ("{'inner': 'x'}") is still not rescuable — there is no " to
+    protect; zero rows in current bronze.
+    """
+    _t = s.strip()
+    if not ((_t.startswith("{'") or _t.startswith("[{'")) and '"' in s):
+        return s
+    pattern = r"'(\w+)'\s*:\s*'(.*?)'(?=\s*,\s*'\w+'\s*:|\s*})"
+    def _tokenize_dquotes(match):
+        value = match.group(2)
+        if value[:1] in ("{", "[") and '"' in value:
+            return "'" + match.group(1) + "': '" + value.replace('"', token) + "'"
+        return match.group(0)
+    return re.sub(pattern, _tokenize_dquotes, s, flags=re.DOTALL)
+
+
+def _restore_dquote_tokens(obj, token="(*DQUOTE*)"):
+    """Revert (*DQUOTE*) -> " across every string value, in OBJECT space
+    (post-parse, where every character is legal). Runs BEFORE wrapper
+    detection so a protected stringified inner is again a parseable
+    '{...}' string and Rule 1 can unwrap it. Unlike the apostrophe token
+    (problem keys only), DQUOTE tokens can appear under any key."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                if token in v:
+                    obj[k] = v.replace(token, '"')
+            else:
+                _restore_dquote_tokens(v, token)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, str):
+                if token in item:
+                    obj[i] = item.replace(token, '"')
+            else:
+                _restore_dquote_tokens(item, token)
+
+
+def _escape_other_breakers(s):
+    """Ladder rung 5 — string-level insurance, only reached after quote
+    repair (rungs 3 AND 4) has already failed on this row. Handles the next
+    most common reasons a flipped/tokenized string still won't parse:
+      - unquoted values that start with a digit but aren't pure numbers
+        (e.g. 12abc) — quoted so they parse as strings;
+      - bare backslashes not already part of a valid JSON escape;
+      - trailing commas before } or ].
+    Deliberately NOT fixed (documented residual): digits-only invalid
+    numbers such as 007 and bare dates such as 2026-11-06 — quoting those
+    would turn a would-be number into a string, so they stay NULL.
+    Context-blind edge, accepted: the digit rule can match a 'x: 12abc,'
+    shape INSIDE a quoted value — but this rung only ever sees rows that
+    are already NULL-bound, so the worst case is the row staying NULL;
+    rows that parse at a higher rung are never touched by it.
+    """
+    # Unquoted values that start with a digit but aren't pure numbers
+    s = re.sub(
+        r'([:,\[\(]\s*)([0-9][0-9a-zA-Z_\-\.]*[a-zA-Z][0-9a-zA-Z_\-\.]*)(\s*[,}\])])',
+        r'\1"\2"\3',
+        s
+    )
+    # Escape bare backslashes that are not already part of a valid escape
+    s = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', s)
+    # Remove trailing commas before } or ]
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+    return s
+
+
 def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
-    """Try clean repair first. If parse fails: wrap problem keys, tokenize all ' inside them with token, then flip quotes.
+    """Escalation inside the quote-repair path.
+    1. Protect word apostrophes
+    2. Convert Python literals
+    3. Try clean quote flip
+    4. Tokenize stringified-inner double quotes (*DQUOTE*), wrap + tokenize
+       problem keys, then flip
+    5. Escape other breakers (insurance — only if everything above failed)
     """
     # 1. Protect word apostrophes globally first (does not use token)
     protected = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROWORD\2", s)
@@ -266,11 +379,25 @@ def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # 3. Wrap & tokenize problem keys, then flip quotes
-    wrapped = _wrap_problem_keys_in_string_and_tokenize(protected, token=token)
+    # 3. Tokenize stringified-inner double quotes, wrap & tokenize problem
+    # keys, then flip quotes. _protect_stringified_inner_quotes is a no-op
+    # for rows with no double-quoted stringified values, so this attempt is
+    # byte-identical to the old one for every such row.
+    dquote_protected = _protect_stringified_inner_quotes(protected)
+    wrapped = _wrap_problem_keys_in_string_and_tokenize(dquote_protected, token=token)
     attempt = wrapped.replace("'", '"').replace("APOSTROWORD", "'")
-    json.loads(attempt)         # validate
-    return attempt
+    try:
+        json.loads(attempt)
+        return attempt
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 4. Escape other breakers — insurance, only reached if everything above
+    # failed. A JSONDecodeError here propagates to the caller and the row
+    # becomes NULL (fail-safe rung 6).
+    escaped = _escape_other_breakers(attempt)
+    json.loads(escaped)
+    return escaped
 
 
 def _unwrap_problem_keys(obj):
@@ -318,6 +445,9 @@ def _detect_and_unwrap(parsed):
                         # so tokens would otherwise leak into the output.
                         _unwrap_problem_keys(inner)
                         _restore_apostrophe_tokens(inner)
+                        # DQUOTE tokens from the extended rung 4 revert here
+                        # too, before recursion — same leak-prevention logic.
+                        _restore_dquote_tokens(inner)
                         return _detect_and_unwrap(inner)
                     except (json.JSONDecodeError, TypeError):
                         pass  # Not a JSON wrapper, continue checking other keys
@@ -364,9 +494,16 @@ def _parse_activity_final(raw):
       3. APOSTROWORD-protected quote flip (word apostrophes preserved), plus
          controlled None/True/False -> null/true/false conversion outside
          quoted strings (_convert_python_literals — spec: null handling)
-      4. Wrap problem keys + (*APOSTROPHE*) token (non-word apostrophes
-         preserved; reverted in object space after parse)
-      5. NULL — fail-safe drop, visible in the engine's parse %
+      4. Tokenize stringified-inner double quotes (*DQUOTE*) + wrap
+         problem keys + (*APOSTROPHE*) token (all reverted in object space;
+         the multi-key single-quoted outer with a double-quoted
+         stringified inner — formerly a documented limitation — is
+         rescued here and unwrapped post-parse by Rule 1)
+      5. Escape other breakers — digit-leading unquoted values, bare
+         backslashes, trailing commas (_escape_other_breakers; string-level
+         insurance only after rungs 3-4 failed; see its docstring for the
+         documented residual)
+      6. NULL — fail-safe drop, visible in the engine's parse %
     Wrapper detection is by type inspection, not by hardcoded key names, and
     runs post-parse recursively (see _detect_and_unwrap).
     Problem keys: _PROBLEM_KEYS is domain-specific.
@@ -395,6 +532,12 @@ def _parse_activity_final(raw):
         try:
             repaired = _repair_single_quotes(raw.strip(), token=token)
             outer = json.loads(repaired)
+            # Revert (*DQUOTE*) tokens in OBJECT space BEFORE wrapper
+            # detection: a protected stringified inner becomes a parseable
+            # '{...}' string again and Rule 1 unwraps it — the multi-key
+            # rescue composes with the existing post-parse machinery.
+            if "(*DQUOTE*)" in repaired:
+                _restore_dquote_tokens(outer)
             repaired_row = True
         except (json.JSONDecodeError, TypeError):
             return None
