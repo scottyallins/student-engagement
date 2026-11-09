@@ -1054,12 +1054,102 @@ def find_pk(df, table_name=None, validate=True, sample_size=10000):
 # SILVER WRITING
 # ============================================================================
 
+# Pinned merge keys for CDC upserts — the one-row-per-id silver contract
+# (Nov 9 2026). Tables listed here upsert by PK on CDC batches (MERGE:
+# existing ids UPDATE in place, new ids INSERT, so the row count tracks the
+# true population instead of growing with every changed record). Tables NOT
+# listed keep the legacy delete+append behavior. Keys are the pinned
+# per-family PKs from 2_Silver/rebuild_silver_parents_latest_per_id;
+# children get their entries in the child-rebuild step.
+SILVER_MERGE_KEYS = {
+    "leads_processed":                      "id",
+    "lead_activites_processed":              "id",
+    "close_crm_users_processed":             "id",
+    "custom_activites_processed":            "id",
+    "calendly_scheduled_events_processed":   "EVENT_URI",
+    "student_sentiment_processed":           "CHANNEL_ID",
+    "mdl_users_processed":                   "ID",
+}
+
+
+def _merge_silver(df, table_name, pk):
+    """CDC upsert by PK: UPDATE existing ids in place, INSERT new ids.
+
+    Source batch rules:
+      * deduped to latest-version-per-PK first (a multi-dump batch holding
+        two versions of one id would make MERGE fail with multiple matches);
+        ties broken by bronze_insert_date / bronze_updated_at DESC NULLS
+        LAST, then payload_hash DESC — the same ordering as the parent rebuild;
+      * NULL-PK rows are kept verbatim (never deduped away): they miss the ON
+        match and INSERT; identical payloads are already skipped upstream by
+        the payload_hash anti-join, so they only re-insert if a NULL-PK
+        payload actually changes;
+      * schema evolution: source columns the target lacks are added via
+        ALTER TABLE ADD COLUMN before the merge; target columns missing
+        from the source keep their values on UPDATE and go NULL on INSERT
+        (explicit-column MERGE, not UPDATE SET * / INSERT *).
+    """
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import col, row_number
+
+    full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
+
+    # Dedupe batch to the latest version per PK (NULL-PK rows kept as-is).
+    w = Window.partitionBy(pk).orderBy(
+        col("bronze_insert_date").desc_nulls_last(),
+        col("bronze_updated_at").desc_nulls_last(),
+        col("payload_hash").desc())
+    src = (df.filter(col(pk).isNotNull())
+             .withColumn("_rn", row_number().over(w))
+             .filter("_rn = 1").drop("_rn")
+             .unionByName(df.filter(col(pk).isNull())))
+
+    # Schema evolution: add source columns the target lacks (nullable).
+    src_cols = [f.name for f in df.schema.fields]
+    tgt_cols = set(spark.table(full).columns)
+    for f in df.schema.fields:
+        if f.name not in tgt_cols:
+            spark.sql(f"ALTER TABLE {full} ADD COLUMN `{f.name}` {f.dataType.simpleString()}")
+
+    # Explicit-column MERGE so a schema mismatch between batch and target
+    # cannot make the write fail after the ALTER step above.
+    view = f"_merge_src_{table_name}"
+    src.createOrReplaceTempView(view)
+    set_clause = ", ".join(f"t.`{c}` = s.`{c}`" for c in src_cols)
+    ins_cols = ", ".join(f"`{c}`" for c in src_cols)
+    ins_vals = ", ".join(f"s.`{c}`" for c in src_cols)
+    try:
+        spark.sql(f"""
+            MERGE INTO {full} AS t
+            USING {view} AS s
+            ON t.`{pk}` = s.`{pk}`
+            WHEN MATCHED THEN UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN INSERT ({ins_cols}) VALUES ({ins_vals})
+        """)
+    finally:
+        spark.sql(f"DROP VIEW IF EXISTS {view}")
+
 
 def write_silver(df, table_name):
-    """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set."""
+    """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set.
+
+    CDC mode: MERGE-by-PK upsert for tables with a SILVER_MERGE_KEYS entry
+    (one-row-per-id contract); legacy delete+append otherwise. Full-load mode
+    (_CDC_WATERMARK=None): atomic full overwrite (overwriteSchema=true).
+    """
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
 
     if _CDC_WATERMARK is not None:
+        # Upsert-by-PK when the table has a pinned merge key: changed records
+        # UPDATE in place, new records INSERT. Errors PROPAGATE — never fall
+        # through to the full overwrite below (it would replace the whole
+        # table with just the CDC batch).
+        _mk = SILVER_MERGE_KEYS.get(table_name)
+        if _mk and _mk in df.columns:
+            _merge_silver(df, table_name, _mk)
+            cnt = spark.table(full).count()
+            print(f"  ✅ CDC MERGE: {table_name}: {cnt:,} rows (upsert by {_mk})")
+            return cnt
         try:
             spark.sql(f"DESCRIBE TABLE {full}")
             # Keep microseconds: the DELETE window must exactly match the parse filter
