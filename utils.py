@@ -1427,14 +1427,20 @@ def print_keys_only(num, depth, name, pk, fks, mapping_keys):
 
 
 def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return_results=False):
-    """Value-verify FK→PK joins across ALL silver tables (read-only diagnostic).
+    """Value-verify FK→PK joins across ALL silver tables (diagnostic; reads all
+    business tables, materializes the _key_join_map side table).
 
     FK side: pk-like / *_id scalar columns, sampled <= sample_cap rows per table.
+    On _custom tables (the pivot position) EVERY scalar column is tested — custom
+    fields (CSM, Lead_Owner, …) can carry join keys with no *_id name shape.
     PK side: the COMPLETE distinct value set of each table's PK candidate
     (both-sides-sampling misses core joins — samples don't align on big tables).
     A PK candidate whose values are contained in another table's PK domain is a
-    carried parent key (FK echo), not a join target — excluded here.
-    Prints one family per target PK with its verified FK members.
+    carried parent key (FK echo), not a join target — excluded here, recorded
+    as a PK_ECHO row in the map (the PK(x) = PK(y) relation).
+    Prints one family per target PK with its verified FK members, and writes
+    every relation (PK census, PK_ECHO, PK_FK) to _key_join_map — one row per
+    relation with its stable hash, containment, and domain sizes.
     Labels: PK_FK_n [md5-8] — n renumbers per run; the hash is the stable
     identity of the family's membership signature (same membership = same hash).
     """
@@ -1460,6 +1466,15 @@ def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return
                 continue
             if n == pk or n.lower().endswith("_id") or (pk and n.endswith(f"_{pk}")):
                 cand.append(n)
+        # _custom tables are the pivot position: EVERY scalar column is a
+        # custom-field value (CSM, Lead_Owner, Setter, …) with no *_id shape
+        # hint — include them all so the containment test can verify joins
+        # the name-based filter would never see.
+        if t.endswith("_custom"):
+            for f in schema.fields:
+                if isinstance(f.dataType, (StringType, IntegerType, LongType)) \
+                        and f.name not in ("bronze_insert_date", "bronze_updated_at", "payload_hash"):
+                    cand.append(f.name)
         cand = list(dict.fromkeys(cand))
         if not cand:
             continue
@@ -1478,7 +1493,8 @@ def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return
 
     # Echo exclusion: a PK candidate contained (>= min_containment) in another
     # table's PK domain is a carried parent key, not a true join target.
-    echo = set()
+    # echo_of records the pairing (a inside b) so the map can express PK(x) = PK(y).
+    echo, echo_of = set(), {}
     for a, avals in pk_domains.items():
         if a in echo:
             continue
@@ -1487,13 +1503,13 @@ def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return
                 continue
             if len(avals & bvals) / max(len(avals), 1) >= min_containment:
                 if len(avals) < len(bvals):
-                    echo.add(a)   # a's domain sits inside b's — a is the echo
+                    echo.add(a); echo_of[a] = b   # a's domain sits inside b's
                 elif len(avals) == len(bvals):
                     # equal domains: prefer the non-child (parent) table
                     if b.startswith(a + "_"):
-                        echo.add(b)
+                        echo.add(b); echo_of[b] = a
                     elif a.startswith(b + "_"):
-                        echo.add(a)
+                        echo.add(a); echo_of[a] = b
     targets = {t: v for t, v in pk_domains.items() if t not in echo}
 
     families = {}
@@ -1508,7 +1524,8 @@ def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return
                 families.setdefault((pt, pk_cols[pt]), []).append((frac, ft, fc, len(fvals)))
 
     print(f"\n  🔗 JOIN KEYS (value-verified FK→PK; FK ≤{sample_cap:,} sampled rows, "
-          f"PK domain complete; ≥{int(min_containment*100)}% containment, ≥{min_values} distinct):")
+          f"PK domain complete; ≥{int(min_containment*100)}% containment, ≥{min_values} distinct; "
+          f"_custom tables: all scalar columns tested):")
     n_fam = 0
     for key in sorted(families, key=lambda k: (k[0], k[1])):
         members = sorted(families[key], key=lambda m: (-m[0], m[1], m[2]))
@@ -1520,8 +1537,146 @@ def find_join_keys(sample_cap=10000, min_values=30, min_containment=0.90, return
             print(f"  # *      {ft}.{fc}  ({frac*100:.1f}% of {n:,} sampled distinct)")
     if not families:
         print("  (none found at current thresholds)")
+
+    # --- Materialize the key map (side table) ---------------------------------
+    # One row per: PK census entry, PK→PK echo containment (PK(x) = PK(y)),
+    # and every verified FK→PK member (PK(x) = FK(y)) with its stable hash.
+    # Overwritten on every run — the map always reflects current silver state.
+    try:
+        from pyspark.sql.types import DoubleType, StructField
+        from datetime import datetime, timezone
+        _now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        map_rows = []
+        for t in sorted(pk_domains):
+            map_rows.append((_now, "PK", t, pk_cols[t], None, None, None,
+                             len(pk_domains[t]), None, None))
+            if t in echo_of:
+                b = echo_of[t]
+                map_rows.append((_now, "PK_ECHO", t, pk_cols[t], b, pk_cols[b],
+                                 None, len(pk_domains[t]), len(pk_domains[b]), None))
+        for key in families:
+            members = sorted(families[key], key=lambda m: (-m[0], m[1], m[2]))
+            _sig = "|".join(sorted(f"{ft}.{fc}" for _, ft, fc, _ in members)) + f"->{key[0]}.{key[1]}"
+            _h = hashlib.md5(_sig.encode()).hexdigest()[:8]
+            for frac, ft, fc, n in members:
+                map_rows.append((_now, "PK_FK", ft, fc, key[0], key[1],
+                                 round(float(frac), 4), n, len(pk_domains[key[0]]), _h))
+        map_schema = StructType([
+            StructField("captured_at", StringType()),
+            StructField("kind", StringType()),
+            StructField("left_table", StringType()),
+            StructField("left_col", StringType()),
+            StructField("right_table", StringType()),
+            StructField("right_col", StringType()),
+            StructField("containment", DoubleType()),
+            StructField("left_n", LongType()),
+            StructField("right_n", LongType()),
+            StructField("rel_hash", StringType()),
+        ])
+        map_name = f"{CATALOG}.{SILVER_SCHEMA}._key_join_map"
+        map_pdf = pd.DataFrame(map_rows, columns=[f.name for f in map_schema.fields])
+        (spark.createDataFrame(map_pdf, schema=map_schema)
+              .write.format("delta").mode("overwrite")
+              .option("overwriteSchema", "true").saveAsTable(map_name))
+        print(f"  🗺️ Key map → {map_name} ({len(map_rows):,} rows)")
+    except Exception as e:
+        print(f"  ⚠️ key map skipped: {str(e)[:80]}")
+
     if return_results:
         return families
+
+
+def find_problem_keys(bronze_name, sample_rows=1000):
+    """DISCOVER problem keys (free-text fields that break quote repair) with
+    NO prior knowledge, using the real repair ladder as ground truth.
+
+    Differential method:
+      1. Randomly sample raw_data strings from the bronze source.
+      2. Run the ladder with the CURRENT _PROBLEM_KEYS — rows still NULL are
+         hard failures (reported with an excerpt).
+      3. Run the ladder with _PROBLEM_KEYS emptied — rows that now fail but
+         passed in step 2 were rescued ONLY by the problem-key wrap.
+      4. For each such row, test every key name it contains with a single-key
+         wrap: keys that rescue it are the discovered problem keys. Keys NOT
+         in the current set are reported MISSING — paste those into
+         _PROBLEM_KEYS (JSON Repair UDF cell) to close the gap.
+
+    On-demand tool (NOT wired into the nightly): run per source, or whenever
+    a new source starts failing. _PROBLEM_KEYS is mutated only during the
+    run and restored in a finally block. Returns a summary dict.
+    """
+    global _PROBLEM_KEYS
+    original = set(_PROBLEM_KEYS)
+
+    br = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_name}")
+    _src = br.filter(col("raw_data").isNotNull())
+    total = _src.count()
+    if total > sample_rows:
+        _src = _src.select("raw_data").sample(False, sample_rows / total).limit(sample_rows)
+    else:
+        _src = _src.select("raw_data")
+    raws = list({r["raw_data"] for r in _src.collect()})
+
+    def _ok(s):
+        try:
+            return _parse_activity_final(s) is not None
+        except Exception:
+            return False
+
+    rescued_by, missing = {}, {}
+    try:
+        # Step 2 — current set: hard failures are rows no rung can save.
+        ok_current = {s: _ok(s) for s in raws}
+        hard = [s for s in raws if not ok_current[s]]
+
+        # Step 3 — emptied set: rows that fail now were saved by the wrap.
+        _PROBLEM_KEYS = set()
+        fail_no_wrap = [s for s in raws if not _ok(s)]
+        wrap_rescued = [s for s in fail_no_wrap if ok_current[s]]
+
+        # Step 4 — single-key differential: which key does the rescuing?
+        from collections import Counter
+        key_re = re.compile(r"[\"'](\w+)[\"']\s*:")
+        rescued_by, missing = Counter(), Counter()
+        unexplained = []
+        for s in wrap_rescued:
+            keys = sorted(set(key_re.findall(s)))
+            row_rescuers = []
+            for k in keys:
+                _PROBLEM_KEYS = {k}
+                if _ok(s):
+                    row_rescuers.append(k)
+            if not row_rescuers:
+                # fallback: the row may need SEVERAL keys wrapped at once
+                _PROBLEM_KEYS = set(keys)
+                if _ok(s):
+                    row_rescuers = keys
+                else:
+                    unexplained.append(s)
+            for k in row_rescuers:
+                rescued_by[k] += 1
+                if k not in original:
+                    missing[k] += 1
+    finally:
+        _PROBLEM_KEYS = original
+
+    print(f"\n  🔧 PROBLEM KEYS — {bronze_name} (sampled {len(raws):,} distinct raw rows):")
+    print(f"  # * hard failures (NULL even with current set): {len(hard):,}")
+    for s in hard[:3]:
+        print(f"      excerpt: {s[:110].replace(chr(10), ' ')}…")
+    print(f"  # * rows rescued by problem-key wrap: {len(wrap_rescued):,}")
+    if rescued_by:
+        print("  # * discovered keys (rows rescued per key):")
+        for k, n in sorted(rescued_by.items(), key=lambda x: -x[1]):
+            flag = "  ⚠️ MISSING from _PROBLEM_KEYS — add it" if k not in original else ""
+            print(f"      {k}: {n}{flag}")
+    if unexplained:
+        print(f"  # * {len(unexplained)} wrap-rescued row(s) no single/union key set explains — inspect manually")
+    if not wrap_rescued and not hard:
+        print("  # * sample fully clean — no problem keys exercised in this sample")
+    return {"sampled": len(raws), "hard_failures": len(hard),
+            "wrap_rescued": len(wrap_rescued),
+            "discovered": dict(rescued_by), "missing": dict(missing)}
 
 
 def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False):
