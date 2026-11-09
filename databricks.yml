@@ -145,7 +145,16 @@ resources:
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
-            notebook_path: 2_Silver/2_4_Silver_custom_activites_processed.ipynb
+            notebook_path: 2_Silver/2_4_01_Silver_custom_activites_processed.ipynb
+        # custom-activity fields child: the cf_ key -> field-name dictionary
+        # (one row per field definition per type; gold 3_03 resolves setter/closer/
+        # contract value/program through it instead of hardcoded keys). The two
+        # permission children are intentionally NOT nightly tasks (no consumer).
+        - task_key: silver_custom_activities_fields
+          depends_on:
+            - task_key: silver_custom_activities
+          notebook_task:
+            notebook_path: 2_Silver/2_4_02_Silver_custom_activites_processed_fields.ipynb
         - task_key: silver_calendly
           depends_on:
             - task_key: bronze_ingestion
@@ -256,6 +265,7 @@ resources:
             notebook_path: 3_Gold/3_02_Gold_leads_activity_fact.ipynb
         - task_key: gold_sales_fact
           depends_on:
+            - task_key: silver_custom_activities_fields
             - task_key: gold_staff_emails
             - task_key: gold_staff_dim
             - task_key: gold_lead_dim
