@@ -74,6 +74,12 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 #      untouched. Wrapper unwrap happens AFTER any successful parse (a
 #      wrapper IS valid JSON; you cannot extract it from a string you
 #      cannot parse without fragile regex surgery) — see _detect_and_unwrap.
+#   Rung 1b. Smart-quote normalization (typographic curly quotes used as
+#      DELIMITERS by non-conformant producers), applied ONLY inside the
+#      escalation path — rows that parse clean at rung 1 are never touched,
+#      so smart quotes that are legitimate VALUE content survive. After
+#      normalization the full ladder runs on the normalized string, so
+#      curly single-quote delimiters are rescued by the flip as well.
 #   Rung 2. String-level unwrap (bounded insurance): a row that is exactly
 #      a single-key single-quoted wrapper {'key': '<stringified JSON>'}
 #      gets its inner string extracted and the WHOLE ladder run recursively
@@ -101,12 +107,18 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 #      data — same collision assumption the scheme always had.
 #   Rung 5. Escape other breakers (string-level insurance, reached only
 #      after every repair above has failed on this row): quote unquoted
-#      values that start with a digit but contain letters (e.g. 12abc),
-#      double bare backslashes not already part of a valid escape, and
-#      remove trailing commas before } or ]. Deliberately NOT fixed
-#      (documented residual): digits-only invalid numbers (007) and bare
-#      dates (2026-11-06) still fall through — quoting those would turn a
-#      would-be number into a string.
+#      KEYS (string-aware, never inside string values), escape raw control
+#      characters inside strings (pure rescue — parsed values unchanged,
+#      a tab stays a tab), quote unquoted values that start with a digit
+#      but contain letters (e.g. 12abc), double bare backslashes not
+#      already part of a valid escape, and remove trailing commas before
+#      } or ]. The former residual — digits-only invalid numbers (007) and
+#      bare dates (2026-11-06) — is now OPT-IN via the module switches
+#      QUOTE_INVALID_NUMBERS / QUOTE_BARE_DATES (default False = the row
+#      still NULLs; see _apply_overprepared_quoting): quoting changes a
+#      would-be number into a string, which is right for identifiers and
+#      dates-as-text and wrong for true numeric measures — decide per
+#      source, then review via repair_json_flags_udf / repair_flag_summary.
 #   Rung 6. NULL — fail-safe drop, visible in the engine's parse % line.
 #
 # Wrapper detection (post-parse, recursive — every stringified inner JSON
@@ -126,7 +138,54 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 # quote repair). For a new source, profile failed parses and update the set.
 # The detection logic is universal; the key set is not.
 
-_PROBLEM_KEYS = {"description", "notes", "body_text", "subject", "text", "note"}
+_PROBLEM_KEYS = {
+    # High-volume free-text (lead_activites_raw + leads_raw)
+    "text",
+    "body_text",
+    "body_preview",
+    "subject",
+    "note",
+    "note_html",
+    "html",
+    "outcome_autofill_reasoning",
+    "user_note",
+    "user_note_html",
+    "name",
+    "template_name",
+    "title",
+    "error_message",
+    "filename",
+    "description",
+
+    # Wrapper keys that appeared as single-quoted JSON
+    "JSON_OBJECT",
+
+    # leads_raw free-text / custom fields
+    "Current Situation",
+    "Objections Faced?",
+    "Reactivation Campaign",
+    "SMS Opt-Out",
+    "career goal timeline",
+    "Lead Quality",
+    "Current Salary",
+    "Visa Status",
+    "Ontraport_Call Notes",
+    "Churn RCA",
+    "Company Name",}
+
+# --- Rung-5 over-prepared switches (Nov 9 2026 upgrade). Defaults OFF so
+# existing behavior is byte-identical. Flip per source (driver-side,
+# before process_table; same pattern as _CDC_WATERMARK) when you decide the
+# value is worth keeping as a string instead of NULLing the row:
+#   QUOTE_INVALID_NUMBERS = True  ->  digits-only invalid numbers (007)
+#       survive as strings (zip codes, account numbers, SKUs...)
+#   QUOTE_BARE_DATES      = True  ->  bare dates (2026-11-06) survive as
+#       castable strings
+# Reset to False after the source is reviewed (or fix it at source).
+# Visibility: repair_json_flags_udf / repair_flag_summary report which keys
+# took on quoting — see the flags section at the bottom of this cell.
+QUOTE_INVALID_NUMBERS = False
+QUOTE_BARE_DATES = False
 
 def _wrap_problem_keys_in_string_and_tokenize(s, token="(*APOSTROPHE*)"):
     """Wrap problem-key values and replace every ' in them with the token.
@@ -325,6 +384,195 @@ def _restore_dquote_tokens(obj, token="(*DQUOTE*)"):
                 _restore_dquote_tokens(item, token)
 
 
+# ============================================================================
+# RUNG-1B + RUNG-5 UPGRADE HELPERS (Nov 9 2026) — cover every breaker class
+# discover_all_taxonomy can report. All are INSIDE the escalation path:
+# rows that parse clean at rung 1 are never touched by any of them.
+# ============================================================================
+
+def _normalize_smart_quotes(s):
+    """Rung 1b — typographic smart quotes (the curly forms of double and
+    single quotes) used as DELIMITERS by non-conformant producers.
+    Applied only to rows that already failed the raw direct parse, so
+    smart quotes that are legitimate value content in a clean row are
+    never touched. After normalization every lower rung runs on the
+    normalized string — curly single-quote delimiters are rescued by the
+    flip like any other single-quoted row. Documented edge: a
+    rung-1-failing row whose VALUES contain smart quotes has them
+    normalized too; such rows were NULL-bound anyway, and the delimiter
+    case is the common one."""
+    return (s.replace("\u201c", '"').replace("\u201d", '"')
+             .replace("\u2018", "'").replace("\u2019", "'"))
+
+
+def _quote_unquoted_keys(s):
+    """Rung 5 — quote unquoted keys ({name: value} -> {\"name\": value}).
+    String-aware: the key pattern is applied only OUTSIDE quoted spans, so
+    a 'word: value' shape inside an existing string value is never injected
+    with quotes (the naive regex misfires there). Tracks both quote
+    characters — rung 5 sees post-flip (double-quoted) rows, but the helper
+    is safe pre-flip too."""
+    KEY_PATTERN = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+    out = []
+    i = 0
+    n = len(s)
+    in_str = None
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\" and i + 1 < n:          # keep escaped chars intact
+                out.append(s[i:i + 2])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            out.append(c)
+            i += 1
+            continue
+        if c in ("'", '"'):
+            in_str = c
+            out.append(c)
+            i += 1
+            continue
+        m = KEY_PATTERN.match(s, i)
+        if m:                                     # unquoted key — quote it
+            out.append(m.group(1) + '"' + m.group(2) + '"' + m.group(3))
+            i = m.end()
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _escape_control_chars_in_strings(s):
+    """Rung 5 — escape raw control characters that JSON forbids inside
+    strings (tab, newline, CR, FF, BS and other chars below 0x20), INSIDE
+    quoted spans only. Pure rescue: the escape sequence is exactly how
+    that character is legally represented, so the PARSED value is
+    byte-identical (a tab stays a tab) — unlike the opt-in quoting rules
+    this changes no type, so it is always on at rung 5. Outside strings
+    these characters are legal whitespace and are left alone (a naive
+    global replace would corrupt structural whitespace)."""
+    _ESC = {"\t": "\\t", "\n": "\\n", "\r": "\\r", "\f": "\\f", "\b": "\\b"}
+    out = []
+    i = 0
+    n = len(s)
+    in_str = None
+    while i < n:
+        c = s[i]
+        if in_str:
+            if c == "\\" and i + 1 < n:          # keep existing escapes intact
+                out.append(s[i:i + 2])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+                out.append(c)
+                i += 1
+                continue
+            if c in _ESC:
+                out.append(_ESC[c])
+                i += 1
+                continue
+            if ord(c) < 0x20:
+                out.append("\\u%04x" % ord(c))
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c in ("'", '"'):
+            in_str = c
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _apply_overprepared_quoting(s, track=None):
+    """Rung 5 OPTIONAL rules — the over-prepared path. Quotes digits-only
+    invalid numbers (007) and bare dates (2026-11-06) so the row PARSES
+    instead of NULLing. Type-changing by design: those values become
+    strings — the right call for free-text/identifier data (zip codes,
+    account numbers, SKUs, dates-as-text), the wrong call for true numeric
+    measures (decide per source). Defaults come from the module switches
+    QUOTE_INVALID_NUMBERS / QUOTE_BARE_DATES (False = unchanged
+    behavior). Records fired rules in `track` for repair-flags
+    visibility."""
+    if track is None:
+        track = {}
+    if QUOTE_INVALID_NUMBERS:
+        _s = re.sub(r'([:,\[\(]\s*)(0\d+)(\s*[,}\])])', r'\1"\2"\3', s)
+        if _s != s:
+            track["quoted_invalid_numbers"] = True
+            s = _s
+    if QUOTE_BARE_DATES:
+        _s = re.sub(r'([:,\[\(]\s*)(\d{4}-\d{2}-\d{2})(\s*[,}\])])', r'\1"\2"\3', s)
+        if _s != s:
+            track["quoted_bare_dates"] = True
+            s = _s
+    return s
+
+
+# --- Post-parse date locator (upgrade request: scan for these) -------------
+
+_DATE_PATTERNS = [
+    (re.compile(r"^\d{4}-\d{2}-\d{2}$"), "%Y-%m-%d"),
+    (re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"), "%Y-%m-%dT%H:%M:%S"),
+    (re.compile(r"^\d{2}/\d{2}/\d{4}$"), "%m/%d/%Y"),
+    (re.compile(r"^\d{2}-\d{2}-\d{4}$"), "%m-%d-%Y"),
+]
+
+def _looks_like_date(s):
+    """True when a string value matches one of the known date shapes
+    (YYYY-MM-DD, ISO datetime, MM/DD/YYYY, MM-DD-YYYY)."""
+    from datetime import datetime as _dt
+    if not isinstance(s, str):
+        return False
+    for pat, fmt in _DATE_PATTERNS:
+        if pat.match(s):
+            try:
+                _dt.strptime(s[:19], fmt)   # ignore timezone tail
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def _scan_date_like_keys(obj):
+    """Post-parse date locator: walk the parsed object and collect every
+    key whose value looks like a date-as-text — the columns that take on
+    quoting under QUOTE_BARE_DATES, and generally the date-typed columns
+    silver should cast. Returns a sorted, de-duplicated key list."""
+    keys = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str) and _looks_like_date(v):
+                keys.add(k)
+            else:
+                keys.update(_scan_date_like_keys(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            keys.update(_scan_date_like_keys(item))
+    return sorted(keys)
+
+
+def _scan_invalid_number_keys(obj):
+    """Post-parse scan: keys whose values are leading-zero number-strings
+    (007, 0123) — the columns that take on quoting under
+    QUOTE_INVALID_NUMBERS (zip codes, account numbers...)."""
+    keys = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str) and re.match(r"^0\d+$", v):
+                keys.add(k)
+            else:
+                keys.update(_scan_invalid_number_keys(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            keys.update(_scan_invalid_number_keys(item))
+    return sorted(keys)
+
+
 def _escape_other_breakers(s):
     """Ladder rung 5 — string-level insurance, only reached after quote
     repair (rungs 3 AND 4) has already failed on this row. Handles the next
@@ -333,9 +581,12 @@ def _escape_other_breakers(s):
         (e.g. 12abc) — quoted so they parse as strings;
       - bare backslashes not already part of a valid JSON escape;
       - trailing commas before } or ].
-    Deliberately NOT fixed (documented residual): digits-only invalid
-    numbers such as 007 and bare dates such as 2026-11-06 — quoting those
-    would turn a would-be number into a string, so they stay NULL.
+    Deliberately NOT fixed HERE (former residual, now opt-in): digits-only
+    invalid numbers such as 007 and bare dates such as 2026-11-06 — quoting
+    those changes a would-be number into a string. They stay NULL by
+    default; the over-prepared switches QUOTE_INVALID_NUMBERS /
+    QUOTE_BARE_DATES (applied by _apply_overprepared_quoting right after
+    this function, rung 5 of _repair_single_quotes) opt in per source.
     Context-blind edge, accepted: the digit rule can match a 'x: 12abc,'
     shape INSIDE a quoted value — but this rung only ever sees rows that
     are already NULL-bound, so the worst case is the row staying NULL;
@@ -354,15 +605,19 @@ def _escape_other_breakers(s):
     return s
 
 
-def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
+def _repair_single_quotes(s, token="(*APOSTROPHE*)", track=None):
     """Escalation inside the quote-repair path.
     1. Protect word apostrophes
     2. Convert Python literals
     3. Try clean quote flip
     4. Tokenize stringified-inner double quotes (*DQUOTE*), wrap + tokenize
        problem keys, then flip
-    5. Escape other breakers (insurance — only if everything above failed)
+    5. Escape other breakers — unquoted keys, raw control chars in strings,
+       digit-leading values, bare backslashes, trailing commas, then the
+       OPT-IN over-prepared quoting (insurance — only if everything above
+       failed; records the rescuing rung and fired repairs in `track`)
     """
+    track = {} if track is None else track
     # 1. Protect word apostrophes globally first (does not use token)
     protected = re.sub(r"([a-zA-Z])'([a-zA-Z])", r"\1APOSTROWORD\2", s)
 
@@ -375,6 +630,7 @@ def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
     attempt = protected.replace("'", '"').replace("APOSTROWORD", "'")
     try:
         json.loads(attempt)
+        track["rung"] = 3
         return attempt          # clean success
     except (json.JSONDecodeError, TypeError):
         pass
@@ -388,6 +644,7 @@ def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
     attempt = wrapped.replace("'", '"').replace("APOSTROWORD", "'")
     try:
         json.loads(attempt)
+        track["rung"] = 4
         return attempt
     except (json.JSONDecodeError, TypeError):
         pass
@@ -395,7 +652,20 @@ def _repair_single_quotes(s, token="(*APOSTROPHE*)"):
     # 4. Escape other breakers — insurance, only reached if everything above
     # failed. A JSONDecodeError here propagates to the caller and the row
     # becomes NULL (fail-safe rung 6).
-    escaped = _escape_other_breakers(attempt)
+    # Nov 9 2026 upgrade — three additions in the rung-5 pipeline:
+    #   a. quote unquoted keys (string-aware — never inside string values)
+    #   b. escape raw control characters inside strings (pure rescue —
+    #      parsed values unchanged, a tab stays a tab)
+    #   c. apply the OPT-IN over-prepared quoting (007 / bare dates —
+    #      module switches; default off = previous NULL residual)
+    track["rung"] = 5
+    escaped = _quote_unquoted_keys(attempt)
+    if escaped != attempt:
+        track["unquoted_key_repair"] = True
+    _c = _escape_control_chars_in_strings(escaped)
+    if _c != escaped:
+        track["control_char_repair"] = True
+    escaped = _apply_overprepared_quoting(_escape_other_breakers(_c), track=track)
     json.loads(escaped)
     return escaped
 
@@ -482,11 +752,14 @@ def _detect_and_unwrap(parsed):
         return [_detect_and_unwrap(item) for item in parsed]
     return parsed
 
-def _parse_activity_final(raw):
+def _parse_activity_final(raw, return_flags=False):
     """
     Normalize JSON and return a valid JSON string for ALL tables.
     Escalation ladder — first success wins, fail-safe NULL at the end:
       1. Direct parse (clean rows are left untouched)
+      1b. Smart-quote normalization (typographic quotes used as
+          delimiters) — INSIDE the escalation path only, so smart quotes
+          that are legal value content in a clean row are never touched
       2. String-level unwrap of a single-key single-quoted wrapper, then
          the FULL ladder recursively on the inner string (insurance rung:
          a single-quoted outer holding double-quoted inner JSON can never
@@ -499,58 +772,139 @@ def _parse_activity_final(raw):
          the multi-key single-quoted outer with a double-quoted
          stringified inner — formerly a documented limitation — is
          rescued here and unwrapped post-parse by Rule 1)
-      5. Escape other breakers — digit-leading unquoted values, bare
-         backslashes, trailing commas (_escape_other_breakers; string-level
-         insurance only after rungs 3-4 failed; see its docstring for the
-         documented residual)
+      5. Escape other breakers — unquoted keys, raw control chars in
+         strings, digit-leading unquoted values, bare backslashes,
+         trailing commas; then the OPT-IN over-prepared quoting of
+         digits-only invalid numbers (007) and bare dates (2026-11-06) —
+         module switches QUOTE_INVALID_NUMBERS / QUOTE_BARE_DATES,
+         default off = the row NULLs as before
       6. NULL — fail-safe drop, visible in the engine's parse %
     Wrapper detection is by type inspection, not by hardcoded key names, and
     runs post-parse recursively (see _detect_and_unwrap).
     Problem keys: _PROBLEM_KEYS is domain-specific.
+
+    return_flags=True (used by repair_json_flags_udf — the once-per-source
+    repair review, NOT the nightly payload path) returns a
+    (payload_json, flags) tuple instead. Flags report the rescuing rung,
+    which repairs fired (smart quotes, unquoted keys, control chars, opt-in
+    quoting), and which keys hold date-as-text / leading-zero values — the
+    columns that take on quoting.
     """
     if not raw:
-        return None
+        return (None, {"rung": None}) if return_flags else None
     repaired_row = False
     token = "(*APOSTROPHE*)"
+    track = {}
+    s = raw.strip()
     try:
-        outer = json.loads(raw.strip())
+        outer = json.loads(s)
+        track["rung"] = 1
     except (json.JSONDecodeError, TypeError):
-        # Rung 2 — unwrap a single-key single-quoted wrapper at the STRING
-        # level and run the full ladder on the inner. Strictly additive
-        # insurance: no match, an unparseable inner, or any unexpected
-        # error falls through to the proven quote-repair rungs below, so
-        # this rung can only rescue rows, never break previously-working
-        # ones.
+        # Rung 1b — smart-quote normalization, INSIDE the escalation path
+        # only (clean rows above are never touched, so smart quotes that are
+        # legitimate VALUE content survive). A no-op for rows without smart
+        # quotes — byte-identical to the previous ladder for those rows.
+        normalized = _normalize_smart_quotes(s)
+        if normalized != s:
+            track["smart_quote_repair"] = True
         try:
-            _inner = _extract_single_quoted_wrapper(raw.strip())
-            if _inner is not None:
-                _nested = _parse_activity_final(_inner)
-                if _nested is not None:
-                    return _nested
-        except Exception:
-            pass  # insurance rung must never break the proven path — fall through
-        try:
-            repaired = _repair_single_quotes(raw.strip(), token=token)
-            outer = json.loads(repaired)
-            # Revert (*DQUOTE*) tokens in OBJECT space BEFORE wrapper
-            # detection: a protected stringified inner becomes a parseable
-            # '{...}' string again and Rule 1 unwraps it — the multi-key
-            # rescue composes with the existing post-parse machinery.
-            if "(*DQUOTE*)" in repaired:
-                _restore_dquote_tokens(outer)
-            repaired_row = True
+            outer = json.loads(normalized)
+            track["rung"] = "1b"
         except (json.JSONDecodeError, TypeError):
-            return None
+            # Rung 2 — unwrap a single-key single-quoted wrapper at the STRING
+            # level and run the full ladder on the inner (on the NORMALIZED
+            # string — the wrapper's delimiters may be curly quotes).
+            # Strictly additive insurance: no match, an unparseable inner,
+            # or any unexpected error falls through to the proven
+            # quote-repair rungs below, so this rung can only rescue rows,
+            # never break previously-working ones.
+            try:
+                _inner = _extract_single_quoted_wrapper(normalized)
+                if _inner is not None:
+                    _nested = _parse_activity_final(_inner)
+                    if _nested is not None:
+                        track["rung"] = 2
+                        if return_flags:
+                            try:
+                                _obj = json.loads(_nested)
+                            except (json.JSONDecodeError, TypeError):
+                                _obj = None
+                            _flags = {**track}
+                            if isinstance(_obj, (dict, list)):
+                                _flags["quoted_date_keys"] = _scan_date_like_keys(_obj)
+                                _flags["quoted_invalid_number_keys"] = _scan_invalid_number_keys(_obj)
+                            return _nested, _flags
+                        return _nested
+            except Exception:
+                pass  # insurance rung must never break the proven path — fall through
+            try:
+                repaired = _repair_single_quotes(normalized, token=token, track=track)
+                outer = json.loads(repaired)
+                # Revert (*DQUOTE*) tokens in OBJECT space BEFORE wrapper
+                # detection: a protected stringified inner becomes a parseable
+                # '{...}' string again and Rule 1 unwraps it — the multi-key
+                # rescue composes with the existing post-parse machinery.
+                if "(*DQUOTE*)" in repaired:
+                    _restore_dquote_tokens(outer)
+                repaired_row = True
+            except (json.JSONDecodeError, TypeError):
+                if return_flags:
+                    return None, {**track, "rung": None}
+                return None
     # Universal wrapper unwrap (unchanged)
     unwrapped = _detect_and_unwrap(outer)
     # Restore apostrophe tokens after unwrapping problem keys
     if repaired_row:
         _unwrap_problem_keys(unwrapped)
         _restore_apostrophe_tokens(unwrapped, token=token)
+    if return_flags:
+        _flags = {**track}
+        _flags["quoted_date_keys"] = _scan_date_like_keys(unwrapped)
+        _flags["quoted_invalid_number_keys"] = _scan_invalid_number_keys(unwrapped)
+        return json.dumps(unwrapped), _flags
     return json.dumps(unwrapped)
 
 from pyspark.sql.types import StringType
 repair_json_udf = udf(StringType())(_parse_activity_final)
+
+
+def _parse_activity_flags(raw):
+    """Diagnostics companion to repair_json_udf — SAME ladder, but returns
+    the repair FLAGS instead of the payload (per-row visibility into which
+    rung rescued the row, which repairs fired, and which keys hold
+    date-as-text / leading-zero values). For the once-per-source repair
+    review (see repair_flag_summary) — not called by the nightly engine,
+    so the pipeline's payload contract is unchanged."""
+    _payload, flags = _parse_activity_final(raw, return_flags=True)
+    return json.dumps(flags)
+
+
+repair_json_flags_udf = udf(StringType())(_parse_activity_flags)
+
+
+def repair_flag_summary(df, payload_col):
+    """Once-per-source repair review. Runs the flags UDF over a bronze
+    payload column and returns (flagged_df, rung_summary_df):
+      flagged_df      — input + repair_flags JSON column (per-row visibility)
+      rung_summary_df — row counts per rescuing rung (parse health at a
+                       glance; rescuing_rung null = rows that still NULL)
+    Drill-down — which columns took on quoting, on flagged_df:
+      flagged.select(
+          explode(from_json(get_json_object("repair_flags", "$.quoted_date_keys"),
+                           ArrayType(StringType()))).alias("date_key")
+      ).groupBy("date_key").count().orderBy("count", ascending=False)
+    Review once per source; then either fix the source or flip
+    QUOTE_BARE_DATES / QUOTE_INVALID_NUMBERS for that source (and cast
+    those keys to string in silver)."""
+    flagged = df.withColumn("repair_flags", repair_json_flags_udf(col(payload_col)))
+    rung_summary = (
+        flagged.groupBy(
+            get_json_object(col("repair_flags"), "$.rung").alias("rescuing_rung")
+        )
+        .count()
+        .orderBy("rescuing_rung")
+    )
+    return flagged, rung_summary
 
 
 
