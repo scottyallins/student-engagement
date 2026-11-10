@@ -931,8 +931,17 @@ def get_silver_watermark(silver_table):
         return None
 
 
-def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None):
-    """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse."""
+def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=200):
+    """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse.
+
+    schema_sample: how many (random) rows schema_of_json_agg sees. Default 200
+    is fine for CDC batches (mergeSchema appends tolerate discovery drift).
+    None = discover over ALL distinct rows - use for one-off full rebuilds so
+    rare historical fields survive: a drifted sample can miss fields present
+    on <0.5% of rows (Nov 10 2026: 'SMS Opt-Out' missed -> the REPLACE tried
+    to drop SMS_Opt_Out and Delta rejected it because the table's
+    workloadBasedColumns stats property pins that column).
+    """
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
 
     if watermark:
@@ -1073,12 +1082,13 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     # datatype ground truth is the MAJORITY type across sample rows, not a
     # single (possibly unrepresentative) first row.
     # ------------------------------------------------------------------
-    _SCHEMA_SAMPLE = 200
+    # schema_sample=None -> discover over every distinct row (no sampling).
+    _SCHEMA_SAMPLE = schema_sample
     _batch_df = df.filter(col("raw_data_repaired").isNotNull()).select("raw_data_repaired")
     _sample_df = _batch_df
-    if total > _SCHEMA_SAMPLE:
+    if _SCHEMA_SAMPLE is not None and total > _SCHEMA_SAMPLE:
         _sample_df = _batch_df.sample(False, _SCHEMA_SAMPLE / total).limit(_SCHEMA_SAMPLE)
-    if total < _SCHEMA_SAMPLE:
+    if _SCHEMA_SAMPLE is not None and total < _SCHEMA_SAMPLE:
         # Small batch (typical CDC increment): pull extra random rows from full
         # bronze so discovery sees fields that live outside this increment.
         try:
