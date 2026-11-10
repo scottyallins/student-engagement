@@ -1504,8 +1504,18 @@ def write_silver(df, table_name):
             cnt = spark.table(full).count()
             print(f"  ✅ CDC MERGE: {table_name}: {cnt:,} rows (upsert by {_mk})")
             return cnt
+        # Legacy delete+append for child tables without a pinned merge key.
+        # Only the existence check may fall through — a table that doesn't
+        # exist yet needs its first full load via the overwrite below. A
+        # failure of the DELETE or the append itself PROPAGATES: falling
+        # through would replace the whole table with just the CDC batch
+        # (silent data loss — this exact fallthrough wiped
+        # leads_processed_contacts on Nov 10, 2026).
         try:
             spark.sql(f"DESCRIBE TABLE {full}")
+        except Exception:
+            pass   # table doesn't exist yet → first full load below
+        else:
             # Keep microseconds: the DELETE window must exactly match the parse filter
             # (bronze_updated_at > watermark). Truncating to seconds made the DELETE
             # wider than the read, silently dropping the previous batch's newest rows.
@@ -1520,8 +1530,6 @@ def write_silver(df, table_name):
             cnt = spark.table(full).count()
             print(f"  \u2705 CDC: {table_name}: {cnt:,} rows (delete+insert)")
             return cnt
-        except Exception:
-            pass
 
     df.write.format("delta").mode("overwrite") \
         .option("overwriteSchema", "true") \
