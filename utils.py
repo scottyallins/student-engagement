@@ -1436,6 +1436,95 @@ SILVER_MERGE_KEYS = {
 }
 
 
+def _cast_tree(scol, sdt, tdt):
+    """Build a Column expressing a source value (type sdt) as the TARGET type.
+
+    Recursive nested-type reconciliation for CDC MERGE batches:
+      struct -> struct  : rebuilt field-by-field; target fields the source
+                          lacks become NULL; source fields the target lacks
+                          are dropped (nested fields cannot be ALTERed in);
+      string -> struct/array/map : re-parsed with from_json (covers the
+                          size-limit-degraded discovery, where discovery saw
+                          the JSON as text);
+      array  -> array   : transformed element-wise by the same rules;
+      map    -> map     : round-tripped via to_json + from_json when the
+                          source is struct/array, else from_json;
+      primitives        : plain CAST.
+    """
+    from pyspark.sql.functions import transform as _tf, from_json as _fj, \
+        lit as _lit, struct as _struct, to_json as _tj
+    from pyspark.sql.types import StructType, ArrayType, StringType, MapType
+
+    if isinstance(tdt, StructType):
+        if isinstance(sdt, StructType):
+            smap = {f.name.lower(): f for f in sdt.fields}
+            parts = []
+            for tf in tdt.fields:
+                if tf.name.lower() in smap:
+                    sf = smap[tf.name.lower()]
+                    parts.append(_cast_tree(scol.getField(sf.name),
+                                            sf.dataType, tf.dataType).alias(tf.name))
+                else:
+                    parts.append(_lit(None).cast(tf.dataType).alias(tf.name))
+            return _struct(*parts)
+        return _fj(scol.cast("string"), tdt)
+    if isinstance(tdt, ArrayType):
+        if isinstance(sdt, ArrayType):
+            if isinstance(tdt.elementType, StructType):
+                if isinstance(sdt.elementType, StructType):
+                    return _tf(scol, lambda x: _cast_tree(x, sdt.elementType, tdt.elementType))
+                # degraded array<string> of JSON texts -> array<struct>
+                return _tf(scol, lambda x: _fj(x.cast("string"), tdt.elementType))
+            return _tf(scol, lambda x: x.cast(tdt.elementType.simpleString()))
+        if isinstance(sdt, StringType):
+            return _fj(scol.cast("string"), tdt)
+        return _lit(None).cast(tdt)
+    if isinstance(tdt, MapType):
+        if isinstance(sdt, (StructType, ArrayType)):
+            return _fj(_tj(scol), tdt)
+        return _fj(scol.cast("string"), tdt)
+    if isinstance(sdt, (StructType, ArrayType)):
+        return _lit(None).cast(tdt)   # nested -> primitive: no safe cast
+    return scol.cast(tdt.simpleString())
+
+
+def _reconcile_to_target(src, tgt_df, table_name):
+    """Cast a CDC batch's EXISTING columns to the target table's Delta types.
+
+    Batch schemas come from per-batch sample discovery and drift on nested
+    types (addresses degraded to array<string>, contacts missing rare element
+    fields). struct/array<struct> types with different fields are NOT
+    implicitly castable, so the explicit-column MERGE dies with
+    DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION even when the ALTER step added
+    every missing TOP-LEVEL column. Columns absent from the target pass
+    through untouched (ALTER adds them with the batch type); matched columns
+    pass through by name, aliased to the TARGET name.
+
+    Validated Nov 11 2026 on a clone of silver.leads_processed with the exact
+    run-99534124159213 failure signature: MERGE succeeds, degraded
+    array<string> addresses round-trip to the target struct byte-identical
+    (junk elements null-filled), missing contact element fields NULL-filled,
+    new top-level columns ALTER-added.
+    """
+    from pyspark.sql.functions import col
+    tgt_fields = {f.name.lower(): f for f in tgt_df.schema.fields}
+    adj, sel = [], []
+    for f in src.schema.fields:
+        tf = tgt_fields.get(f.name.lower())
+        if tf is None:
+            sel.append(col(f"`{f.name}`"))
+        elif f.dataType == tf.dataType:
+            sel.append(col(f"`{f.name}`").alias(tf.name))
+        else:
+            sel.append(_cast_tree(col(f"`{f.name}`"), f.dataType, tf.dataType).alias(tf.name))
+            adj.append(f"{f.name}: {f.dataType.simpleString()} -> {tf.dataType.simpleString()}")
+    if adj:
+        print(f"  🔧 {table_name}: reconciling {len(adj)} drifted column type(s): "
+              + "; ".join(adj[:6]) + (" …" if len(adj) > 6 else ""))
+        src = src.select(*sel)
+    return src
+
+
 def _merge_silver(df, table_name, pk):
     """CDC upsert by PK: UPDATE existing ids in place, INSERT new ids.
 
@@ -1468,10 +1557,22 @@ def _merge_silver(df, table_name, pk):
              .filter("_rn = 1").drop("_rn")
              .unionByName(df.filter(col(pk).isNull())))
 
+    # Nested-schema reconciliation to the target's Delta types (Nov 11 2026):
+    # batch schema comes from per-batch sample discovery and drifts on
+    # NESTED types. Nov 11 8AM silver_leads failure (run 99534124159213) was
+    # exactly this: addresses discovered as array<string> vs the target's
+    # array<struct<...>>, contacts missing rare element fields — and Delta
+    # MERGE rejects the explicit-column assignments with
+    # DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION (struct types with different
+    # fields are not implicitly castable), even though the ALTER step added
+    # every missing TOP-LEVEL column. Cast the batch to the target's types
+    # BEFORE the ALTER/MERGE below.
+    src = _reconcile_to_target(src, spark.table(full), table_name)
+
     # Schema evolution: add source columns the target lacks (nullable).
-    src_cols = [f.name for f in df.schema.fields]
+    src_cols = [f.name for f in src.schema.fields]
     tgt_cols = set(spark.table(full).columns)
-    for f in df.schema.fields:
+    for f in src.schema.fields:
         if f.name not in tgt_cols:
             spark.sql(f"ALTER TABLE {full} ADD COLUMN `{f.name}` {f.dataType.simpleString()}")
 
