@@ -176,12 +176,19 @@ resources:
             - task_key: silver_contacts_emails
           notebook_task:
             notebook_path: 2_Silver/2_8_Silver_user_mapping.ipynb
-        # ---------- GOLD SET 1: dims, metrics, lookups (parallel; depend ONLY on
-        # silver_user_mapping — the LAST silver task — so NO gold runs before ALL
-        # silver is complete; star schema leftmost set)
-        # EXCEPTION: gold_staff_dim also waits for gold_staff_emails + gold_lead_dim
-        # because 3_01 additionally builds gold.staff_account_dim (person-grain
-        # staff account view) from both of them ----------
+        # ---------- GOLD SET 1: dims, metrics, lookups (star schema leftmost set;
+        # every task roots at silver_user_mapping — the LAST silver task — so NO
+        # gold runs before ALL silver is complete)
+        # EXCEPTIONS (Nov 12 2026 notebook changes, yml updated Nov 13):
+        #   * gold_staff_dim waits for gold_staff_emails + gold_lead_dim — 3_01 also
+        #     builds gold.staff_account_dim (person-grain staff account view) from both
+        #   * gold_lead_dim waits for gold_staff_emails — 3_04 v4 absorbed 3_12's
+        #     email attribution (whole-person staff separation needs gold.staff_emails);
+        #     3_12_Gold_lead_emails is RETIRED and its task removed from this DAG
+        #   * gold_missed_calls + gold_sentiment wait for gold_lead_dim — 3_07/3_11
+        #     now source gold.lead_dim (all-leads spine population)
+        #   * gold_calendly_metric depends on silver_calendly ONLY — 3_10 re-keyed
+        #     per invitee email (reads nothing else; no identity-spine input) ----------
         - task_key: gold_staff_dim
           depends_on:
             - task_key: silver_user_mapping
@@ -192,6 +199,7 @@ resources:
         - task_key: gold_lead_dim
           depends_on:
             - task_key: silver_user_mapping
+            - task_key: gold_staff_emails
           notebook_task:
             notebook_path: 3_Gold/3_04_Gold_lead_dim.ipynb
         - task_key: gold_staff_emails
@@ -199,20 +207,6 @@ resources:
             - task_key: silver_user_mapping
           notebook_task:
             notebook_path: 3_Gold/3_00_Gold_staff_emails.ipynb
-        - task_key: gold_lead_emails
-          depends_on:
-            - task_key: gold_staff_emails
-            - task_key: gold_staff_dim
-            - task_key: gold_lead_dim
-            - task_key: gold_days_since_last_email
-            - task_key: gold_days_since_last_meeting
-            - task_key: gold_missed_calls
-            - task_key: gold_days_until_next_meeting
-            - task_key: gold_days_since_last_login
-            - task_key: gold_calendly_metric
-            - task_key: gold_sentiment
-          notebook_task:
-            notebook_path: 3_Gold/3_12_Gold_lead_emails.ipynb
         - task_key: gold_days_since_last_email
           depends_on:
             - task_key: silver_user_mapping
@@ -226,6 +220,7 @@ resources:
         - task_key: gold_missed_calls
           depends_on:
             - task_key: silver_user_mapping
+            - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_07_Gold_missed_calls_14_days.ipynb
         - task_key: gold_days_until_next_meeting
@@ -240,12 +235,13 @@ resources:
             notebook_path: 3_Gold/3_09_Gold_days_since_last_login.ipynb
         - task_key: gold_calendly_metric
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: silver_calendly
           notebook_task:
             notebook_path: 3_Gold/3_10_Gold_days_since_last_meeting_calendly.ipynb
         - task_key: gold_sentiment
           depends_on:
             - task_key: silver_user_mapping
+            - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_11_Gold_sentiment.ipynb
         # ---------- GOLD SET 2: facts + lead-email bridge (wait for ALL of gold set 1) ----------
@@ -278,12 +274,13 @@ resources:
             - task_key: gold_sentiment
           notebook_task:
             notebook_path: 3_Gold/3_03_Gold_sales_fact.ipynb
-        # ---------- GOLD SET 3: health metrics (waits for ALL of gold set 2) ----------
+        # ---------- GOLD SET 3: health metrics (waits for ALL of gold set 2 +
+        # gold_lead_dim — 3_13 reads lead_dim directly since 3_12 was retired) ----------
         - task_key: gold_health_metrics
           depends_on:
             - task_key: gold_leads_activity_fact
             - task_key: gold_sales_fact
-            - task_key: gold_lead_emails
+            - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_13_Gold_health_metrics.ipynb
         # ---------- GOLD SET 4: profile + communication state (wait for gold set 3) ----------

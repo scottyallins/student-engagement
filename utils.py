@@ -1436,6 +1436,118 @@ SILVER_MERGE_KEYS = {
 }
 
 
+def _parent_pk(df, silver_name):
+    """Pinned per-family PK first (SILVER_MERGE_KEYS — the same pins the
+    Nov 9 rebuild notebooks used), find_pk as fallback. find_pk alone can
+    pick the wrong key or none at all: lead_activites validation can fail
+    on 'id' and hand back lead_id (collapsing the version chain per LEAD,
+    not per activity), and calendly has no 'id'-shaped column at all
+    (EVENT_URI is never detected). The pin is the provenance of the
+    one-row-per-id contract — always prefer it when present in the parsed
+    columns."""
+    _pin = SILVER_MERGE_KEYS.get(silver_name)
+    if _pin and _pin in df.columns:
+        return _pin
+    return find_pk(df, table_name=silver_name)
+
+
+def _is_nested_schema_mismatch(e):
+    """True when a CDC write died on a nested-schema mismatch — the MERGE
+    form (DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION, 'Cannot cast struct<...>
+    to struct<...>', 'All nested columns must match') or the append form
+    (DELTA_INSERT_SCHEMA_MISMATCH / 'Failed to merge incompatible data
+    types' — children on the delete+append path). This is the drift
+    _merge_silver's top-level ADD COLUMN evolution can never heal: a
+    field added/removed/retyped INSIDE an existing column."""
+    _s = str(e)
+    return ("SCHEMA_MISMATCH" in _s or "Cannot cast struct" in _s
+            or "nested columns must match" in _s
+            or "Failed to merge incompatible data types" in _s)
+
+
+# Tables currently mid-full-rebuild — explicit loop guard. Structurally a
+# loop cannot happen today (the rebuild's write runs with the watermark
+# cleared, i.e. the full-overwrite branch, and overwriteSchema replaces
+# the schema so no cast mismatch can re-fire), but this makes the
+# invariant hard instead of implied (Nov 12 2026 review).
+_REBUILDING = set()
+
+
+def _latest_per_pk(df, pk):
+    """Collapse to the LATEST version per PK — the one-row-per-id silver
+    contract (Nov 12 2026 review). parse_bronze_table keeps EVERY distinct
+    payload version by design (full history lives in bronze); a FULL
+    rebuild that writes all of them puts duplicate ids in silver and the
+    next CDC MERGE dies on multiple matches. Same window as _merge_silver:
+    bronze_insert_date / bronze_updated_at DESC NULLS LAST, then
+    payload_hash DESC; NULL-PK rows are kept verbatim (they cannot
+    collide on the ON clause)."""
+    if not pk or pk not in df.columns \
+            or "bronze_insert_date" not in df.columns:
+        return df
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number
+    _order = [col("bronze_insert_date").desc_nulls_last(),
+              col("bronze_updated_at").desc_nulls_last()]
+    if "payload_hash" in df.columns:
+        _order.append(col("payload_hash").desc())
+    w = Window.partitionBy(pk).orderBy(*_order)
+    _before = df.count()
+    df = (df.filter(col(pk).isNotNull())
+            .withColumn("_rn", row_number().over(w))
+            .filter("_rn = 1").drop("_rn")
+            .unionByName(df.filter(col(pk).isNull())))
+    _after = df.count()
+    if _after < _before:
+        print(f"  🔁 Latest-per-{pk}: {_before:,} → {_after:,} rows "
+              f"({_before - _after:,} older versions collapsed)")
+    return df
+
+
+def _full_rebuild_parent(bronze_name, silver_name, flatten=False):
+    """CDC escape hatch (Nov 12 2026): the full-history rebuild the Nov 9
+    notebooks did, invoked automatically when the nightly MERGE hits a
+    nested schema drift. parse_bronze_table over EVERY distinct bronze row
+    (schema_sample=None so rare historical fields survive discovery),
+    then the same parent prep the FULL LOAD path runs (flatten ->
+    find_pk -> LATEST-per-PK collapse -> extract_custom), then the atomic
+    overwrite with overwriteSchema=true. The watermark is cleared FIRST so
+    write_silver takes the full-overwrite path — never overwrite a table
+    with the CDC batch alone — and restored after, so a multi-table
+    notebook keeps normal CDC for the next table. Returns the rebuilt
+    parent DataFrame. _REBUILDING guards against re-entry loops."""
+    if silver_name in _REBUILDING:
+        raise RuntimeError(
+            f"rebuild loop detected: {silver_name} is already being rebuilt")
+    _REBUILDING.add(silver_name)
+    global _CDC_WATERMARK
+    _saved_wm = _CDC_WATERMARK
+    _CDC_WATERMARK = None
+    try:
+        df_full = parse_bronze_table(bronze_name, schema_sample=None)
+        if df_full is None:
+            raise RuntimeError(
+                f"full rebuild of {silver_name}: no parsable rows in {bronze_name}")
+        if flatten:
+            df_full = flatten_structs(df_full, skip_custom=True)
+        pk = _parent_pk(df_full, silver_name)
+        df_full = _latest_per_pk(df_full, pk)
+        carry = list(dict.fromkeys(
+            ["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
+        has_custom = ("custom" in df_full.columns
+                      and isinstance(df_full.schema["custom"].dataType, StructType))
+        has_custom_cf = any(c.startswith("custom_cf_") for c in df_full.columns)
+        if has_custom or has_custom_cf:
+            _pipeline = PIPELINE_NUMBERS.get(silver_name or bronze_name, 0)
+            df_full = extract_custom(df_full, silver_name, carry, f"{_pipeline}_1",
+                                     parent_pk=pk, dry_run=True)
+        write_silver(df_full, silver_name)
+        return df_full
+    finally:
+        _REBUILDING.discard(silver_name)
+        _CDC_WATERMARK = _saved_wm
+
+
 def _cast_tree(scol, sdt, tdt):
     """Build a Column expressing a source value (type sdt) as the TARGET type.
 
@@ -1595,12 +1707,27 @@ def _merge_silver(df, table_name, pk):
         spark.sql(f"DROP VIEW IF EXISTS {view}")
 
 
-def write_silver(df, table_name):
+def write_silver(df, table_name, bronze_name=None, flatten=False):
     """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set.
 
     CDC mode: MERGE-by-PK upsert for tables with a SILVER_MERGE_KEYS entry
     (one-row-per-id contract); legacy delete+append otherwise. Full-load mode
     (_CDC_WATERMARK=None): atomic full overwrite (overwriteSchema=true).
+
+    Schema-drift escape hatch (Nov 12 2026): when the MERGE fails on a
+    NESTED schema mismatch (drift inside an existing column — the one
+    shape top-level ADD COLUMN evolution cannot heal) and bronze_name is
+    supplied, fall back to _full_rebuild_parent: a full-history re-parse
+    and overwrite of THIS table, so the nightly heals itself instead of
+    failing the job. Other errors still propagate, and a mismatch
+    without bronze_name (direct callers) propagates too — never overwrite
+    a table with the CDC batch alone.
+
+    bronze_name here means THIS table is the parse target of that bronze
+    table — PARENTS only. Child tables are protected at the builder level
+    (explode_to_child / extract_custom), which re-runs the child's own
+    build recipe from its full source; passing bronze_name for a child
+    write would rebuild it with parent-shaped rows.
     """
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
 
@@ -1611,10 +1738,22 @@ def write_silver(df, table_name):
         # table with just the CDC batch).
         _mk = SILVER_MERGE_KEYS.get(table_name)
         if _mk and _mk in df.columns:
-            _merge_silver(df, table_name, _mk)
-            cnt = spark.table(full).count()
-            print(f"  ✅ CDC MERGE: {table_name}: {cnt:,} rows (upsert by {_mk})")
-            return cnt
+            try:
+                _merge_silver(df, table_name, _mk)
+                cnt = spark.table(full).count()
+                print(f"  ✅ CDC MERGE: {table_name}: {cnt:,} rows (upsert by {_mk})")
+                return cnt
+            except Exception as e:
+                if not _is_nested_schema_mismatch(e) or bronze_name is None:
+                    raise
+                print(f"  ⚠️ CDC MERGE blocked by nested schema drift in {table_name}")
+                print(f"     {str(e).splitlines()[0][:200]}")
+                print(f"  🔄 Falling back to FULL REBUILD of {table_name} from "
+                      f"{bronze_name} (full history + overwriteSchema)")
+                _full_rebuild_parent(bronze_name, table_name, flatten=flatten)
+                cnt = spark.table(full).count()
+                print(f"  ✅ REBUILT: {table_name}: {cnt:,} rows (full overwrite)")
+                return cnt
         # Legacy delete+append for child tables without a pinned merge key.
         # Only the existence check may fall through — a table that doesn't
         # exist yet needs its first full load via the overwrite below. A
@@ -1662,10 +1801,18 @@ def write_silver(df, table_name):
 # ============================================================================
 
 
-def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None, dry_run=False, recurse=True):
+def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="", parent_pk=None, dry_run=False, recurse=True, bronze_name=None, _rebuilding=False):
     """Explode an array column into a child table. Recurse on nested arrays until scalar.
 
     When dry_run=True: prints the child table name and columns without writing.
+
+    Nov 12 2026 child escape hatch: when dry_run=False and the child write
+    fails on a nested schema mismatch, this rebuilds the child from the
+    FULL current source (silver parent re-explode by default; full bronze
+    re-parse when bronze_name is given) with the watermark cleared, so
+    the child heals itself instead of failing the notebook — see
+    _full_rebuild_child_from_source below. _rebuilding is the recursion
+    guard: a rebuild that fails again propagates.
     """
     child_name = f"{parent_name}_{array_col}"
 
@@ -1708,7 +1855,14 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
         indent = "    " * (depth + 1)
         print(f"{indent}📦 {child_name} ({len(df_child.columns)} cols): {df_child.columns}")
     else:
-        write_silver(df_child, child_name)
+        try:
+            write_silver(df_child, child_name)
+        except Exception as e:
+            if not _is_nested_schema_mismatch(e) or _rebuilding:
+                raise
+            print(f"  ⚠️ child write blocked by nested schema drift in {child_name} — full rebuild from source")
+            print(f"     {str(e).splitlines()[0][:200]}")
+            _full_rebuild_child_from_source(parent_name, array_col, carry_cols, depth, num_path, parent_pk, recurse, bronze_name)
 
     _lineage_tree.append((num_path, depth + 1, child_name))
 
@@ -1746,6 +1900,51 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
         grandchild_num = f"{num_path}_{grandchild_idx}"
         explode_to_child(df_child, child_name, ca, new_carry, depth + 1, grandchild_num, parent_pk=element_pk, dry_run=dry_run)
 
+
+def _full_rebuild_child_from_source(parent_name, array_col, carry_cols, depth, num_path, parent_pk, recurse, bronze_name):
+    """Child-table CDC escape hatch (Nov 12 2026): when a child's write
+    fails on nested schema drift, rebuild that child — and, when recurse,
+    its descendants — from the FULL current source, overwriting, the way
+    the Nov 9 child rebuilds did. Two source styles, mirroring the two
+    child-notebook patterns:
+      - silver-parent-derived (default, e.g. 2_1_03_01 / 2_4_02): re-read
+        the FULL silver parent table and re-explode it. Valid because a
+        child can never be newer than its parent.
+      - bronze-derived (bronze_name given): re-parse FULL bronze history
+        (schema_sample=None so rare fields survive discovery) + the
+        standard prep (flatten -> find_pk -> carry), then re-explode.
+    The watermark is cleared FIRST so the rebuild's writes take the full
+    overwrite path, and restored after. A failure inside the rebuild
+    propagates (_rebuilding guard — never loop)."""
+    global _CDC_WATERMARK
+    _saved = _CDC_WATERMARK
+    _CDC_WATERMARK = None
+    try:
+        if bronze_name:
+            src = parse_bronze_table(bronze_name, schema_sample=None)
+            if src is None:
+                raise RuntimeError(
+                    f"child rebuild: no parsable rows in {bronze_name}")
+            src = flatten_structs(src, skip_custom=True)
+            _pk = _parent_pk(src, parent_name)
+            # one row per id before re-exploding — same window as _merge_silver;
+            # without it every historical version of a parent row explodes
+            # into duplicate child rows
+            src = _latest_per_pk(src, _pk)
+            _carry = list(dict.fromkeys(
+                ["bronze_insert_date", "bronze_updated_at"] + ([_pk] if _pk else [])))
+        else:
+            src = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{parent_name}")
+            _carry = list(dict.fromkeys([c for c in carry_cols if c in src.columns]))
+        print(f"  🔄 re-exploding {array_col} from full "
+              f"{'bronze ' + bronze_name if bronze_name else 'silver parent ' + parent_name}")
+        explode_to_child(src, parent_name, array_col, _carry, depth=depth,
+                          num_path=num_path, parent_pk=parent_pk,
+                          dry_run=False, recurse=recurse,
+                          bronze_name=bronze_name, _rebuilding=True)
+    finally:
+        _CDC_WATERMARK = _saved
+
 # COMMAND ----------
 
 # DBTITLE 1,Custom Field Extraction
@@ -1754,13 +1953,22 @@ def explode_to_child(df, parent_name, array_col, carry_cols, depth=0, num_path="
 # ============================================================================
 
 
-def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_run=False):
+def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_run=False, bronze_name=None, _rebuilding=False):
     """Extract custom struct AND custom_cf_ columns.
 
     - cf_ fields (inside custom struct OR as top-level custom_cf_ columns) → custom_fields MAP
     - Non-cf_ scalar fields → _custom child table (one table, no further children)
     - Non-cf_ array fields → array columns in _custom table (preserved for future use, NOT exploded)
     The custom_fields MAP is always built on the parent regardless of dry_run.
+
+    Nov 12 2026 child escape hatch: when dry_run=False, bronze_name is
+    given (the source bronze table), and the _custom child write fails on
+    a nested schema mismatch, this rebuilds the child by re-parsing FULL
+    bronze history and re-running the extraction with the watermark
+    cleared (full overwrite) — see _full_rebuild_custom_child below. The
+    raw custom struct only exists in bronze, so there is no
+    silver-parent fallback for custom children. _rebuilding is the
+    recursion guard: a rebuild that fails again propagates.
     """
     # Detect cf_ from TWO sources:
     top_cf_cols = [c for c in df.columns if c.startswith("custom_cf_")]
@@ -1809,7 +2017,14 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_ru
             print(f"    📦 {custom_name} ({len(df_custom.columns)} cols): {df_custom.columns}")
         else:
             print(f"\n  📦 CUSTOM TABLE — {custom_name}")
-            write_silver(df_custom, custom_name)
+            try:
+                write_silver(df_custom, custom_name)
+            except Exception as e:
+                if not _is_nested_schema_mismatch(e) or _rebuilding or bronze_name is None:
+                    raise
+                print(f"  ⚠️ custom child write blocked by nested schema drift in {custom_name} — full rebuild from bronze")
+                print(f"     {str(e).splitlines()[0][:200]}")
+                return _full_rebuild_custom_child(bronze_name, parent_name, num_path, parent_pk)
         _lineage_tree.append((num_path, 1, custom_name))
 
     # -- 2. Build custom_fields MAP column from ALL cf_ fields --
@@ -1843,6 +2058,38 @@ def extract_custom(df, parent_name, carry_cols, num_path, parent_pk=None, dry_ru
             df = df.drop(c)
 
     return df
+
+
+def _full_rebuild_custom_child(bronze_name, parent_name, num_path, parent_pk):
+    """Custom-child CDC escape hatch (Nov 12 2026): the raw custom struct
+    only exists in bronze — silver parents replace it with the
+    custom_fields MAP — so a _custom child can only be rebuilt by
+    re-parsing FULL bronze history (schema_sample=None so rare fields
+    survive discovery) and re-running the extraction with the watermark
+    cleared (full-overwrite write). Returns the mapped parent df built
+    from full history. A failure inside the rebuild propagates
+    (_rebuilding guard — never loop)."""
+    global _CDC_WATERMARK
+    _saved = _CDC_WATERMARK
+    _CDC_WATERMARK = None
+    try:
+        df_full = parse_bronze_table(bronze_name, schema_sample=None)
+        if df_full is None:
+            raise RuntimeError(
+                f"custom child rebuild: no parsable rows in {bronze_name}")
+        df_full = flatten_structs(df_full, skip_custom=True)
+        pk = _parent_pk(df_full, parent_name)
+        # one custom row per id — same window as _merge_silver; without it
+        # every historical version of a parent row becomes its own custom row
+        df_full = _latest_per_pk(df_full, pk)
+        carry = list(dict.fromkeys(
+            ["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
+        print(f"  🔄 re-extracting custom from full bronze {bronze_name}")
+        return extract_custom(df_full, parent_name, carry, num_path,
+                              parent_pk=parent_pk or pk, dry_run=False,
+                              bronze_name=bronze_name, _rebuilding=True)
+    finally:
+        _CDC_WATERMARK = _saved
 
 # COMMAND ----------
 
@@ -2310,7 +2557,7 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
             if df_sample is not None:
                 if flatten:
                     df_sample = flatten_structs(df_sample, skip_custom=True)
-                pk = find_pk(df_sample, table_name=silver_name)
+                pk = _parent_pk(df_sample, silver_name)
                 carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
                 child_idx = 0
                 has_custom = "custom" in df_sample.columns and isinstance(df_sample.schema["custom"].dataType, StructType)
@@ -2376,8 +2623,20 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
     if flatten:
         df_flat = flatten_structs(df_flat, skip_custom=True)
 
-    # Find PK (carry was used for child tables — retained for re-enablement)
-    pk = find_pk(df_flat, table_name=silver_name)
+    # Find PK (carry was used for child tables — retained for re-enablement).
+    # Pinned per-family key (SILVER_MERGE_KEYS) first — the Nov 9 pins;
+    # find_pk alone is wrong for calendly (no id column) and risky for
+    # lead_activites (sample validation can hand back lead_id).
+    pk = _parent_pk(df_flat, silver_name)
+    # FULL LOAD only: collapse to the LATEST version per PK — the
+    # one-row-per-id silver contract (same window as _merge_silver / the
+    # Nov 9 rebuild notebooks). parse_bronze_table keeps every distinct
+    # payload version by design (full history lives in bronze); without
+    # this collapse a first run writes one row per VERSION and the first
+    # CDC MERGE then dies on duplicate ids. CDC batches skip it —
+    # _merge_silver applies the same window itself.
+    if not _CDC_WATERMARK and pk:
+        df_flat = _latest_per_pk(df_flat, pk)
     carry = list(dict.fromkeys(["bronze_insert_date", "bronze_updated_at"] + ([pk] if pk else [])))
 
     # Extract custom fields into MAP + print potential _custom child tables (dry_run)
@@ -2392,7 +2651,10 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
     # Print physical schema tree and summary for parent
     # print_physical_schema(df_flat, silver_name)
     # print_schema_summary(df_flat, f"{silver_name} (parent)")
-    write_silver(df_flat, silver_name)
+    # bronze_name/flatten flow into write_silver's Nov-12 schema-drift
+    # escape hatch: if the CDC MERGE hits a nested mismatch, it can rebuild
+    # THIS table from full bronze history instead of failing the run.
+    write_silver(df_flat, silver_name, bronze_name=bronze_name, flatten=flatten)
 
     # Explode arrays (dry_run — print schema without writing child tables)
     scalars, arrays, structs = categorize_fields(df_flat)

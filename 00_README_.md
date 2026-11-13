@@ -29,7 +29,7 @@ databricks jobs repair-run <run_id> --rerun-all-failed-tasks --rerun-dependent-t
 
 **Re-run safety:** every task is idempotent.
 * Bronze loads are incremental — the watermark is `MAX(insert_date)` already in bronze, so a re-run re-pulls exactly the missed rows and never duplicates.
-* Silver tasks are CDC on `bronze_updated_at` — a re-run reprocesses only rows that changed.
+* Silver tasks are CDC on `bronze_updated_at` — a re-run reprocesses only rows that changed, upserting them by primary key (no duplicates, no version churn).
 * Gold tables are `CREATE OR REPLACE`, or idempotent MERGE / DELETE+INSERT patterns (the SCD2 profile and the daily history both delete-then-insert today's rows, so re-running a day is safe).
 
 **Secrets:** the PostgreSQL connection credentials live in the Databricks secret scope `dea-rds` (keys: `host`, `port`, `database`, `username`, `password`). No connection values are stored in code or git.
@@ -40,11 +40,11 @@ databricks jobs repair-run <run_id> --rerun-all-failed-tasks --rerun-dependent-t
 
 **Bronze — land everything, exactly as exported.** Nine PostgreSQL tables are loaded over JDBC into Delta tables with three columns each: `raw_data` (the source row as a JSON string), `insert_date`, and `bronze_updated_at`. Loads are config-driven from `config.bronze_config`, incremental on `insert_date`, error-isolated per table (one failed source logs its error and the remaining tables still land; the task then fails so the alert fires), and batched with parallel JDBC partitions so large pulls are OOM-safe and paced against the source database.
 
-**Silver — parse, normalize, and identify.** A shared engine (the `utils` notebook) reads each bronze table, repairs malformed JSON, deduplicates snapshot re-dumps, infers the schema, parses the JSON, and writes the silver parent tables — all under a CDC watermark so only changed rows are reprocessed. Array fields become child tables through dedicated child notebooks. The layer finishes with the **identity spine** (`silver.user_identity_map`): one row per *person* across all systems, carrying every identity hash, email, and lead attribution. The spine is what makes cross-system metrics (Calendly bookings, platform logins) possible — the CRM export masks emails and names as `user_…` hashes, so no system can be joined to another directly.
+**Silver — parse, normalize, and identify.** A shared engine (the `utils` notebook) reads each bronze table, repairs malformed JSON, deduplicates snapshot re-dumps, infers the schema, parses the JSON, and upserts the silver parent tables — all under a CDC watermark so only changed rows are reprocessed. Parents are MERGE-by-primary-key (one row per id), and each CDC batch's columns are first reconciled to the target table's Delta types, so per-batch schema inference can never drift a nested column into a shape the write would reject. Array fields become child tables through dedicated child notebooks. The layer finishes with the **identity spine** (`silver.user_identity_map`): one row per *person* across all systems, carrying every identity hash, email, and lead attribution. The spine is what makes cross-system metrics (Calendly bookings, platform logins) possible — the CRM export masks emails and names as `user_…` hashes, so no system can be joined to another directly.
 
 **Gold — the business star schema.** Nineteen notebooks build twenty tables (every table can be re-run or recovered independently — detachment; `3_01` builds two: the staff dimension and its account view): two staff tables, the lead dimension, two facts, seven single-metric tables, the client email view, a staff-email blocklist, a staging join, the SCD2 health profile, its daily history, two communication tables, and the coaching score. `lead_id` is the shared foreign key across the layer; facts keep their natural event grain.
 
-**Data volume (current counts):** Bronze holds ≈19.8M rows across 9 tables — the source re-dumps full tables on every export, and bronze faithfully keeps every dump. Silver distills this to ≈12.9M rows across 15 tables (current-state children plus CDC version history on parents). Gold lands at ≈230K rows across 20 tables, with the health layer at exactly **1,374 active coaching clients** per table.
+**Data volume (current counts):** Bronze holds ≈20.8M rows across 9 tables — the source re-dumps full tables on every export, and bronze faithfully keeps every dump. Silver distills this to ≈2.4M rows across 15 tables (one row per id on parents, exploded children, identity spine). Gold lands at ≈1.2M rows across 20 tables, with the health layer at exactly **1,380 active coaching clients** per table.
 
 ### Data Flow
 
@@ -56,7 +56,8 @@ PostgreSQL (raw schema — 9 source tables)
 BRONZE  crm_ingestion.bronze          9 raw Delta tables (raw_data JSON, insert_date, bronze_updated_at)
     |
     v  %run ../utils → process_table(): JSON repair → dedup re-dumps → schema inference
-       → parse → write parent (CDC on bronze_updated_at); child notebooks explode arrays
+       → parse → upsert parent by PK (CDC on bronze_updated_at, batch schema
+         reconciled to the target's Delta types); child notebooks explode arrays
 SILVER  crm_ingestion.silver          15 tables: 7 parents + 7 children/grandchild + identity spine
     |   silver.user_identity_map (2_8) — one row per person: hashes, emails, lead_ids
     v
@@ -130,15 +131,15 @@ student-engagement/
 
 | # | Bronze Table | Source | Used Downstream | Rows | Description |
 |---|---|---|:---:|---:|---|
-| 1 | `crm_ingestion.bronze.leads_raw` | `raw.leads_raw` | Yes | 531,475 | Lead/contact/account data |
-| 2 | `crm_ingestion.bronze.lead_activites_raw` | `raw.lead_activites_raw` | Yes | 443,211 | CRM activities (Email, Call, Meeting, Note, SMS, CustomActivity) |
-| 3 | `crm_ingestion.bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | Yes | 90,706 | CRM user directory (staff) |
-| 4 | `crm_ingestion.bronze.custom_activites_raw` | `raw.custom_activites_raw` | Yes | 159 | Custom activity type metadata |
-| 5 | `crm_ingestion.bronze.all_payments` | `raw.all_payments` | No | 268,940 | Payment records (bronze only — no silver consumer) |
-| 6 | `crm_ingestion.bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Yes | 15,451,143 | Scheduled meeting events (full re-dump each export) |
-| 7 | `crm_ingestion.bronze.student_sentiment` | `raw.student_sentiment` | Yes | 227,427 | Sentiment + Slack message data |
-| 8 | `crm_ingestion.bronze.mdl_users_raw` | `raw.mdl_users_raw` | Yes | 2,465,573 | Moodle platform users |
-| 9 | `crm_ingestion.bronze.lead_merges` | `raw.lead_merges` | No | 347,320 | Lead merge history (bronze only — no silver consumer) |
+| 1 | `crm_ingestion.bronze.leads_raw` | `raw.leads_raw` | Yes | 584,776 | Lead/contact/account data |
+| 2 | `crm_ingestion.bronze.lead_activites_raw` | `raw.lead_activites_raw` | Yes | 485,786 | CRM activities (Email, Call, Meeting, Note, SMS, CustomActivity) |
+| 3 | `crm_ingestion.bronze.close_crm_users_raw` | `raw.close_crm_users_raw` | Yes | 94,567 | CRM user directory (staff) |
+| 4 | `crm_ingestion.bronze.custom_activites_raw` | `raw.custom_activites_raw` | Yes | 165 | Custom activity type metadata |
+| 5 | `crm_ingestion.bronze.all_payments` | `raw.all_payments` | No | 279,218 | Payment records (bronze only — no silver consumer) |
+| 6 | `crm_ingestion.bronze.calendly_scheduled_events` | `raw.calendly_scheduled_events` | Yes | 16,088,624 | Scheduled meeting events (full re-dump each export) |
+| 7 | `crm_ingestion.bronze.student_sentiment` | `raw.student_sentiment` | Yes | 240,983 | Sentiment + Slack message data |
+| 8 | `crm_ingestion.bronze.mdl_users_raw` | `raw.mdl_users_raw` | Yes | 2,623,130 | Moodle platform users |
+| 9 | `crm_ingestion.bronze.lead_merges` | `raw.lead_merges` | No | 369,436 | Lead merge history (bronze only — no silver consumer) |
 
 Every bronze table has the same three columns: `raw_data` (JSON string), `insert_date`, `bronze_updated_at`.
 
@@ -161,13 +162,13 @@ All silver notebooks start with `%run ../utils`, then call `process_table('bronz
 | `repair_json_udf` | Detects and repairs malformed JSON: type-based wrapper unwrapping (stringified inner JSON, single-key data-array wrappers), quote repair, recursion. An escalation ladder — direct parse first, surgery only when needed. Free-text keys that break parsing (`description`, `notes`, `body_text`, `subject`, `text`, `note`) are nulled before repair. |
 | `parse_bronze_table()` | Reads a bronze table, deduplicates snapshot re-dumps, detects the wrapper format, repairs dirty rows once into a temp table, infers the schema from up to 200 sampled rows (`schema_of_json_agg` with single-row fallback), parses with `from_json`, and explodes the top-level array. Aborts the write if every field parses to NULL (wrong-schema guard). |
 | `get_silver_watermark()` | Returns `MAX(bronze_updated_at)` from a silver table — the CDC watermark, or None on first run. |
-| `write_silver()` | Writes a DataFrame to silver. In CDC mode (watermark set) it deletes rows newer than the watermark and appends — the delete window matches the read filter to the microsecond. First run is a full overwrite. |
+| `write_silver()` | Writes a DataFrame to silver. In CDC mode (watermark set): the seven parents upsert by their pinned primary key — `_merge_silver` MERGEs by id (existing ids UPDATE in place, new ids INSERT), with the batch's columns first reconciled to the target's Delta types (`_reconcile_to_target` → `_cast_tree`; per-batch schema inference drifts on nested types, and Delta rejects a MERGE whose source struct/array types differ from the target's) and any new top-level columns ALTER-added before the MERGE; child tables delete+append exactly the rows newer than the watermark (delete window matches the read filter to the microsecond). First run is a full overwrite. |
 | `flatten_structs()` | Flattens StructType columns into individual columns (the `custom` struct is kept for separate extraction). |
 | `explode_to_child()` | Explodes an array column into a child table; `dry_run=True` prints the lineage without writing. |
 | `extract_custom()` | Extracts the `custom` struct and `custom_cf_` fields into a child table and a `custom_fields` MAP on the parent. |
 | `process_table()` | Orchestrator: parse → optional flatten → custom extraction → write parent → print the discovered lineage tree (children are printed in dry-run; child tables are built by the dedicated child notebooks). |
 
-**Version history, not destructive updates:** bronze receives a full re-dump from the source on every export, so silver parents accumulate one row per source version (`bronze_updated_at` distinguishes them). Silver is append-CDC: only rows newer than the watermark are reprocessed. **Every gold consumer takes the latest version per key** — `ROW_NUMBER() OVER (PARTITION BY <key> ORDER BY <timestamp> DESC)` keeps `rn = 1`.
+**One row per id, not version history:** bronze receives a full re-dump from the source on every export, so the engine deduplicates byte-identical re-dumps and anti-joins on a payload hash to skip source versions silver already holds, then upserts each id's latest version into the parent. Silver is CDC: only rows newer than the watermark are reprocessed. Gold consumers still take the latest per key — `ROW_NUMBER() OVER (PARTITION BY <key> ORDER BY <timestamp> DESC)` keeps `rn = 1` — a guard that also covers the exploded child arrays.
 
 **Schema discovery note:** schema inference samples up to 200 random rows, so fields that appear only in rare activity types can be missed by the parent parse. `lead_activites_processed` captures 76 of the 135 source fields this way; the email body fields are among the missing 59 — which is why `lead_activites_email_body` re-parses bronze with its own targeted extraction.
 
@@ -175,31 +176,31 @@ All silver notebooks start with `%run ../utils`, then call `process_table('bronz
 
 | Notebook | Bronze Source | Silver Table | Rows | Contents |
 |---|---|---|---:|---|
-| `2_1_01` | `leads_raw` | `leads_processed` | 343,820 | Flattened leads: `id`, `name` (identity hash), `display_name`, `status_label`, `date_updated`, + the raw arrays (`contacts`, `opportunities`, `tasks`, `custom` struct) |
-| `2_2_01` | `lead_activites_raw` | `lead_activites_processed` | 7,558,812 | Activities: `id`, `lead_id`, `type`, `activity_at`, `direction`, `status`, `disposition`, `note`, `text` (SMS body — email body is NOT here), `attendees` array, `custom_fields` MAP, … 76 fields |
-| `2_3` | `close_crm_users_raw` | `close_crm_users_processed` | 164,756 | CRM users/staff (real names, emails) |
-| `2_4` | `custom_activites_raw` | `custom_activites_processed` | 1,757 | Custom activity types, fields, outcomes |
-| `2_5` | `calendly_scheduled_events` | `calendly_scheduled_events_processed` | 104,716 | Meeting events: `EVENT_URI`, `INVITEE_NAME`/`INVITEE_EMAIL` (real emails), `EVENT_START_TIME`, `EVENT_CREATED_AT`, `INVITEE_UPDATED_AT` |
-| `2_6` | `student_sentiment` | `student_sentiment_processed` | 140,771 | Sentiment + Slack data (`CHANNEL_ID`, `CHANNEL_NAME`) |
-| `2_7` | `mdl_users_raw` | `mdl_users_processed` | 29,455 | Platform users: `USERNAME`/`FIRSTNAME`/`LASTNAME` are identity hashes, `LASTACCESS` |
+| `2_1_01` | `leads_raw` | `leads_processed` | 64,770 | Flattened leads (one row per id): `id`, `name` (identity hash), `display_name`, `status_label`, `date_updated`, + the raw arrays (`contacts`, `opportunities`, `tasks`, `custom` struct) |
+| `2_2_01` | `lead_activites_raw` | `lead_activites_processed` | 1,037,014 | Activities: `id`, `lead_id`, `type`, `activity_at`, `direction`, `status`, `disposition`, `note`, `text` (SMS body — email body is NOT here), `attendees` array, `custom_fields` MAP, … 76 fields |
+| `2_3` | `close_crm_users_raw` | `close_crm_users_processed` | 532 | CRM users/staff (real names, emails) |
+| `2_4` | `custom_activites_raw` | `custom_activites_processed` | 30 | Custom activity types, fields, outcomes |
+| `2_5` | `calendly_scheduled_events` | `calendly_scheduled_events_processed` | 102,420 | Meeting events: `EVENT_URI`, `INVITEE_NAME`/`INVITEE_EMAIL` (real emails), `EVENT_START_TIME`, `EVENT_CREATED_AT`, `INVITEE_UPDATED_AT` |
+| `2_6` | `student_sentiment` | `student_sentiment_processed` | 2,263 | Sentiment + Slack data (`CHANNEL_ID`, `CHANNEL_NAME`) |
+| `2_7` | `mdl_users_raw` | `mdl_users_processed` | 26,274 | Platform users: `USERNAME`/`FIRSTNAME`/`LASTNAME` are identity hashes, `LASTACCESS` |
 
 ### 5.3 Child Tables (7)
 
 Two build patterns, both CDC:
 
-* **Lead children** (`2_1_02`, `2_1_03_01`, `2_1_03_02`) — explode arrays from the silver *parent* (`leads_processed`), reading only parent rows newer than the child's own watermark. They inherit the parent's version history; consumers deduplicate.
+* **Lead children** (`2_1_02`, `2_1_03_01`, `2_1_03_02`) — explode arrays from the silver *parent* (`leads_processed`), reading only parent rows newer than the child's own watermark. With one-row-per-id parents they hold one row per id × child key.
 * **Activity children** (`2_2_03`, `2_2_04`, `2_2_05`) — read the activity parent's changed rows, keep the **latest version per activity**, and replace exactly the affected activity's rows (an exact-key DELETE, because a timestamp-only delete would leave stale siblings). These tables represent **current state**. First run, or a legacy schema without `bronze_updated_at`, triggers a full rebuild.
 * `2_2_02` re-parses bronze directly (the parent parse misses the body fields — see §5.1).
 
 | Notebook | Silver Table | Rows | One row per… |
 |---|---|---:|---|
-| `2_1_02` | `leads_processed_custom` | 343,820 | Lead × custom fields: `CSM`, `Contracted_Value`, `Tier`, `Avatar`, `SENTIMENTS_LAST_30_DAYS`, `DAYS_SINCE_LAST_*` (CRM pre-calculated), `Channel_ID` |
-| `2_1_03_01` | `leads_processed_contacts` | 420,471 | Lead × contact: `id` (cont_id), `name` (identity hash), emails/phones/urls arrays |
-| `2_1_03_02` | `leads_processed_contacts_emails` | 508,148 | Lead × contact × email: `email`, `type`, `is_unsubscribed` (mostly masked `user_…@masked.com`) |
-| `2_2_02` | `lead_activites_email_body` | 2,593,027 | Email activity × body text: `body_text` extracted from the nested `body_text_quoted` array |
-| `2_2_03` | `lead_activites_processed_attendees` | 61,201 | Activity × attendee: `contact_id`, real `email` (the only real client email in the CRM export), `is_organizer`, `user_id` (48-char staff login hash), `name`, `status` — current state |
-| `2_2_04` | `lead_activites_processed_envelope` | 427,155 | Email activity envelope (from/to masked addresses) — current state |
-| `2_2_05` | `lead_activites_processed_to` | 124,446 | Email activity recipients — current state |
+| `2_1_02` | `leads_processed_custom` | 64,770 | Lead × custom fields: `CSM`, `Contracted_Value`, `Tier`, `Avatar`, `SENTIMENTS_LAST_30_DAYS`, `DAYS_SINCE_LAST_*` (CRM pre-calculated), `Channel_ID` |
+| `2_1_03_01` | `leads_processed_contacts` | 69,704 | Lead × contact: `id` (cont_id), `name` (identity hash), emails/phones/urls arrays |
+| `2_1_03_02` | `leads_processed_contacts_emails` | 82,292 | Lead × contact × email: `email`, `type`, `is_unsubscribed` (mostly masked `user_…@masked.com`) |
+| `2_2_02` | `lead_activites_email_body` | 129,966 | Email activity × body text: `body_text` extracted from the nested `body_text_quoted` array |
+| `2_2_03` | `lead_activites_processed_attendees` | 62,968 | Activity × attendee: `contact_id`, real `email` (the only real client email in the CRM export), `is_organizer`, `user_id` (48-char staff login hash), `name`, `status` — current state |
+| `2_2_04` | `lead_activites_processed_envelope` | 453,049 | Email activity envelope (from/to masked addresses) — current state |
+| `2_2_05` | `lead_activites_processed_to` | 132,695 | Email activity recipients — current state |
 
 **Why `lead_activites_email_body` exists:** `body_text_quoted[0].text` carries the actual email body — including Calendly's 'A new event has been scheduled.' message, which `3_06` uses as meeting evidence. The `text` column on `lead_activites_processed` is SMS text only; emails have NULL there.
 
@@ -212,7 +213,7 @@ One row per **person** across all systems. This is the piece that makes cross-sy
 2. **Group by email** — one row per email with every linked hash, lead, and contact attribution.
 3. **Pivot** back to source-column shapes (each source table joins on its own column name).
 4. **Create `master_user_id`** — bundle hashes that share the same **real** email into one person; masked emails stay for lookup but cannot group. Two guards prevent false bundles: a hash carrying more than 10 real emails (shared/system hash) and an email carrying more than 5 distinct hashes (community/shared inbox) are excluded from grouping but remain searchable.
-5. **Materialize** `silver.user_identity_map`: `master_user_id`, `user_32digits`, `real_emails`, `masked_emails`, `lead_ids`, `cont_ids`, `source_tables` — one row per person (≈131,000 currently; ≈42K with a real email, ≈46K linked to leads).
+5. **Materialize** `silver.user_identity_map`: `master_user_id`, `user_32digits`, `real_emails`, `masked_emails`, `lead_ids`, `cont_ids`, `source_tables` — one row per person (≈135,000 currently; ≈42K with a real email, ≈53K linked to leads).
 6. **Validate** spine coverage against the gold meeting signals (future bookings, any bookings).
 
 **Canonical email contract:** every email is normalized exactly once, in Step 1's union wrapper — `NULLIF(LOWER(TRIM(email)), '')`. All spine outputs are canonical by construction; gold tables join on emails without re-normalizing.
@@ -235,22 +236,22 @@ Star schema keyed on `lead_id`. Every consumer-facing table is one row per clien
 | 4 | `3_04` | `lead_dim` | client (`lead_id`) | The Coaching Client population + commercial attributes |
 | 5–11 | `3_05`–`3_11` | 7 metric tables | client (`lead_id`) | Single engagement metrics (§6.3) |
 | 12 | `3_12` | `lead_emails` | lead (`lead_id`) | Client email view + primary email (§6.2) |
-| 13 | `3_13` | `health_metrics` | client (`lead_id`) | Staging join: lead_dim + sales + staff + all 7 metrics |
+| 13 | `3_13` | `health_metrics` | client (`lead_id`) | Staging join: lead_dim + sales + staff + all 7 metrics + real client names |
 | 14 | `3_14` | `customer_health_profile` | client × version | SCD2 engagement versions — scoring, bands, hash (§6.4) |
 | 15 | `3_15` | `customer_health_history` | run_date × client | Daily snapshot of open versions, 90-day window |
-| 16 | `3_16` | `communication_state` | lead (`lead_id`) | Attempt-vs-contact state for ALL leads (44,742) |
+| 16 | `3_16` | `communication_state` | lead (`lead_id`) | Attempt-vs-contact state for ALL leads (47,853) |
 | 17 | `3_17` | `communication_recency` | client (`lead_id`) | Per-channel recency + whose-turn for clients (context only) |
 | 18 | `3_18` | `coaching_score_by_client_health` | client (`lead_id`) | The company's service report card (§6.5) |
 
 ### 6.1 The Population (`lead_dim`)
 
-`lead_dim` defines who the health layer scores: leads whose **latest** status is `Coaching Client`. All versions of a lead are ranked first (`date_updated DESC`), and only then is the latest status checked — so a lead whose status changed away from Coaching Client leaves the population, and a lead that returned re-enters it. Current population: **1,374 clients**. Columns: `lead_id`, `lead_name` (the identity hash), `lead_display_name`, `status_label`, `date_updated`, `csm_id`, `Contracted_Value`, `Tier`, `Avatar`.
+`lead_dim` defines who the health layer scores: leads whose **latest** status is `Coaching Client`. All versions of a lead are ranked first (`date_updated DESC`), and only then is the latest status checked — so a lead whose status changed away from Coaching Client leaves the population, and a lead that returned re-enters it. Current population: **1,380 clients**. Columns: `lead_id`, `lead_name` (the identity hash), `lead_display_name`, `status_label`, `date_updated`, `csm_id`, `Contracted_Value`, `Tier`, `Avatar`.
 
 ### 6.2 Identity, Staff, and Client Emails
 
-**`staff_emails` (3_00)** — one row per staff person from the spine. A person is staff if ANY of: (a) they carry a 48-char organizer-login hash (`attendees.user_id` — only a logged-in staff member can organize an activity), (b) any real email on `@dataengineeracademy.com`, (c) any real email registered in `close_crm_users`. Whole-master rule: one marker makes the **entire** person staff — every hash, real email, and masked email. `all_emails` is the complete staff blocklist (189 staff persons currently).
+**`staff_emails` (3_00)** — one row per staff person from the spine. A person is staff if ANY of: (a) they carry a 48-char organizer-login hash (`attendees.user_id` — only a logged-in staff member can organize an activity), (b) any real email on `@dataengineeracademy.com`, (c) any real email registered in `close_crm_users`. Whole-master rule: one marker makes the **entire** person staff — every hash, real email, and masked email. `all_emails` is the complete staff blocklist (188 staff persons currently).
 
-**`lead_emails` (3_12)** — the client email view, built on the spine. `customer_emails` = every email attributed to the lead's persons **minus** the staff blocklist. `primary_customer_email` picks THE one client email by priority: (1) a real email from the lead's own CRM contact record, (2) any real non-staff email, (3) a masked email from the lead's own record, (4) any masked non-staff email — alphabetical tie-break. 55,254 leads carry email arrays; over 99% of clients have a primary. Search pattern: `email = primary_customer_email OR array_contains(customer_emails, email)`. The subtraction is validated leak-proof: no staff email — not even one of the 443 CRM directory addresses — appears among the customer email arrays.
+**`lead_emails` (3_12)** — the client email view, built on the spine. `customer_emails` = every email attributed to the lead's persons **minus** the staff blocklist. `primary_customer_email` picks THE one client email by priority: (1) a real email from the lead's own CRM contact record, (2) any real non-staff email, (3) a masked email from the lead's own record, (4) any masked non-staff email — alphabetical tie-break. 63,985 leads carry email arrays; over 99% of clients have a primary. Search pattern: `email = primary_customer_email OR array_contains(customer_emails, email)`. The subtraction is validated leak-proof: no staff email — not even one of the 444 CRM directory addresses — appears among the customer email arrays.
 
 **`staff_account_dim` (3_01)** — one row per staff person (189): the full staff account view, joining the `staff_emails` identity with the `staff_dim` CRM directory profile through the unique-email bridge (the spine's 32-char hashes and the CRM's 48-char login hashes are disjoint id spaces, so email is the only join key). Role attribution keeps labels separate — `csm_lead_ids`/`n_csm_leads`, `setter_lead_ids`/`n_setter_sales`, `closer_lead_ids`/`n_closer_sales` — guarded against fanout: `n_crm_matches` flags a person matching several CRM directory rows, and a directory email shared across staff persons attributes nothing (unique-email rule). A leaf dimension for per-staff analysis (health of a CSM's book, setter/closer deal attribution); nothing in the build chain joins on it.
 
@@ -266,7 +267,7 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 | 2 | `days_since_last_meeting` (3_06) | email_body | Days since the last Calendly 'A new event has been scheduled.' email (CRM meeting evidence) |
 | 3 | `missed_calls_14_days` (3_07) | activities | Count of inbound `no-answer` calls in the **trailing 14 days** (a window metric, not a lifetime total) |
 | 4 | `days_until_next_meeting` (3_08) | Calendly + spine | Days to the client's next **future** Calendly event. The CRM never records future meetings — Calendly is the only source; clients matched via spine hash or real email |
-| 5 | `days_since_last_login` (3_09) | mdl_users + two hash bridges | Days since last platform login — the contact's hash AND the lead record's own hash, each matched against `USERNAME` ∪ `FIRSTNAME` ∪ `LASTNAME`. The platform's emails are 100% masked with zero overlap against the CRM's, so email matching is impossible — name-hash equality is the only bridge. Users whose Moodle `LASTACCESS` is the epoch default (1970) have never logged in; they score flag 0. Coverage: 633 clients; the remainder are unlinkable by any key in the export. |
+| 5 | `days_since_last_login` (3_09) | mdl_users + two hash bridges | Days since last platform login — the contact's hash AND the lead record's own hash, each matched against `USERNAME` ∪ `FIRSTNAME` ∪ `LASTNAME`. The platform's emails are 100% masked with zero overlap against the CRM's, so email matching is impossible — name-hash equality is the only bridge. Users whose Moodle `LASTACCESS` is the epoch default (1970) have never logged in; they score flag 0. Coverage: 634 clients; the remainder are unlinkable by any key in the export. |
 | 6 | `days_since_last_meeting_calendly` (3_10) | Calendly + spine | Days since the client's latest **booking creation** (`EVENT_CREATED_AT` — booking recency, not event start; future bookings count) |
 | 7 | `sentiment` (3_11) | `leads_processed_custom` | Sentiment label + days since last message from client / from team. The raw `student_sentiment` table cannot be joined to leads (its `CHANNEL_ID` is a different identifier type than any CRM key), so the CRM's pre-calculated fields carry this metric; one Slack channel is excluded by spec |
 
@@ -274,7 +275,7 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 
 ### 6.4 Health Scoring (3_13 join → 3_14 SCD2 profile)
 
-**`health_metrics` (3_13)** — one row per client: `lead_dim` LEFT JOIN `lead_emails`, `sales_fact`, `staff_dim` (CSM), and all seven metric tables, plus the intern and attention flags. This is the staging join everything downstream reads. Commercial context rides on the same row: `contract_start_date` reads the CRM's stored `Contract Start Date` custom field (latest snapshot per lead), falling back to the qualifying sale date when the field is empty — 1,329 of 1,374 clients carry one; the rest have neither field nor sale on file (a source-side gap, not a pipeline one). `date_of_sale` (the New Sale activity, per the spec) stays a separate column — the two dates are different facts.
+**`health_metrics` (3_13)** — one row per client: `lead_dim` LEFT JOIN `lead_emails`, `sales_fact`, `staff_dim` (CSM), and all seven metric tables, plus the intern and attention flags. This is the staging join everything downstream reads. `lead_name` carries the client's **real name**, recovered from the Calendly invitee lines quoted in email notification bodies (`body_text_quoted` on `lead_activites_processed`) — the only place in the export where client names appear unmasked, since the CRM masks every person-name field as `user_…` hashes. Distinct invitee names per lead are joined alphabetically with ` / `; leads that never booked a meeting keep the identity hash as a fallback, and leads with neither stay empty (843 of 1,380 carry a real name). Identity-keyed logic (intern flag, unlinked flag) still runs on the hash. Commercial context rides on the same row: `contract_start_date` reads the CRM's stored `Contract Start Date` custom field (latest snapshot per lead), falling back to the qualifying sale date when the field is empty — 1,329 of 1,380 clients carry one; the rest have neither field nor sale on file (a source-side gap, not a pipeline one). `date_of_sale` (the New Sale activity, per the spec) stays a separate column — the two dates are different facts.
 
 **Scoring (`3_14`):** three engagement flags → engagement pattern → base score → adjustments → band.
 
@@ -297,10 +298,10 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 
 | Band | Rule | Current |
 |---|---|---:|
-| GOOD | ≥ 75 | 205 |
-| AVERAGE | 50–74 | 289 |
-| POOR | < 50 | 417 |
-| NO DATA | no engagement evidence at all | 463 |
+| GOOD | ≥ 75 | 211 |
+| AVERAGE | 50–74 | 303 |
+| POOR | < 50 | 411 |
+| NO DATA | no engagement evidence at all | 455 |
 
 **SCD Type 2 versioning (`customer_health_profile`):** one row per client **per engagement version**. A change-detection hash covers engagement state + identity + contract value — clock metrics (the `days_since_*` columns) are deliberately excluded so the hash does not churn daily. Each run:
 
@@ -308,13 +309,13 @@ All metrics are per-source `lead_id` — no identity consolidation. Cross-system
 2. **INSERT step 2** — new leads, and leads whose version just closed, get a fresh open version (`VRSN_START_DATE = today`).
 3. **UPDATE step 3** — leads that left the population close their open version; if they return later, step 2 opens a new one.
 
-`VRSN_END_DATE IS NULL` = the current version. Read the current state with `WHERE VRSN_END_DATE IS NULL` — currently 1,374 open versions.
+`VRSN_END_DATE IS NULL` = the current version. Read the current state with `WHERE VRSN_END_DATE IS NULL` — currently 1,380 open versions.
 
 **`customer_health_history` (3_15)** — daily full snapshot of the open versions: one row per active client per day, all version columns + `run_date`, idempotent (deletes today's rows first), with a rolling **90-day retention**. The profile is the change log (what changed, when); the history is the trend log (band transitions, score drift).
 
 ### 6.5 Communication Tables and the Coaching Score
 
-**`communication_state` (3_16)** — direction-aware state for **every** lead with contact history (44,742), built on the core distinction between an **attempt** and **contact made**: an outbound call is an attempt (only `disposition = 'answered'` is contact); a client inbound call counts as the client reaching out even if we missed it; sent email/SMS and Slack count as contact. Key columns: per-channel in/out recency (email, call, SMS, Slack), `client_reach_days` (their last contact or attempt), `we_connected_days` (our last contact made), `we_attempted_days` (our last attempt of any kind), `whose_turn` (`US` / `CLIENT` / `CURRENT`), and `all_out_attempted` (no outbound attempt of any kind in the last 14 days — the only windowed rule; `whose_turn` itself compares raw dates and never goes stale).
+**`communication_state` (3_16)** — direction-aware state for **every** lead with contact history (47,853), built on the core distinction between an **attempt** and **contact made**: an outbound call is an attempt (only `disposition = 'answered'` is contact); a client inbound call counts as the client reaching out even if we missed it; sent email/SMS and Slack count as contact. Key columns: per-channel in/out recency (email, call, SMS, Slack), `client_reach_days` (their last contact or attempt), `we_connected_days` (our last contact made), `we_attempted_days` (our last attempt of any kind), `whose_turn` (`US` / `CLIENT` / `CURRENT`), and `all_out_attempted` (no outbound attempt of any kind in the last 14 days — the only windowed rule; `whose_turn` itself compares raw dates and never goes stale).
 
 **`communication_recency` (3_17)** — the same logic narrowed to the client population (one row per client), with the reply-debt view: `last_contact_in_days` (the client's last inbound on **any** channel — a missed call counts), `whose_turn` (`THEIR TURN` / `OUR TURN` / `MUTUAL` / `NO CONTACT` / `NEVER REACHED`), and `exhausted_outreach_flag`. **Pure context table — not an input to any score.**
 
@@ -324,11 +325,11 @@ The promise ladder (`service_verdict`), current run:
 
 | Verdict | Clients |
 |---|---:|
-| PROMISE KEPT | 1,257 |
-| WITHIN THE PROMISE (0–2 days) | 58 |
-| PROMISE SLIPPING (3–7 days) | 29 |
-| PROMISE BROKEN (8–30 days) | 15 |
-| PROMISE ABANDONED (31+ days) | 12 |
+| PROMISE KEPT | 1,245 |
+| WITHIN THE PROMISE (0–2 days) | 51 |
+| PROMISE SLIPPING (3–7 days) | 58 |
+| PROMISE BROKEN (8–30 days) | 12 |
+| PROMISE ABANDONED (31+ days) | 14 |
 
 `company_service_score = 100 − (10 per day past the 2-day reply promise, capped at 40) − 20 (no attempt since their last reach) − 40 (abandoned) − 30 (contract without delivery) − 10 (minimal service)`, floored at 0. Thresholds are provisional constants — the business can retune them without touching the pipeline. Column comments in the table carry the customer-voice definitions ('Every day here is a day the client feels deprioritized'). Like 3_17, this is a context table — not an input to any score. Dollar columns self-mark as floors (contract value on file, not measured loss).
 
