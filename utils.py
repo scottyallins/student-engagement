@@ -1504,6 +1504,7 @@ def _latest_per_pk(df, pk):
     return df
 
 
+
 def _full_rebuild_parent(bronze_name, silver_name, flatten=False):
     """CDC escape hatch (Nov 12 2026): the full-history rebuild the Nov 9
     notebooks did, invoked automatically when the nightly MERGE hits a
@@ -1730,6 +1731,52 @@ def write_silver(df, table_name, bronze_name=None, flatten=False):
     write would rebuild it with parent-shaped rows.
     """
     full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
+
+    # NULL-PK quarantine (Nov 17 2026): pinned-PK silver parents carry NOT NULL
+    # on the PK (3_18 contracts). NULL-PK rows in any batch — CDC MERGE, legacy
+    # delete+append, or full rebuild — are quarantined to silver.null_pk_quarantine
+    # and excluded from the write. Detect + preserve + surface: nothing is dropped
+    # or hidden, every offending payload stays queryable, and the nightly stays
+    # green instead of dying on DELTA_NOT_NULL_CONSTRAINT_VIOLATED.
+    _mk = SILVER_MERGE_KEYS.get(table_name)
+    if _mk and _mk in df.columns:
+        _nulls = df.filter(col(_mk).isNull())
+        _n = _nulls.count()
+        if _n:
+            from pyspark.sql.functions import (
+                struct as _struct, current_timestamp as _ts)
+            _qt = f"{CATALOG}.{SILVER_SCHEMA}.null_pk_quarantine"
+            spark.sql(f"""
+                CREATE TABLE IF NOT EXISTS {_qt} (
+                    table_name         STRING,
+                    pk_column          STRING,
+                    payload_hash       STRING,
+                    bronze_insert_date TIMESTAMP,
+                    bronze_updated_at  TIMESTAMP,
+                    quarantined_at     TIMESTAMP,
+                    row_json           STRING
+                )
+            """)
+            _keys = ["table_name", "pk_column", "payload_hash",
+                     "bronze_insert_date"]
+            _batch = _nulls.select(
+                lit(table_name).alias("table_name"),
+                lit(_mk).alias("pk_column"),
+                col("payload_hash"),
+                col("bronze_insert_date"),
+                col("bronze_updated_at"),
+                _ts().alias("quarantined_at"),
+                to_json(_struct(*[col(c) for c in _nulls.columns]))
+                    .alias("row_json"),
+            )
+            _new = _batch.join(
+                spark.table(_qt).select(*_keys), on=_keys, how="left_anti")
+            _new_cnt = _new.count()
+            if _new_cnt:
+                _new.write.format("delta").mode("append").saveAsTable(_qt)
+            print(f"  🚫 {table_name}: {_n} NULL-{_mk} row(s) quarantined "
+                  f"({_new_cnt} new, {_n - _new_cnt} already known)")
+            df = df.filter(col(_mk).isNotNull())
 
     if _CDC_WATERMARK is not None:
         # Upsert-by-PK when the table has a pinned merge key: changed records
