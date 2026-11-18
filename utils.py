@@ -143,6 +143,8 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 #     so the value span ended early and the wrap misfired.
 #   * Rule 1 unwrap skips _PROBLEM_KEYS — free text whose CONTENT happens
 #     to be valid JSON is data, never a wrapper (was silently restructured).
+#     (11/18/2026 refinement: the skip uses _UNWRAP_EXEMPT_KEYS — true
+#     free-text keys only; JSON_OBJECT is a wrapper key and must unwrap.)
 #   * Nested Rule-1 repair derives its own safe tokens (same fix, one
 #     nesting level down).
 # ============================================================================
@@ -207,8 +209,9 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 # re-runs the whole ladder on the inner string, so unwrap-then-parse
 # happens at every nesting level). Rules, by type inspection not key names:
 #   1. dict value that is a string starting with '{' or '[' → stringified JSON
-#      (11/17/2026: _PROBLEM_KEYS are exempt — their string values are free
-#      text, i.e. DATA, never wrappers)
+#      (11/17/2026: true free-text keys (_UNWRAP_EXEMPT_KEYS) are exempt —
+#      their string values are free text, i.e. DATA, never wrappers; 11/18
+#      fix: JSON_OBJECT is NOT exempt, it is a wrapper key)
 #   2. dict with exactly one key whose value is a list → array wrapper
 #      (guarded against the token scheme's own single-string wrap — see
 #      the inline comment in _detect_and_unwrap Rule 2)
@@ -256,6 +259,22 @@ _PROBLEM_KEYS = {
     "Ontraport_Call Notes",
     "Churn RCA",
     "Company Name",}
+
+# 11/18/2026 — REGRESSION FIX (JSON_OBJECT). The 11/17 free-text guard
+# exempted every _PROBLEM_KEYS key from the Rule-1 wrapper unwrap. That is
+# right for prose keys (text, subject, name...) but WRONG for JSON_OBJECT:
+# it is not free text — it is the WRAPPER KEY that carries the entire
+# payload for close_crm_users_raw and custom_activites_raw, whose bronze
+# rows are {"INSERT_DATE": ..., "JSON_OBJECT": "{'data': [...]}"} (outer
+# parses clean at rung 1; the inner is single-quoted JSON repaired by the
+# nested ladder). The exemption froze those tables at wrapper level:
+# discovery saw only INSERT_DATE + a 200KB string, no user fields were
+# ever extracted, full-history rebuilds degraded to STRING and aborted,
+# and the CDC path would have written wrapper-level rows to silver.
+# JSON_OBJECT stays in _PROBLEM_KEYS (the rung-4 string-level wrap still
+# protects it when IT appears single-quoted); only the post-parse UNWRAP
+# exemption is lifted. True free-text keys keep the exemption.
+_UNWRAP_EXEMPT_KEYS = _PROBLEM_KEYS - {"JSON_OBJECT"}
 
 # --- Rung-5 over-prepared switches (Nov 9 2026 upgrade). Defaults OFF so
 # existing behavior is byte-identical. Flip per source (driver-side,
@@ -829,9 +848,11 @@ def _detect_and_unwrap(parsed, _depth=0):
     11/17/2026: (a) recursion capped at _MAX_JSON_DEPTH — pathological
     nesting used to raise RecursionError (caught nowhere) and kill the UDF
     task; unwrapping now stops and keeps what it has. (b) Rule 1 skips
-    _PROBLEM_KEYS — free text whose CONTENT happens to be valid JSON was
-    silently unwrapped and restructured; free-text values are data, never
-    wrappers.
+    _UNWRAP_EXEMPT_KEYS — free text whose CONTENT happens to be valid JSON
+    was silently unwrapped and restructured; free-text values are data,
+    never wrappers. (11/18/2026 fix: the exemption is free-text keys ONLY —
+    JSON_OBJECT is a wrapper key carrying whole payloads for
+    close_crm_users_raw / custom_activites_raw and must unwrap.)
     """
     # 11/17/2026 — recursion cap: stop unwrapping, keep what we have
     if _depth >= _MAX_JSON_DEPTH:
@@ -839,10 +860,13 @@ def _detect_and_unwrap(parsed, _depth=0):
     if isinstance(parsed, dict):
         # Rule 1: Check for stringified inner JSON wrapper (any value that looks like JSON)
         for key, val in parsed.items():
-            # 11/17/2026 — free-text guard: problem keys are prose by
+            # 11/18/2026 — regression fix: exempt only TRUE free-text keys
+            # (_UNWRAP_EXEMPT_KEYS). JSON_OBJECT is a wrapper key, not prose —
+            # exempting it froze close_crm_users/custom_activites at wrapper
+            # level. 11/17/2026 — free-text guard: problem keys are prose by
             # definition; their string values are DATA, never wrappers
             # (user text that happens to be valid JSON was restructured)
-            if key in _PROBLEM_KEYS:
+            if key in _UNWRAP_EXEMPT_KEYS:
                 continue
             if isinstance(val, str) and val.strip() and val.strip()[0] in ('{', '['):
                 # Try parsing as-is first (might already be valid JSON)
@@ -1117,6 +1141,17 @@ _LADDER_CASES = [
     ("11/17: literal (*APOSTROPHE*) token survives", "{'text': 'girls\' night (*APOSTROPHE*) plan'}", {"text": "girls' night (*APOSTROPHE*) plan"}),
     ("11/17: literal APOSTROWORD survives", "{'text': 'APOSTROWORD and girls\' night'}", {"text": "APOSTROWORD and girls' night"}),
     ("11/17: free text that looks like JSON stays data", '{"text": "{\\"not\\": \\"a wrapper\\"}"}', {"text": "{\"not\": \"a wrapper\"}"}),
+    # 11/18/2026 — regression pins (JSON_OBJECT unwrap fix):
+    # close_crm_users_raw / custom_activites_raw are exactly this shape —
+    # clean double-quoted outer, JSON_OBJECT holding single-quoted inner.
+    # The 11/17 free-text guard froze it at wrapper level; it MUST unwrap
+    # to the inner records (nested single-quote repair + Rule-2 array).
+    ("11/18: JSON_OBJECT wrapper unwraps",
+     '{"INSERT_DATE": "2026-01-01 08:00:00", "JSON_OBJECT": "{\'data\': [{\'id\': \'u1\'}]}"}',
+     [{"id": "u1"}]),
+    ("11/18: exempt-key JSON_OBJECT-shaped value stays data",
+     '{"subject": "{\'a\': 1}"}',
+     {"subject": "{'a': 1}"}),
 ]
 
 # --- runner ----------------------------------------------------------------
