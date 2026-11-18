@@ -1285,14 +1285,16 @@ def _registry_write(silver_name, struct_type):
         _rows, schema="silver_name STRING, field_name STRING, ddl_type STRING"
     ).write.format("delta").mode("append").saveAsTable(_SCHEMA_REGISTRY)
 
-def _registry_union(silver_name, discovered_st):
+def _registry_union(silver_name, discovered_st, _prior_override=None):
     """11/17/2026 — union discovered schema with the registry's prior
     knowledge. Registry fields absent from THIS discovery are re-added
     (typed from the registry); discovered fields win on conflicts (fresher
     type, and they are written back to the registry by the caller). The
     result feeds from_json, so no known field can ever be silently dropped
-    by a narrow CDC sample again."""
-    _prior = _registry_read(silver_name)
+    by a narrow CDC sample again.
+    11/18/2026 — _prior_override lets the corpus pin this function without
+    touching the real registry (inject a {field_name: ddl_type} dict)."""
+    _prior = _registry_read(silver_name) if _prior_override is None else _prior_override
     if not _prior:
         return discovered_st
     _out = discovered_st
@@ -2208,6 +2210,28 @@ def find_pk(df, table_name=None, validate=True, sample_size=10000):
     # avoid). Return None: _parent_pk then falls back to the pinned
     # SILVER_MERGE_KEYS, and the caller logs that no PK was found.
     return None
+
+
+# --- 11/18/2026 CORPUS PIN: registry union must never duplicate a field ---
+# Incident (13:00 nightly — first real CDC batch after the rebuild, 12,001
+# rows): _registry_union compared the registry's RAW field name against the
+# discovery's SANITIZED names, so any field whose raw name changes under
+# _sanitize_col_name (_type -> type, custom.cf_* -> custom_cf_*) was always
+# judged "missing" and re-added as a DUPLICATE — from_json parsed a struct
+# with the field twice and the field-health guard crashed
+# AMBIGUOUS_REFERENCE_TO_FIELDS ("_type" appears 2 times). Registry evidence:
+# _type held 8 rows vs baseline 5 from earlier silent double-writes. Lives
+# here, not in the corpus cell, because it needs _registry_union (cell 5)
+# and _sanitize_col_name (this cell) to both exist at import time.
+_st_pin = StructType().add("_type", StringType(), True).add("name", StringType(), True)
+_u_pin = _registry_union("PIN_union_regression", _st_pin,
+                         _prior_override={"_type": "string", "only_in_registry": "string"})
+_pin_names = [f.name for f in _u_pin.fields]
+assert _pin_names.count("_type") == 1, (
+    f"_registry_union re-added _type ({_pin_names.count('_type')} occurrences) "
+    "— the raw-vs-sanitized name comparison regressed")
+assert "only_in_registry" in _pin_names, "grow-only registry re-add lost"
+print("  PASS  11/18: _registry_union no-duplicate (raw vs sanitized names)")
 
 # COMMAND ----------
 
