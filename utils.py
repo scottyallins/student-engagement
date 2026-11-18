@@ -1298,9 +1298,9 @@ def _registry_union(silver_name, discovered_st):
     _out = discovered_st
     _names = {_sanitize_col_name(f.name) for f in discovered_st.fields}
     for _fn, _ddl in sorted(_prior.items()):
-        if _fn not in _names:
+        if _fn not in _names and _sanitize_col_name(_fn) not in _names:
             try:
-                _t = StructType.fromDDL(f"`{_fn}` {_ddl}").fields[0].dataType
+              _t = StructType.fromDDL(f"`{_fn}` {_ddl}").fields[0].dataType
             except Exception:
                 _t = StringType()
             _out = _out.add(_fn, _t, True)
