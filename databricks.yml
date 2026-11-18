@@ -316,3 +316,12 @@ resources:
             - task_key: gold_communication_recency
           notebook_task:
             notebook_path: 3_Gold/3_18_Gold_coaching_score_by_client_health.ipynb
+        # ---------- FLEET HEALTH: report-only, the job's LAST task (11/18/2026) ----------
+        # engine_health_report() ties telemetry + quarantine + completeness
+        # signals together. Report-only: never fails the job — the findings
+        # dict in the output IS the operator queue.
+        - task_key: engine_health
+          depends_on:
+            - task_key: gold_coaching_score
+          notebook_task:
+            notebook_path: 3_Gold/3_19_Engine_health_report.ipynb
