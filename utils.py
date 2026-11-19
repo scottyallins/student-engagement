@@ -1095,6 +1095,48 @@ def repair_flag_summary(df, payload_col):
     )
     return flagged, rung_summary
 
+
+# ============================================================================
+# 11/19/2026 — RUNG TELEMETRY: same ladder, ONE parse, TWO outputs.
+# repair_json_flags_udf (above) re-parses every payload, so it stayed a
+# once-per-source review tool. This variant returns the PAYLOAD and the
+# RESCUING RUNG from the same single pass, letting the nightly engine log
+# which rung rescued each row at zero extra parses. The payload output is
+# byte-identical to repair_json_udf — return_flags=True and False return
+# the same json.dumps(unwrapped) / _nested / None in every branch of
+# _parse_activity_final (pinned by the corpus telemetry smoke).
+# rung values: 1 (clean direct parse), '1b' (smart quotes), 2 (string-level
+# wrapper unwrap), 3/4/5 (quote-repair ladder), 'depth_limit' (recursion
+# cap), None (fail-safe rung 6 — NULL payload, quarantined downstream).
+# ============================================================================
+def _parse_activity_telemetered(raw):
+    _payload, _flags = _parse_activity_final(raw, return_flags=True)
+    _rung = _flags.get("rung") if isinstance(_flags, dict) else None
+    return (_payload, None if _rung is None else str(_rung))
+
+
+from pyspark.sql.types import StringType, StructType, StructField  # telemetry struct return
+repair_json_telemetry_udf = udf(StructType([
+    StructField("payload", StringType()),
+    StructField("rung", StringType()),
+]))(_parse_activity_telemetered)
+
+
+def _rung_mix_to_json(df, rung_col="_rung"):
+    """11/19/2026 — batch rung mix as a compact JSON dict {"rung": count}
+    for the run log. ONE groupBy over the post-repair increment (the small
+    temp-table batch, not 22M-row bronze), zero extra parses. A None rung
+    (fail-safe rung 6 / unparseable) logs as "null" so a parse-failure
+    spike is visible IN the mix itself."""
+    _rows = df.groupBy(rung_col).count().collect()
+    if not _rows:
+        return None
+    _mix = {}
+    for _r in _rows:
+        _rv = _r[rung_col]
+        _mix["null" if _rv is None else str(_rv)] = _r["count"]
+    return json.dumps(_mix)
+
 # COMMAND ----------
 
 # DBTITLE 1,# Repair Ladder Tests
@@ -1202,15 +1244,34 @@ _p, _f = _parse_activity_final("{'a': 'x'}", return_flags=True)
 assert isinstance(_f, dict) and "rung" in _f, "return_flags must report the rescuing rung"
 print("  PASS  11/17: return_flags smoke")
 
+# --- 11/19/2026 rung-telemetry smoke ------------------------------------------
+# The telemetry variant must return the SAME payload the nightly UDF would
+# (the nightly path consumes it — byte identity is the contract), plus a
+# string rung. One parse, two outputs.
+_t_payload, _t_rung = _parse_activity_telemetered('{"a": 1}')
+assert json.loads(_t_payload) == {"a": 1} and _t_rung == "1", \
+    "clean row must pass through with rung '1'"
+_t_payload, _t_rung = _parse_activity_telemetered("{'a': 'x'}")
+assert _t_payload is not None and isinstance(_t_rung, str), \
+    "single-quoted row must rescue with a reported rung"
+_t_payload, _t_rung = _parse_activity_telemetered(None)
+assert _t_payload is None and _t_rung is None, "empty row must fail safe with no rung"
+_mix_df = spark.range(4).withColumn(
+    "_rung", when(col("id") < 3, lit("1")).otherwise(lit(None).cast("string")))
+_mix = _rung_mix_to_json(_mix_df, "_rung")
+assert _mix is not None and '"1": 3' in _mix and '"null": 1' in _mix, \
+    "rung mix must count rescuing rungs and surface fail-safe nulls"
+print("  PASS  11/19: rung telemetry (payload identity, rung, mix)")
+
 # --- verdict ------------------------------------------------------------------
 if _ladder_failures:
     _msg = "\n".join(f"  FAIL {_n}: {_why}" for _n, _why in _ladder_failures)
     raise AssertionError(
         f"Repair ladder regression: {len(_ladder_failures)} of "
-        f"{len(_LADDER_CASES) + 3} checks failed:\n{_msg}"
+        f"{len(_LADDER_CASES) + 4} checks failed:\n{_msg}"
     )
-print(f"✅ Repair ladder corpus: all {len(_LADDER_CASES) + 3} checks passed "
-      f"({len(_LADDER_CASES)} cases + token/cap/flags checks)")
+print(f"✅ Repair ladder corpus: all {len(_LADDER_CASES) + 4} checks passed "
+      f"({len(_LADDER_CASES)} cases + token/cap/flags/telemetry checks)")
 
 # COMMAND ----------
 
@@ -1314,10 +1375,10 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
                    deduped_rows=None, cdc_rows=None, repair_needed=None,
                    discovery_mode=None, fields_discovered=None,
                    parsed_valid=None, parsed_null=None, quarantined_new=None,
-                   note=None):
+                   note=None, rung_stats=None):
     """11/17/2026 — RUN LOG: one row per parse run, appended to
     {SILVER_SCHEMA}._run_log (rows in / deduped / CDC / parsed /
-    quarantined / fields / discovery mode / note). The fleet's nervous
+    quarantined / fields / discovery mode / note / rung mix). The fleet's nervous
     system: volume-anomaly ('empty pull vs outage'), parse-rate, and
     field-count convergence alerting all compute from this table — the
     engine itself only prints. Written on SUCCESS, SKIP and FAILURE
@@ -1332,14 +1393,17 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
               bronze_table, silver_name, mode,
               raw_rows, deduped_rows, cdc_rows, repair_needed,
               discovery_mode, fields_discovered,
-              parsed_valid, parsed_null, quarantined_new, note)],
+              parsed_valid, parsed_null, quarantined_new, note,
+              rung_stats)],
             schema=("run_id STRING, logged_at STRING, bronze_table STRING, "
                     "silver_name STRING, mode STRING, raw_rows BIGINT, "
                     "deduped_rows BIGINT, cdc_rows BIGINT, repair_needed BOOLEAN, "
                     "discovery_mode STRING, fields_discovered INT, "
                     "parsed_valid BIGINT, parsed_null BIGINT, "
-                    "quarantined_new BIGINT, note STRING")
-        ).write.format("delta").mode("append").saveAsTable(
+                    "quarantined_new BIGINT, note STRING, rung_stats STRING")
+        ).write.format("delta").mode("append").option(
+            # 11/19 — rung_stats column evolves the existing _run_log table
+            "mergeSchema", "true").saveAsTable(
             f"{CATALOG}.{SILVER_SCHEMA}._run_log")
     except Exception as _le:
         print(f"  ⚠️ run log skipped ({str(_le)[:60]})")
@@ -1496,7 +1560,14 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
 
     if _needs_repair:
         # Parse + repair via UDF (handles JSON_OBJECT wrapper, single quotes, data array)
-        df = df.withColumn("raw_data_repaired", repair_json_udf(col("raw_data")))
+        # 11/19/2026 — RUNG TELEMETRY: the telemetry variant returns
+        # (payload, rung) from the SAME ladder pass — no second parse. The
+        # payload column is byte-identical to repair_json_udf's output
+        # (corpus telemetry smoke), so the downstream contract is unchanged.
+        df = (df.withColumn("_repair_out", repair_json_telemetry_udf(col("raw_data")))
+                .withColumn("raw_data_repaired", col("_repair_out.payload"))
+                .withColumn("_rung", col("_repair_out.rung"))
+                .drop("_repair_out"))
 
         # NOTE: custom. keys are intentionally kept as nested struct fields so the
         # custom object can be extracted into its own child table (extract_custom)
@@ -1511,7 +1582,8 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         # 11/17/2026 — raw_data rides along in the temp table: the parse-null
         # quarantine below stores the ORIGINAL text so replay_quarantined can
         # re-run the current ladder from scratch on parked payloads.
-        df.select("insert_date", "bronze_updated_at", "payload_hash", "raw_data", "raw_data_repaired") \
+        # 11/19/2026 — _rung rides along for the rung-mix telemetry below
+        df.select("insert_date", "bronze_updated_at", "payload_hash", "raw_data", "raw_data_repaired", "_rung") \
             .write.format("delta").mode("overwrite") \
             .option("mergeSchema", "true") \
             .saveAsTable(full_temp)
@@ -1523,6 +1595,9 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         # Clean JSON detected — skip UDF repair and temp table, use raw_data directly
         print(f"  ✓ Clean JSON detected — skipping UDF repair")
         df = df.withColumn("raw_data_repaired", col("raw_data"))
+        # 11/19/2026 — rung telemetry: no ladder ran, so every row is
+        # direct-parse rung 1 (per the same sampled decision above)
+        df = df.withColumn("_rung", lit("1"))
 
     total = df.count()
     if total == 0:
@@ -1534,6 +1609,22 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                        note="no rows after repair")
         return None
     print(f"  Source: {total:,} rows")
+
+    # 11/19/2026 — RUNG TELEMETRY: batch rung mix into the run log — the
+    # drift tripwire for the repair ladder. A source that suddenly sends
+    # more single-quoted payloads flips the mix OVERNIGHT, visible in
+    # _run_log before anyone asks why parse % moved. One groupBy over the
+    # small post-repair increment, zero extra parses. Best-effort like
+    # everything around the log: telemetry failure never blocks the parse.
+    _rung_stats = None
+    try:
+        if "_rung" in df.columns:
+            _rung_stats = _rung_mix_to_json(df, "_rung")
+            if _rung_stats:
+                print(f"  📊 Rung mix: {_rung_stats}")
+            df = df.drop("_rung")
+    except Exception as _rte:
+        print(f"  ℹ️ rung telemetry skipped ({str(_rte)[:60]})")
 
     # Detect if UDF returns arrays (each row is a JSON array of records) vs single objects
     _first_row = df.filter(col("raw_data_repaired").isNotNull()).select("raw_data_repaired").first()
@@ -1548,7 +1639,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=True,
-                       note="repair UDF NULLed every row (ladder failure)")
+                       note="repair UDF NULLed every row (ladder failure)", rung_stats=_rung_stats)
         raise RuntimeError(
             f"{bronze_table}: {_dedup_total:,} distinct rows but the repair "
             f"UDF returned NULL for every one — repair-ladder failure, "
@@ -1822,7 +1913,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=_needs_repair, parsed_valid=0,
                        parsed_null=_quarantined_n, quarantined_new=_new_q_n,
-                       note="0 parsed — whole batch failed (all rows quarantined)")
+                       note="0 parsed — whole batch failed (all rows quarantined)", rung_stats=_rung_stats)
         raise RuntimeError(
             f"{bronze_table}: {total:,} repaired rows but 0 parsed — "
             f"discovered-schema/parse failure, not 'no new data'")
@@ -2005,7 +2096,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                            fields_discovered=len(_check_type.fields),
                            parsed_valid=valid, parsed_null=_quarantined_n,
                            quarantined_new=_new_q_n,
-                           note="all fields NULL — schema mismatch, write skipped")
+                           note="all fields NULL — schema mismatch, write skipped", rung_stats=_rung_stats)
             return None
         _populated = sum(1 for i, f in enumerate(_check_type.fields) if _null_counts[f"_nc_{i}"] > 0)
         print(f"  ✓ Field health: {_populated}/{len(_check_type.fields)} fields have data")
@@ -2050,7 +2141,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                    discovery_mode=("FULL" if _SCHEMA_SAMPLE is None else f"SAMPLE {_SCHEMA_SAMPLE}"),
                    fields_discovered=(len(deduped_st.fields) if isinstance(deduped_st, StructType) else None),
                    parsed_valid=valid, parsed_null=_quarantined_n, quarantined_new=_new_q_n,
-                   note=_tc_note)
+                   rung_stats=_rung_stats, note=_tc_note)
     return df_flat
 
 # COMMAND ----------
