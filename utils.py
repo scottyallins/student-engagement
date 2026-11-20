@@ -926,7 +926,7 @@ def _detect_and_unwrap(parsed, _depth=0):
         return [_detect_and_unwrap(item, _depth=_depth + 1) for item in parsed]  # 11/17/2026 — depth-capped
     return parsed
 
-def _parse_activity_final(raw, return_flags=False, _depth=0):
+def _parse_activity_final_impl(raw, return_flags=False, _depth=0):
     """
     Normalize JSON and return a valid JSON string for ALL tables.
     11/17/2026: (a) recursion capped at _MAX_JSON_DEPTH — a deeply-nested
@@ -1052,6 +1052,24 @@ def _parse_activity_final(raw, return_flags=False, _depth=0):
         _flags["quoted_invalid_number_keys"] = _scan_invalid_number_keys(unwrapped)
         return json.dumps(unwrapped), _flags
     return json.dumps(unwrapped)
+
+def _parse_activity_final(raw, return_flags=False, _depth=0):
+    """11/19/2026 — BLANKET FAIL-SAFE wrapper (the 'one weird row kills the
+    nightly' class). The impl below fails safe to NULL for PARSE failures
+    (rung 6), but its post-parse machinery (wrapper unwrap, token restore,
+    scans) had NO catch-all: an unexpected exception type (catastrophic
+    regex backtracking, a monster string) escaped the UDF and killed the
+    whole task. Now any Exception fails safe with rung 'exception' — the
+    rung mix makes the class VISIBLE instead of fatal. Systemic failures
+    (every row 'exception') still trip the all-NULL / 0-parsed guards
+    loudly. Recursion routes through this wrapper per level, so every
+    level is guarded. KeyboardInterrupt/SystemExit deliberately not caught.
+    """
+    try:
+        return _parse_activity_final_impl(raw, return_flags=return_flags, _depth=_depth)
+    except Exception:
+        return (None, {"rung": "exception"}) if return_flags else None
+
 
 from pyspark.sql.types import StringType
 repair_json_udf = udf(StringType())(_parse_activity_final)
@@ -1263,15 +1281,29 @@ assert _mix is not None and '"1": 3' in _mix and '"null": 1' in _mix, \
     "rung mix must count rescuing rungs and surface fail-safe nulls"
 print("  PASS  11/19: rung telemetry (payload identity, rung, mix)")
 
+# --- 11/19/2026 blanket fail-safe smoke ---------------------------------------
+# One pathological row raising an UNEXPECTED exception type (regex blowup,
+# monster string) used to escape the UDF and kill the whole nightly task.
+# The 11/19 wrapper must swallow it into fail-safe NULL with rung
+# 'exception' — visible in telemetry, quarantined downstream, non-fatal.
+class _Boom:
+    def __bool__(self):
+        raise ValueError("pathological row — __bool__ raises")
+_p, _f = _parse_activity_final(_Boom(), return_flags=True)
+assert _p is None and _f == {"rung": "exception"}, \
+    "unexpected exception must fail safe with rung 'exception', not kill the UDF task"
+assert _parse_activity_final(_Boom()) is None, "non-flags path must fail safe to NULL"
+print("  PASS  11/19: blanket fail-safe (exception → rung 'exception')")
+
 # --- verdict ------------------------------------------------------------------
 if _ladder_failures:
     _msg = "\n".join(f"  FAIL {_n}: {_why}" for _n, _why in _ladder_failures)
     raise AssertionError(
         f"Repair ladder regression: {len(_ladder_failures)} of "
-        f"{len(_LADDER_CASES) + 4} checks failed:\n{_msg}"
+        f"{len(_LADDER_CASES) + 5} checks failed:\n{_msg}"
     )
-print(f"✅ Repair ladder corpus: all {len(_LADDER_CASES) + 4} checks passed "
-      f"({len(_LADDER_CASES)} cases + token/cap/flags/telemetry checks)")
+print(f"✅ Repair ladder corpus: all {len(_LADDER_CASES) + 5} checks passed "
+      f"({len(_LADDER_CASES)} cases + token/cap/flags/telemetry/fail-safe checks)")
 
 # COMMAND ----------
 
@@ -1383,7 +1415,10 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
     field-count convergence alerting all compute from this table — the
     engine itself only prints. Written on SUCCESS, SKIP and FAILURE
     paths alike. Non-fatal by design: a logging failure never blocks
-    the pipeline."""
+    the pipeline.
+    11/19/2026 — rung_stats: NULL on rows logged before rung telemetry
+    (11/19) means PRE-TELEMETRY, not zero. Any mix-over-time query must
+    exclude NULLs or the history silently biases toward zero."""
     try:
         from datetime import datetime, timezone
         spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
@@ -4132,6 +4167,23 @@ print("          replay_quarantined('bronze_table_name') — re-run quarantined 
 # When a detector fires with real evidence, THAT is the moment to build the
 # cure (tombstone policy, MAP/KV child table, PK migration, unit cast) —
 # not before.
+#
+# 11/19/2026 — WIRING STATUS (who consumes what):
+#   NIGHTLY via engine_health_report (cell 12 CALLS these functions — they
+#   stay DEFINED here; this cell is the toolbox, that cell is the reader):
+#     • audit_event_time_format — check 10, quiet=True: the survivorship-
+#       ordering tripwire (one aggregation per SILVER_MERGE_KEYS parent).
+#     • check_field_budget      — check 11: column-explosion budget from
+#       the run log the report already reads.
+#   NIGHTLY via engine-NATIVE telemetry (NOT this cell — the engine itself
+#   writes these to _run_log; health checks 4-6, 9 read those fields):
+#     type-conflict notes, fields_discovered jumps, rung_stats mix flips,
+#     parse rates, empty-increment streaks, bronze freshness.
+#   STILL ON-DEMAND ONLY (full bronze parse each, or a business decision):
+#     report_deletion_drift, detect_pk_format_change,
+#     detect_dynamic_key_maps, detect_epoch_unit_drift,
+#     audit_schema_registry, audit_nested_schema_drift,
+#     audit_event_time_regressions. Run the one matching a symptom.
 
 
 # 11/17/2026 — DRIFT POLICY (documentation-of-record): what the engine
@@ -4434,7 +4486,7 @@ def audit_nested_schema_drift(bronze_name, silver_name):
     return {"dropped": _dropped, "added": _added, "retyped": _retyped}
 
 
-def audit_event_time_format(silver_name):
+def audit_event_time_format(silver_name, quiet=False):
     """FUTURE USE — event-time survivorship orders STRING event times
     lexicographically; that is only correct while the source renders ONE
     uniform format per column. If a source changes its updated_at rendering
@@ -4442,7 +4494,10 @@ def audit_event_time_format(silver_name):
     breaks and the WRONG row survives as 'current' — with no error
     anywhere. Scans the resolved event-time column (via _find_event_time)
     for format-class and length uniformity; multiple classes/lengths =
-    alert. Costs one aggregation — cheap to run anytime. REPORT-ONLY."""
+    alert. Costs one aggregation — cheap to run anytime. REPORT-ONLY.
+    11/19/2026 — quiet=True: one line per table, no per-class detail
+    (engine_health_report check 10 consumes this NIGHTLY — see the cell
+    header WIRING STATUS)."""
     _t = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}")
     _et = _find_event_time(_t)
     if not _et:
@@ -4457,11 +4512,12 @@ def audit_event_time_format(silver_name):
             .otherwise("other"))
     _rows = (_t.select(_cls.alias("cls"), expr(f"length(`{_et}`)").alias("len"))
              .groupBy("cls", "len").count().orderBy(col("count").desc()).collect())
-    print(f"\n🕰️ EVENT-TIME FORMAT AUDIT {silver_name}.{_et}:")
+    if not quiet:
+        print(f"\n🕰️ EVENT-TIME FORMAT AUDIT {silver_name}.{_et}:")
+        for r in _rows[:8]:
+            print(f"   {r['cls'] or 'NULL'} len={r['len']}: {r['count']:,}")
     _classes = {r["cls"] for r in _rows if r["cls"]}
     _lens = {r["len"] for r in _rows if r["cls"]}
-    for r in _rows[:8]:
-        print(f"   {r['cls'] or 'NULL'} len={r['len']}: {r['count']:,}")
     _flags = []
     if len(_classes) > 1:
         _flags.append(f"MIXED format classes: {sorted(_classes)}")
@@ -4470,10 +4526,12 @@ def audit_event_time_format(silver_name):
                       "(precision change — ordering risk)")
     if _flags:
         for _f in _flags:
-            print(f"  🔴 {_f} — lexicographic survivorship ordering may be "
-                  "WRONG for mixed rows; cast/normalize before trusting 'current'")
+            print(f"  🔴 EVENT-TIME {silver_name}.{_et}: {_f} — lexicographic "
+                  "survivorship ordering may be WRONG for mixed rows; "
+                  "cast/normalize before trusting 'current'")
     else:
-        print("  ✅ uniform format — lexicographic ordering is sound")
+        print(f"  🟢 EVENT-TIME {silver_name}.{_et}: uniform — "
+              "lexicographic ordering is sound")
     return _flags
 
 
@@ -4537,7 +4595,7 @@ def audit_event_time_regressions(bronze_table, silver_name=None, pk=None):
     return _reg
 
 
-print("🧰 Drift/deletion/identity detectors loaded (dormant — manual, report-only; see DRIFT_POLICY)")
+print("🧰 Drift/deletion/identity detectors loaded — audit_event_time_format + check_field_budget are consumed NIGHTLY by engine_health_report (checks 10-11); the rest stay manual, report-only; see DRIFT_POLICY")
 
 # COMMAND ----------
 
@@ -4572,7 +4630,9 @@ def engine_health_report(check_bronze_freshness=True,
                          quarantine_growth_alert=50,
                          rebuild_storm_window_days=7,
                          rebuild_storm_max=3,
-                         field_jump_alert=10):
+                         field_jump_alert=10,
+                         rung_mix_shift_alert=25,
+                          field_budget=1000):
     """Fleet health in one command. Returns a findings dict (empty = clean).
     Per expected bronze table (EXPECTED_BRONZE_TABLES):
       1. MISSING TELEMETRY  — no run-log row ever: bronze load may have
@@ -4583,7 +4643,8 @@ def engine_health_report(check_bronze_freshness=True,
       3. BRONZE FRESHNESS  — max(insert_date) older than stale_bronze_hours:
          dumps stopped landing.
       4. PARSE RATE         — last real batch parsed < parse_rate_alert of
-         deduped rows: ladder/discovery degrading.
+         the parsed batch (cdc_rows on CDC runs; deduped_rows on FULL runs,
+         where no anti-join ran).
       5. FIELD-COUNT JUMP   — fields_discovered moved > field_jump_alert:
          source schema changed materially (check type-conflict notes).
       6. TYPE-CONFLICT NOTE — recent runs carrying type-conflict notes.
@@ -4594,6 +4655,14 @@ def engine_health_report(check_bronze_freshness=True,
       8. QUARANTINE GROWTH — new parse_quarantine rows/day above threshold,
          null_pk_quarantine size, and any quarantine-DEGRADED runs
          (protection silently off — the worst silent failure there is).
+      9. RUNG-MIX FLIP — rung_stats mix vs 7-day baseline: new rung value,
+         null-rung spike, share shift (repair-ladder drift tripwire; NULL
+         rung_stats = pre-11/19 telemetry, excluded from baselines).
+     10. EVENT-TIME FORMAT — cell-11 audit_event_time_format per silver
+         parent (quiet): survivorship orders STRING event times; mixed
+         classes/lengths = the wrong row can survive as 'current'.
+     11. FIELD BUDGET — cell-11 check_field_budget: tables over
+         field_budget discovered fields — the every-field-a-column wall.
     """
     from datetime import datetime, timedelta, timezone
     _findings = {}
@@ -4639,7 +4708,16 @@ def engine_health_report(check_bronze_freshness=True,
             _real = [r for r in _rs if r.get("parsed_valid")]
             if _real:
                 _l = _real[-1]
-                _d = _l.get("deduped_rows") or 0
+                # 11/19/2026 fix: CDC rows must rate against cdc_rows (the
+                # post-anti-join batch actually parsed). deduped_rows counts
+                # unchanged re-dumped payloads the anti-join legitimately
+                # skips — measured: mdl_users nightly CDC is 117 new payloads
+                # inside a 26,317-payload dump (117/117 parsed = 100%), but
+                # against deduped_rows it printed as '0.4% degrading'. FULL
+                # runs and pre-11/17 rows have cdc_rows NULL → deduped_rows.
+                _d = _l.get("cdc_rows")
+                if _d is None:
+                    _d = _l.get("deduped_rows") or 0
                 if _d and (_l["parsed_valid"] / _d) < parse_rate_alert:
                     _probs.append(f"parse rate {_l['parsed_valid'] / _d:.1%} "
                                   f"on last batch — ladder/discovery degrading")
@@ -4724,6 +4802,105 @@ def engine_health_report(check_bronze_freshness=True,
                         [f"{_total:,} rows — review volume"]
         except Exception as _qe:
             print(f"  ℹ️ {_label} check skipped ({str(_qe)[:60]})")
+
+    # ---- rung-mix flips (9) — 11/19/2026 ----------------------------------
+    # CONSUMPTION for rung telemetry (detection without consumption was the
+    # last known gap): _run_log.rung_stats is written by every parse since
+    # 11/19/2026 — NULL before that = PRE-TELEMETRY, excluded from baselines
+    # (never treated as zero). Baseline: trailing 7 days of rung_stats rows
+    # per source. Flags, strongest first:
+    #   (a) NEW RUNG VALUE — a value today the 7-day baseline never saw:
+    #       vendor change on the repair-ladder axis ('exception' = the
+    #       11/19 blanket fail-safe catching something new)
+    #   (b) NULL-RUNG SPIKE — fail-safe/unparsed rows on a source whose
+    #       baseline was clean
+    #   (c) SHARE SHIFT — any rung's share of the mix moved more than
+    #       rung_mix_shift_alert points
+    # One telemetry run per source so far → 'establishing baseline', no alarm.
+    _mix_rows = [r for r in _rows if r.get("rung_stats")]
+    if _mix_rows:
+        _by_s_mix = {}
+        for r in _mix_rows:
+            _by_s_mix.setdefault(r.get("silver_name"), []).append(r)
+        _cut = _now - timedelta(days=7)
+        for _s, _rs in sorted(_by_s_mix.items()):
+            _rs.sort(key=lambda r: str(r.get("logged_at")))
+            _latest = _rs[-1]
+            try:
+                _l_mix = json.loads(_latest["rung_stats"])
+            except Exception:
+                continue
+            if not isinstance(_l_mix, dict) or not _l_mix:
+                continue
+            _base_rows = [r for r in _rs[:-1]
+                          if (_dt(r.get("logged_at")) or _now) >= _cut]
+            if not _base_rows:
+                print(f"  🟡 rung mix {_s}: establishing baseline "
+                      f"({len(_rs)} telemetry run(s)) — "
+                      f"{json.dumps(_l_mix, sort_keys=True)}")
+                continue
+            _base_mix = {}
+            for r in _base_rows:
+                try:
+                    _bm = json.loads(r["rung_stats"])
+                except Exception:
+                    continue
+                for _k, _v in (_bm or {}).items():
+                    _base_mix[_k] = _base_mix.get(_k, 0) + _v
+            _l_tot = sum(_l_mix.values()) or 1
+            _b_tot = sum(_base_mix.values()) or 1
+            _pm = []
+            _new = sorted(set(_l_mix) - set(_base_mix))
+            if _new:
+                _pm.append(f"NEW rung value(s) {_new} vs 7-day baseline "
+                           f"{sorted(_base_mix)} — vendor/repair drift")
+            if _l_mix.get("null") and not _base_mix.get("null"):
+                _pm.append(f"null-rung (fail-safe/unparsed) {_l_mix['null']} row(s) "
+                           "on a previously clean source")
+            for _k in sorted(_l_mix):
+                if _k in _new or (_k == "null" and not _l_mix[_k]):
+                    continue
+                _shift = (100.0 * _l_mix[_k] / _l_tot
+                          - 100.0 * _base_mix.get(_k, 0) / _b_tot)
+                if abs(_shift) > rung_mix_shift_alert:
+                    _pm.append(f"rung {_k} share moved {_shift:+.0f} points")
+            if _pm:
+                _findings[f"rung-mix:{_s}"] = _pm
+                print(f"  🔴 rung mix {_s}: " + "; ".join(_pm))
+            else:
+                print(f"  🟢 rung mix {_s}: stable vs 7-day baseline — "
+                      f"{json.dumps(_l_mix, sort_keys=True)}")
+    else:
+        print("  🟡 rung mix: no telemetry rows yet "
+              "(rung_stats NULL = pre-11/19 rows only)")
+
+    # ---- event-time format + field budget (10, 11) — 11/19/2026 -----------
+    # The two CHEAP cell-11 detectors promoted to NIGHTLY consumption (one
+    # aggregation per silver parent / one run-log read). The functions stay
+    # DEFINED in cell 11 — this cell only CALLS them (define vs. consume).
+    #   10. EVENT-TIME FORMAT — survivorship orders STRING event times; mixed
+    #       format classes/lengths in one column = the WRONG row can survive
+    #       as 'current', silently. Fleet = SILVER_MERGE_KEYS parents.
+    #   11. FIELD BUDGET — tables over field_budget fields discovered: where
+    #       'every field is a column' should give way to a MAP/sidecar tail.
+    try:
+        for _s in sorted(set(SILVER_MERGE_KEYS.keys())):
+            try:
+                _etf = audit_event_time_format(_s, quiet=True)
+                if _etf:
+                    _findings[f"event-time-format:{_s}"] = _etf
+            except Exception as _ete:
+                print(f"  ℹ️ event-time format {_s} skipped ({str(_ete)[:60]})")
+    except Exception as _ete2:
+        print(f"  ℹ️ event-time format check skipped ({str(_ete2)[:60]})")
+    try:
+        _over_budget = check_field_budget(field_budget=field_budget)
+        if _over_budget:
+            _findings["field-budget"] = [
+                f"{t}: over {field_budget} fields — MAP/sidecar tail time"
+                for t in _over_budget]
+    except Exception as _fbe:
+        print(f"  ℹ️ field budget check skipped ({str(_fbe)[:60]})")
 
     _n = len(_findings)
     print(f"\n🩺 VERDICT: {'🔴 ' + str(_n) + ' finding(s) — investigate before trusting silver' if _n else '🟢 fleet clean'}")

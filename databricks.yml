@@ -1,5 +1,5 @@
 # Student Engagement Pipeline — Declarative Automation Bundle (DAB).
-# The nightly job (36 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
+# The nightly job (38 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
 # Deploy from a local clone: databricks bundle deploy --target prod   (see DEPLOY.md)
 
 bundle:
@@ -189,6 +189,17 @@ resources:
         #     now source gold.lead_dim (all-leads spine population)
         #   * gold_calendly_metric depends on silver_calendly ONLY — 3_10 re-keyed
         #     per invitee email (reads nothing else; no identity-spine input) ----------
+        # 3_20 (11/19/2026): gold_lead_merge_map — loser→winner map from silver
+        # LeadMerge completed events (chain-resolved root winner, cycle-guarded).
+        # Report-only lookup: lead rows are never deleted; consumers fold through
+        # COALESCE(merged_into_lead_id, lead_id) — 3_04 lead_dim carries the
+        # column (CC book: 1,390 leads = 1,388 persons). 3_13/3_14 adoption
+        # deferred: rerouting engagement would reversion the SCD2 profile.
+        - task_key: gold_lead_merge_map
+          depends_on:
+            - task_key: silver_user_mapping
+          notebook_task:
+            notebook_path: 3_Gold/3_20_Gold_lead_merge_map.ipynb
         - task_key: gold_staff_dim
           depends_on:
             - task_key: silver_user_mapping
@@ -200,6 +211,7 @@ resources:
           depends_on:
             - task_key: silver_user_mapping
             - task_key: gold_staff_emails
+            - task_key: gold_lead_merge_map
           notebook_task:
             notebook_path: 3_Gold/3_04_Gold_lead_dim.ipynb
         - task_key: gold_staff_emails
