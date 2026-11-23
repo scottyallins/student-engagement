@@ -1379,6 +1379,94 @@ def _registry_write(silver_name, struct_type):
         _rows, schema="silver_name STRING, field_name STRING, ddl_type STRING"
     ).write.format("delta").mode("append").saveAsTable(_SCHEMA_REGISTRY)
 
+# --- 11/24/2026 KEY-ENTROPY AIRBAG (halting pair of detect_dynamic_key_maps) ---
+class KeyEntropyError(RuntimeError):
+    """Raised by _guard_key_entropy: >= 10 brand-new field names under one
+    parent in a single batch, most matching VALUE patterns (dates, UUIDs,
+    digits, emails) — the key-is-data signature. The registry was NOT
+    written and nothing was parsed into one-off columns; build a MAP / KV
+    child-table extraction for that struct, then re-run."""
+
+
+_KEY_VALUE_RES = None  # compiled lazily — no import-time regex cost
+
+
+def _guard_key_entropy(silver_name, discovered_st, min_new_keys=10,
+                       pattern_frac=0.5, max_depth=3):
+    """11/24/2026 — HALTING dynamic-key airbag, called in parse_bronze_table
+    BEFORE _registry_union/_registry_write absorb a discovery. Fires when one
+    parent level (top level, or a struct / array<struct> child) gains >=
+    min_new_keys BRAND-NEW names in a single batch and >= pattern_frac of
+    them match value signatures — dates, UUIDs, pure digits, emails — i.e.
+    the payload is using DATA as keys ("2026-11-21_usr_99": {...}). Left
+    alone, the grow-only registry would pin those keys as columns FOREVER
+    (the every-field-a-column wall; a rebuild can't unlearn them) and
+    health check #11's field budget reports it after the fact. Known-good
+    fields never trip it (newness is vs the registry); a genuine new nested
+    object with < 10 fields never trips it; the guard's own failure never
+    blocks the parse (telemetry contract)."""
+    global _KEY_VALUE_RES
+    import re as _re
+    try:
+        if _KEY_VALUE_RES is None:
+            _KEY_VALUE_RES = [
+                _re.compile(r"^\d{4}-\d{2}-\d{2}", _re.I),        # dates/datetimes
+                _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                            r"[0-9a-f]{4}-[0-9a-f]{12}$", _re.I),   # UUIDs
+                _re.compile(r"^\d+$"),                              # pure digits (ids)
+                _re.compile(r"^[^@\s]+@[^@\s]+\.\w+$", _re.I),   # emails
+            ]
+        _prior = _registry_read(silver_name) or {}
+
+        def _children(st, depth, path):
+            """Yield (parent_path, [new child names]) for struct levels."""
+            if not isinstance(st, StructType) or depth > max_depth:
+                return
+            for f in st.fields:
+                _t = f.dataType
+                if isinstance(_t, ArrayType):
+                    _t = _t.elementType
+                if not isinstance(_t, StructType):
+                    continue
+                _pd = _prior.get(f.name)
+                _kids = [c.name for c in _t.fields]
+                _new = list(_kids)
+                if _pd:
+                    _t2 = str(_pd)
+                    if _t2.startswith("array<"):
+                        _t2 = _t2[6:-1].strip()
+                    try:
+                        _known = {c.name for c in StructType.fromDDL(_t2).fields}
+                    except Exception:
+                        _known = {c for c in _kids if c in _t2}
+                    _new = [c for c in _kids if c not in _known]
+                yield (path + f.name, _new)
+                yield from _children(_t, depth + 1, path + f.name + ".")
+
+        _groups = [("<top-level>", [f.name for f in discovered_st.fields
+                                     if f.name not in _prior])]
+        _groups += list(_children(discovered_st, 1, ""))
+        for _parent, _names in _groups:
+            if len(_names) < min_new_keys:
+                continue
+            _hits = [n for n in _names if any(p.match(n) for p in _KEY_VALUE_RES)]
+            if len(_hits) >= pattern_frac * len(_names):
+                raise KeyEntropyError(
+                    f"KEY-ENTROPY HALT {silver_name}: {len(_hits)} of {len(_names)} "
+                    f"brand-new field names under '{_parent}' look like VALUES "
+                    f"(dates/UUIDs/digits/emails — e.g. {sorted(_hits)[:5]}). The key "
+                    f"is data; flattening it would pin one-off columns into the "
+                    f"grow-only registry forever. Registry NOT written, nothing "
+                    f"parsed. Build a MAP / KV child-table extraction for that "
+                    f"level, then re-run. See detect_dynamic_key_maps / "
+                    f"check_field_budget.")
+    except KeyEntropyError:
+        raise
+    except Exception as _ke:
+        # telemetry contract: the guard itself must never block the pipeline
+        print(f"  ℹ️ key-entropy guard skipped ({str(_ke)[:60]})")
+
+
 def _registry_union(silver_name, discovered_st, _prior_override=None):
     """11/17/2026 — union discovered schema with the registry's prior
     knowledge. Registry fields absent from THIS discovery are re-added
@@ -1544,6 +1632,94 @@ def _guard_grain_shift(df, pk, silver_name, ratio, mode="CDC",
     except Exception as _ge:
         # telemetry contract: the guard itself must never block the pipeline
         print(f"  ℹ️ grain-shift guard skipped ({str(_ge)[:60]})")
+
+# --- 11/24/2026 MAGNITUDE-DRIFT AIRBAG (silent 100x / 1000x unit shifts) ---
+class MagnitudeDriftError(RuntimeError):
+    """Raised by _guard_magnitude_drift: a numeric field's batch median is
+    ~100x or ~1000x its sticky _field_baselines median — dollars <-> cents,
+    seconds <-> milliseconds — with the column NAME and TYPE unchanged, so
+    nothing else can catch it. Nothing was written; fix the source or the
+    transform, then re-run."""
+
+
+def _guard_magnitude_drift(df, silver_name, value_col="value",
+                           min_nonnull=20, factors=(100.0, 1000.0),
+                           tol=3.0, accuracy=100):
+    """11/24/2026 — HALTING magnitude airbag, called in parse_bronze_table
+    beside _guard_grain_shift (after the run-log row, before the silver
+    write). Cost on a clean run: ONE extra batch scan (percentile medians
+    for the value struct's numeric fields; the grain guard already scans
+    twice). Baselines live in {SILVER_SCHEMA}._field_baselines and are
+    STICKY — the first median seen is the anchor, never auto-updated, so
+    gradual growth can't mask a step change; an operator resets an anchor
+    by deleting its row. Gates: >= min_nonnull non-null values in the
+    batch; POSITIVE baseline and median (currency/epoch scales only —
+    signed deltas are anchored but never compared); ratio within
+    [factor/tol, factor*tol] or its inverse. The guard's own failure never
+    blocks the pipeline (telemetry contract)."""
+    from pyspark.sql import functions as _F
+    from pyspark.sql.types import (ByteType, DecimalType, DoubleType,
+                                   FloatType, IntegerType, LongType,
+                                   ShortType)
+    from datetime import datetime, timezone
+    try:
+        _st = df.schema[value_col].dataType if value_col in df.columns else None
+        if not isinstance(_st, StructType):
+            return
+        _nums = [f.name for f in _st.fields
+                 if isinstance(f.dataType, (ByteType, ShortType, IntegerType,
+                                            LongType, FloatType, DoubleType,
+                                            DecimalType))]
+        if not _nums:
+            return  # O(1): nothing numeric to guard
+        _exprs = []
+        for _n in _nums:
+            _c = _F.col(value_col).getField(_n)
+            _exprs += [_F.percentile_approx(_c, 0.5, accuracy).alias(f"m_{_n}"),
+                       _F.count(_c).alias(f"c_{_n}")]
+        _row = df.agg(*_exprs).first()
+        _bt = f"{CATALOG}.{SILVER_SCHEMA}._field_baselines"
+        _base = {}
+        if spark.catalog.tableExists(_bt):
+            _base = {r["field_name"]: float(r["median_value"])
+                    for r in spark.table(_bt)
+                    .where(col("silver_name") == silver_name).collect()}
+        _ins = []
+        for _n in _nums:
+            _m = _row[f"m_{_n}"]
+            if _m is None or (_row[f"c_{_n}"] or 0) < min_nonnull:
+                continue
+            _m = float(_m)
+            if _n in _base:
+                _b = _base[_n]
+                if not _b or _b <= 0 or _m <= 0:
+                    continue
+                _r = _m / _b
+                for _f in factors:
+                    _inv = 1.0 / _r if _r else 0.0
+                    if (_f / tol <= _r <= _f * tol) or (_f / tol <= _inv <= _f * tol):
+                        raise MagnitudeDriftError(
+                            f"MAGNITUDE-DRIFT HALT {silver_name}.{_n}: batch median "
+                            f"{_m:,.2f} is ~{_f:,.0f}x the baseline {_b:,.2f} "
+                            f"(ratio {_r:,.1f}). Name and type are unchanged — a "
+                            f"unit shift (cents<->dollars, seconds<->millis) nothing "
+                            f"else can catch. Nothing was written. Fix the source/"
+                            f"transform, or reset the anchor by deleting its row in "
+                            f"{SILVER_SCHEMA}._field_baselines, then re-run.")
+            else:
+                _ins.append((silver_name, _n, _m,
+                             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+        if _ins:
+            spark.createDataFrame(_ins, schema=("silver_name STRING, field_name STRING, "
+                                                "median_value DOUBLE, anchored_at STRING")) \
+                 .write.format("delta").mode("append").saveAsTable(_bt)
+            print(f"  📐 Magnitude anchors set: {len(_ins)} numeric field(s) "
+                  f"first-seen in {silver_name} (no comparison yet)")
+    except MagnitudeDriftError:
+        raise
+    except Exception as _me:
+        # telemetry contract: the guard itself must never block the pipeline
+        print(f"  ℹ️ magnitude-drift guard skipped ({str(_me)[:60]})")
 
 
 def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, only_payload_hashes=None):
@@ -1959,10 +2135,15 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     if silver_name:
         try:
             if isinstance(deduped_st, StructType):
+                # 11/24/2026 — KEY-ENTROPY AIRBAG: halt BEFORE the union/write
+                # absorb dynamic keys (see _guard_key_entropy).
+                _guard_key_entropy(silver_name, deduped_st)
                 deduped_st = _registry_union(silver_name, deduped_st)
                 _registry_write(silver_name, deduped_st)
             else:
                 print("  ℹ️ Schema registry skipped (DDL-string fallback schema)")
+        except KeyEntropyError:
+            raise  # 11/24 — the airbag's halt must not be swallowed here
         except Exception as _reg_e:
             print(f"  ⚠️ Schema registry unavailable ({str(_reg_e)[:70]}) — using discovered schema only")
 
@@ -2301,6 +2482,9 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     # re-processes once a human decides.
     _guard_grain_shift(df_flat, _grain_pk, silver_name or bronze_table, _grain,
                       mode=("CDC" if watermark else "FULL"))
+    # 11/24/2026 — MAGNITUDE-DRIFT AIRBAG: same fail-closed position (after
+    # the run-log row, before the silver write) — see _guard_magnitude_drift.
+    _guard_magnitude_drift(df_flat, silver_name or bronze_table)
     return df_flat
 
 # COMMAND ----------
@@ -5255,17 +5439,22 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #    Schema, types and names all pass — Gold revenue spikes 100x
 # MAGIC #    overnight. Fix: magnitude bounds (p50 / min-max scale) per column
 # MAGIC #    fingerprint -> DRIFT_POLICY before Gold writes.
-# MAGIC #    STATUS: partial — detect_epoch_unit_drift exists; general magnitude
-# MAGIC #    bounds not built.
+# MAGIC #    STATUS: BUILT 11/24 (HALTING) — _guard_magnitude_drift compares batch
+# MAGIC #    medians vs sticky _field_baselines anchors (~100x / ~1000x, tolerance
+# MAGIC #    3x, one extra batch scan, positive scales only); first-seen fields
+# MAGIC #    anchor without comparing. detect_epoch_unit_drift stays as the nightly
+# MAGIC #    report.
 # MAGIC
 # MAGIC # 4. DYNAMIC KEY EXPLOSION (data values as JSON keys)
 # MAGIC #    'responses': {'2026-11-20_usr_9912': {...}} flattens into 10k sparse
 # MAGIC #    columns -> Delta metadata blowup. Fix: key-entropy check (>50% of a
 # MAGIC #    map's keys match value patterns) -> auto-convert the struct to
 # MAGIC #    MAP<STRING,STRING> or a key-value child table.
-# MAGIC #    STATUS: partial — detect_dynamic_key_maps + check_field_budget
-# MAGIC #    exist (field budget is consumed nightly by the health report); the
-# MAGIC #    auto-conversion is not built.
+# MAGIC #    STATUS: BUILT 11/24 (HALTING) — _guard_key_entropy halts BEFORE the
+# MAGIC #    registry absorbs >= 10 brand-new value-patterned names (>= 50% date/
+# MAGIC #    UUID/digit/email) under one parent; the MAP conversion itself stays
+# MAGIC #    manual (build it, then re-run). detect_dynamic_key_maps +
+# MAGIC #    check_field_budget stay as the nightly reports.
 # MAGIC
 # MAGIC # 5. SPARSE PATCH OVERWRITES PUT (UPDATE SET * nulls valid fields)
 # MAGIC #    order.updated webhooks carry 2 of 20 fields; a blanket MERGE wipes
@@ -5283,10 +5472,11 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC # DEFENSE MATRIX (which layer guards what):
 # MAGIC #   Syntax    malformed quotes/wrappers -> repair ladder      -> parse_quarantine
 # MAGIC #   Identity  column renames            -> col_uid registry   -> gold_drift_quarantine
-# MAGIC #   Structure dynamic keys              -> key entropy        -> check_field_budget
+# MAGIC #   Structure dynamic keys              -> key entropy        -> halt before registry write (11/24)
 # MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt before silver write (11/24)
 # MAGIC #   Timing    late/out-of-order events   -> arrival watermark  -> guarded MERGE
-# MAGIC #   Semantics unit flips / patch nulls   -> fingerprint        -> DRIFT_POLICY
+# MAGIC #   Semantics unit flips                -> magnitude medians   -> halt (11/24)
+# MAGIC #   Semantics patch nulls (sparse put)    -> merge_mode         -> NOT BUILT (T5)
 # MAGIC
 # MAGIC # ROADMAP (same threads):
 # MAGIC #   - Declarative config: move registry rules, aliases and drift
