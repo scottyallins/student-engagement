@@ -1474,6 +1474,77 @@ _gr_uniq = spark.createDataFrame([("a", 1), ("b", 2), ("c", 3)], ["k", "v"])
 assert _grain_ratio(_gr_uniq, "k") == 1.0, "entity-grain batch must ratio 1.0"
 print("  PASS  11/23: grain ratio (rows/distinct-pk) telemetry contract")
 
+# --- 11/24/2026 GRAIN-SHIFT AIRBAG (halting pair of nightly health check #12) ---
+# Check #12 REPORTS the spike the next morning; this guard HALTS the write as
+# it happens. Same numbers (2x, 7-day baseline) so the report and the halt
+# can never disagree.
+
+
+class GrainShiftError(RuntimeError):
+    """Raised by _guard_grain_shift: the batch's rows/distinct-PK is >= 2x
+    the matured 7-day baseline — probable entity->event grain flip
+    (_latest_per_pk survivorship would silently collapse the repeats).
+    Fail-closed: nothing is written; the batch stays in bronze and
+    re-processes once a human decides — real flip -> rebuild at event
+    grain, benign double-dump -> plain re-run."""
+
+
+def _guard_grain_shift(df, pk, silver_name, ratio, mode="CDC",
+                       window_days=7, min_baseline_days=5,
+                       min_distinct_pks=20, threshold=2.0):
+    """11/24/2026 — HALTING grain-shift airbag. Noise gates, all must hold:
+      * CDC batches only (mode='CDC'): FULL/rebuild batches re-process
+        multi-version history and legitimately carry ratio > 1;
+      * ratio >= threshold — O(1) fast path, 0ms on clean runs (a ratio
+        below 2 can never be 2x a >= 1.0 baseline);
+      * >= min_baseline_days DISTINCT telemetry days in the window — thin
+        history never halts (fresh telemetry stays inert until it ripens,
+        so this airbag armed itself ~a week after the 11/23 deploy);
+      * >= min_distinct_pks distinct PKs in THIS batch — a tiny increment
+        must not halt the fleet;
+      * ratio >= threshold x median baseline of the window.
+    The guard's own failure never blocks the pipeline (telemetry
+    contract); only a genuine hit raises."""
+    from datetime import datetime, timedelta, timezone
+    from statistics import median
+    try:
+        if mode != "CDC" or pk is None or ratio is None or ratio < threshold:
+            return
+        _rl = f"{CATALOG}.{SILVER_SCHEMA}._run_log"
+        if not spark.catalog.tableExists(_rl):
+            return
+        _hist = [(str(r["logged_at"])[:10], float(r["grain_ratio"]))
+                 for r in spark.table(_rl)
+                 .where((col("silver_name") == silver_name)
+                        & col("grain_ratio").isNotNull()).collect()]
+        _cutoff = (datetime.now(timezone.utc)
+                   - timedelta(days=window_days)).strftime("%Y-%m-%d")
+        _win = [r for d, r in _hist if d >= _cutoff]
+        _ndays = len({d for d, r in _hist if d >= _cutoff})
+        if _ndays < min_baseline_days:
+            return
+        _base = median(_win)
+        if _base <= 0 or ratio < threshold * _base:
+            return
+        _d = df.select(pk).distinct().count()
+        if _d < min_distinct_pks:
+            print(f"  ℹ️ grain {ratio:.2f} >= {threshold:.0f}x baseline "
+                  f"{_base:.2f} but only {_d} distinct PK(s) (< {min_distinct_pks}) "
+                  f"— below halt floor, report-only")
+            return
+        raise GrainShiftError(
+            f"GRAIN-SHIFT HALT {silver_name}: batch grain_ratio {ratio:.2f} is "
+            f">= {threshold:.0f}x the {window_days}-day baseline {_base:.2f} "
+            f"(median over {_ndays} telemetry day(s), {_d} distinct PKs). "
+            f"Nothing was written; the batch stays in bronze. Decide, then "
+            f"re-run: real entity->event flip -> rebuild at event grain; "
+            f"benign double-dump -> plain re-run. See health check #12.")
+    except GrainShiftError:
+        raise
+    except Exception as _ge:
+        # telemetry contract: the guard itself must never block the pipeline
+        print(f"  ℹ️ grain-shift guard skipped ({str(_ge)[:60]})")
+
 
 def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, only_payload_hashes=None):
     """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse.
@@ -2207,9 +2278,11 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     # find_pk (NULL-tolerant, sampled); a telemetry failure never blocks
     # the parse (same contract as the rest of the run log).
     try:
-        _grain = _grain_ratio(df_flat, find_pk(df_flat))
+        _grain_pk = find_pk(df_flat)
+        _grain = _grain_ratio(df_flat, _grain_pk)
     except Exception as _ge:
         _grain = None
+        _grain_pk = None
         print(f"  ℹ️ grain telemetry skipped ({str(_ge)[:60]})")
     # 11/17/2026 — run-log row for the successful parse (fleet telemetry;
     # see _run_log_write). Volume-anomaly and convergence alerting read this.
@@ -2221,6 +2294,13 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                    fields_discovered=(len(deduped_st.fields) if isinstance(deduped_st, StructType) else None),
                    parsed_valid=valid, parsed_null=_quarantined_n, quarantined_new=_new_q_n,
                    rung_stats=_rung_stats, grain_ratio=_grain, note=_tc_note)
+    # 11/24/2026 — GRAIN-SHIFT AIRBAG: halting sibling of health check #12.
+    # Runs AFTER the run-log row (the spiked batch lands on the telemetry
+    # record) and BEFORE df_flat returns for the silver write — a raise here
+    # means NOTHING is written for this table; the batch stays in bronze and
+    # re-processes once a human decides.
+    _guard_grain_shift(df_flat, _grain_pk, silver_name or bronze_table, _grain,
+                      mode=("CDC" if watermark else "FULL"))
     return df_flat
 
 # COMMAND ----------
@@ -4158,21 +4238,29 @@ def replay_quarantined(bronze_table, silver_name=None, flatten=False):
         _CDC_WATERMARK = _saved_wm
 
 
-def cleanup_orphaned_temp_tables():
-    """11/17/2026 — engine-start sweep: crash-orphaned _tmp_* / _stg_*
-    tables in the silver schema are dropped at load time (a crash between
-    a write and the finally-cleanup used to leave them accumulating run
-    over run). NOTE: if you ever run two CONCURRENT pipelines sharing this
-    silver schema, remove the auto-call below — it would drop the other
-    run's in-flight staging tables (today's max_concurrency=1 deployment
-    is safe by construction)."""
+def cleanup_orphaned_temp_tables(max_age_hours: int = 12):
+    """11/17/2026 — engine-start sweep; AGE-GATED 11/24/2026: drops only
+    _tmp_*/_stg_* tables older than max_age_hours (created_at). The 11/17
+    per-run name suffix stopped name collisions between runs but NOT this
+    sweep: the job's silver/gold tasks load the engine as PARALLEL sessions
+    sharing this schema, and a late-importing session's load-time sweep
+    dropped three tasks' IN-FLIGHT staging tables during the 11/23 repair
+    (silver_activities attempt 2, run 811982374142191, TABLE_OR_VIEW_NOT_FOUND
+    on _tmp_lead_activites_raw_36291789). In-flight tables are minutes old;
+    crash orphans are hours/days old — the age gate separates them."""
     try:
-        _orphans = [t.name for t in spark.catalog.listTables(f"{CATALOG}.{SILVER_SCHEMA}")
-                    if t.name.startswith(("_tmp_", "_stg_"))]
+        _orphans = [r["table_name"] for r in spark.sql(f"""
+            SELECT table_name
+            FROM system.information_schema.tables
+            WHERE table_catalog = '{CATALOG}' AND table_schema = '{SILVER_SCHEMA}'
+              AND substring(table_name, 1, 5) IN ('_tmp_', '_stg_')
+              AND created < current_timestamp() - INTERVAL {max_age_hours} HOURS
+        """).collect()]
         for _o in _orphans:
             spark.sql(f"DROP TABLE IF EXISTS {CATALOG}.{SILVER_SCHEMA}.{_o}")
         if _orphans:
-            print(f"  🧹 Dropped {len(_orphans)} orphaned temp/staging table(s): "
+            print(f"  🧹 Dropped {len(_orphans)} orphaned temp/staging table(s) "
+                  f"(> {max_age_hours}h old): "
                   f"{_orphans[:6]}{' …' if len(_orphans) > 6 else ''}")
     except Exception as _ce:
         print(f"  ⚠️ orphan temp cleanup skipped ({str(_ce)[:60]})")
@@ -5136,6 +5224,7 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #            implementations were never grafted into this engine),
 # MAGIC #            COLUMN_ALIASES, learned_aliases, canonical_hash_udf,
 # MAGIC #            the Tier-3 auto-heal loop, gold_drift_quarantine routing
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -5148,9 +5237,10 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC # 1. GRAIN FLIP (1 row per entity -> 1 per event/line item)
 # MAGIC #    _latest_per_pk survivorship silently collapses repeats (49 of 50 rows
 # MAGIC #    gone); child joins can fan out and inflate Gold 10x.
-# MAGIC #    STATUS: BUILT 11/23 — _run_log.grain_ratio + engine_health_report
-# MAGIC #    check #12 (report-only by design; benign double-dumps also spike —
-# MAGIC #    the operator judges, nothing halts).
+# MAGIC #    STATUS: BUILT 11/23 (telemetry + nightly report) and 11/24 HALTING —
+# MAGIC #    _guard_grain_shift raises before the silver write on a matured 7-day
+# MAGIC #    2x spike (CDC batches only, >= 5 telemetry days, >= 20 distinct PKs
+# MAGIC #    noise floors); below the floors it stays report-only.
 # MAGIC
 # MAGIC # 2. LATE / OUT-OF-ORDER EVENTS crossing the watermark
 # MAGIC #    An 11:55 PM webhook retry lands 12:15 AM, after the watermark moved
@@ -5194,7 +5284,7 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #   Syntax    malformed quotes/wrappers -> repair ladder      -> parse_quarantine
 # MAGIC #   Identity  column renames            -> col_uid registry   -> gold_drift_quarantine
 # MAGIC #   Structure dynamic keys              -> key entropy        -> check_field_budget
-# MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt _latest_per_pk (ours: report)
+# MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt before silver write (11/24)
 # MAGIC #   Timing    late/out-of-order events   -> arrival watermark  -> guarded MERGE
 # MAGIC #   Semantics unit flips / patch nulls   -> fingerprint        -> DRIFT_POLICY
 # MAGIC
