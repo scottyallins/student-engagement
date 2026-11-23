@@ -45,10 +45,11 @@ SILVER_SCHEMA = "silver"
 # mid-read (fixed names collided).
 _RUN_ID = uuid.uuid4().hex[:8]
 
-# Cache registry: parse_bronze_table caches its pre-repair DataFrame here;
-# the process_table cleanup guard (Orchestrator cell) unpersists them, so the
-# repeated count() actions reuse ONE materialization and nothing leaks
-# across tables.
+# Cache registry — RETIRED 11/23/2026: nothing appends to this anymore
+# (cache() removed from parse_bronze_table; see the dated note there — on
+# serverless each cached DataFrame costs a leaked session schema until
+# Databricks garbage-collects them). Kept as an empty list so the
+# _cleanup_run() uncache loop stays a harmless no-op.
 _CACHED_DFS = []
 
 # SQL identifier guard — anything interpolated into DDL/MERGE text is
@@ -1542,12 +1543,16 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                 if _after < _dedup_total:
                     print(f"  🔁 CDC dedup: {_dedup_total:,} → {_after:,} rows (versions already in silver skipped)")
 
-    # 11/17/2026 — ONE materialization for the count/action cascade: the df
-    # is cached and registered in _CACHED_DFS (the process_table cleanup
-    # guard uncache()s it later). Previously every count()/collect() action
-    # re-ran the dedup window + CDC anti-join from scratch.
-    df = df.cache()
-    _CACHED_DFS.append(df)
+    # 11/23/2026 — cache() REMOVED. On serverless, every .cache()/.persist()
+    # materializes into a per-session schema inside the workspace's internal
+    # temp-table-manager catalog. Those session schemas were not garbage-
+    # collected (50 leaked Nov 18–21), the catalog's 50-schema quota refused
+    # the 51st, and every silver task failed on the Nov 22 & Nov 23 8AM runs
+    # (QUOTA_EXCEEDED — Cannot create 1 Schema(s), estimated 51, limit 50).
+    # Actions now re-run the dedup window + CDC anti-join as they did before
+    # 11/17/2026; measured cost is seconds per table on incremental batches.
+    # Do NOT re-add .cache()/.persist()/CACHE TABLE anywhere on serverless
+    # without checking that quota first.
 
     # Quick check for data
     sample_row = df.select("raw_data").filter(col("raw_data").isNotNull()).first()
