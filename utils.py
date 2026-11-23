@@ -1408,7 +1408,7 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
                    deduped_rows=None, cdc_rows=None, repair_needed=None,
                    discovery_mode=None, fields_discovered=None,
                    parsed_valid=None, parsed_null=None, quarantined_new=None,
-                   note=None, rung_stats=None):
+                   note=None, rung_stats=None, grain_ratio=None):
     """11/17/2026 — RUN LOG: one row per parse run, appended to
     {SILVER_SCHEMA}._run_log (rows in / deduped / CDC / parsed /
     quarantined / fields / discovery mode / note / rung mix). The fleet's nervous
@@ -1419,7 +1419,10 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
     the pipeline.
     11/19/2026 — rung_stats: NULL on rows logged before rung telemetry
     (11/19) means PRE-TELEMETRY, not zero. Any mix-over-time query must
-    exclude NULLs or the history silently biases toward zero."""
+    exclude NULLs or the history silently biases toward zero.
+    11/23/2026 — grain_ratio (rows/distinct pk on the batch sent onward):
+    NULL before 11/23 or when no PK is detectable — also PRE-TELEMETRY,
+    not zero; the grain-shift health check reads it."""
     try:
         from datetime import datetime, timezone
         spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
@@ -1430,19 +1433,46 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
               raw_rows, deduped_rows, cdc_rows, repair_needed,
               discovery_mode, fields_discovered,
               parsed_valid, parsed_null, quarantined_new, note,
-              rung_stats)],
+              rung_stats, grain_ratio)],
             schema=("run_id STRING, logged_at STRING, bronze_table STRING, "
                     "silver_name STRING, mode STRING, raw_rows BIGINT, "
                     "deduped_rows BIGINT, cdc_rows BIGINT, repair_needed BOOLEAN, "
                     "discovery_mode STRING, fields_discovered INT, "
                     "parsed_valid BIGINT, parsed_null BIGINT, "
-                    "quarantined_new BIGINT, note STRING, rung_stats STRING")
+                    "quarantined_new BIGINT, note STRING, rung_stats STRING, "
+                    "grain_ratio DOUBLE")
         ).write.format("delta").mode("append").option(
             # 11/19 — rung_stats column evolves the existing _run_log table
             "mergeSchema", "true").saveAsTable(
             f"{CATALOG}.{SILVER_SCHEMA}._run_log")
     except Exception as _le:
         print(f"  ⚠️ run log skipped ({str(_le)[:60]})")
+
+
+def _grain_ratio(df, pk):
+    """11/23/2026 — CARDINALITY TELEMETRY: rows / distinct pk on the batch
+    actually sent onward (post dedup + CDC). ~1.0 for entity-grain sources;
+    a sustained spike is the silent grain-flip tripwire (entity -> event
+    grain) that _latest_per_pk survivorship would otherwise erase
+    invisibly. None (never 0.0) when pk is None — no detectable PK means
+    no telemetry, not a ratio of zero (the 11/19 denominator lesson)."""
+    if pk is None:
+        return None
+    _n = df.count()
+    _d = df.select(pk).distinct().count()
+    return (float(_n) / _d) if _d else None
+
+
+# --- 11/23/2026 grain-telemetry pin (module-level, registry-union-pin style) ---
+# _grain_ratio contract pinned at import: exact rows/distinct-pk on the batch
+# sent onward; None (never zero) when no PK. A helper refactor can't silently
+# drift the tripwire's math.
+_gr_df = spark.createDataFrame([("a", 1), ("a", 2), ("b", 3)], ["k", "v"])
+assert _grain_ratio(_gr_df, "k") == 1.5, "grain ratio must be rows/distinct-pk"
+assert _grain_ratio(_gr_df, None) is None, "no PK -> NULL telemetry, never zero"
+_gr_uniq = spark.createDataFrame([("a", 1), ("b", 2), ("c", 3)], ["k", "v"])
+assert _grain_ratio(_gr_uniq, "k") == 1.0, "entity-grain batch must ratio 1.0"
+print("  PASS  11/23: grain ratio (rows/distinct-pk) telemetry contract")
 
 
 def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, only_payload_hashes=None):
@@ -2172,6 +2202,15 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
             col("payload_hash"),
             col("parsed").alias("value")
         )
+    # 11/23/2026 — GRAIN TELEMETRY: rows per distinct PK on the batch
+    # actually sent onward — the survivorship-assumption tripwire. Reuses
+    # find_pk (NULL-tolerant, sampled); a telemetry failure never blocks
+    # the parse (same contract as the rest of the run log).
+    try:
+        _grain = _grain_ratio(df_flat, find_pk(df_flat))
+    except Exception as _ge:
+        _grain = None
+        print(f"  ℹ️ grain telemetry skipped ({str(_ge)[:60]})")
     # 11/17/2026 — run-log row for the successful parse (fleet telemetry;
     # see _run_log_write). Volume-anomaly and convergence alerting read this.
     _run_log_write(bronze_table, silver_name or bronze_table,
@@ -2181,7 +2220,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
                    discovery_mode=("FULL" if _SCHEMA_SAMPLE is None else f"SAMPLE {_SCHEMA_SAMPLE}"),
                    fields_discovered=(len(deduped_st.fields) if isinstance(deduped_st, StructType) else None),
                    parsed_valid=valid, parsed_null=_quarantined_n, quarantined_new=_new_q_n,
-                   rung_stats=_rung_stats, note=_tc_note)
+                   rung_stats=_rung_stats, grain_ratio=_grain, note=_tc_note)
     return df_flat
 
 # COMMAND ----------
@@ -4637,7 +4676,8 @@ def engine_health_report(check_bronze_freshness=True,
                          rebuild_storm_max=3,
                          field_jump_alert=10,
                          rung_mix_shift_alert=25,
-                          field_budget=1000):
+                         grain_shift_alert=2.0,
+                         field_budget=1000):
     """Fleet health in one command. Returns a findings dict (empty = clean).
     Per expected bronze table (EXPECTED_BRONZE_TABLES):
       1. MISSING TELEMETRY  — no run-log row ever: bronze load may have
@@ -4668,6 +4708,11 @@ def engine_health_report(check_bronze_freshness=True,
          classes/lengths = the wrong row can survive as 'current'.
      11. FIELD BUDGET — cell-11 check_field_budget: tables over
          field_budget discovered fields — the every-field-a-column wall.
+     12. GRAIN SHIFT — grain_ratio (rows/distinct PK on the batch sent
+         onward) vs 7-day baseline: a ratio spike = possible entity->event
+         grain flip (survivorship would silently collapse repeats; benign
+         double-dump batches also spike — REPORT-ONLY, the operator judges;
+         NULL grain_ratio = pre-11/23 telemetry, excluded from baselines).
     """
     from datetime import datetime, timedelta, timezone
     _findings = {}
@@ -4879,6 +4924,45 @@ def engine_health_report(check_bronze_freshness=True,
         print("  🟡 rung mix: no telemetry rows yet "
               "(rung_stats NULL = pre-11/19 rows only)")
 
+    # ---- grain shift (12) — 11/23/2026 ------------------------------------
+    # CONSUMPTION for grain telemetry: _run_log.grain_ratio (rows/distinct
+    # PK on the batch actually sent onward) is written by every successful
+    # parse since 11/23 — NULL before that = PRE-TELEMETRY, excluded from
+    # baselines (never treated as zero). Protects the core assumption of
+    # _latest_per_pk survivorship: entity grain. An upstream flip to
+    # event/line-item grain arrives here as a ratio spike BEFORE
+    # survivorship silently collapses the repeats. REPORT-ONLY by design
+    # (the 11/19 denominator lesson): benign double-dump batches spike too
+    # — the check surfaces, the operator judges, nothing halts.
+    _grain_rows = [r for r in _rows if r.get("grain_ratio")]
+    if _grain_rows:
+        _by_s_grain = {}
+        for r in _grain_rows:
+            _by_s_grain.setdefault(r.get("silver_name"), []).append(r)
+        _gcut = _now - timedelta(days=7)
+        for _s, _grs in sorted(_by_s_grain.items()):
+            _grs.sort(key=lambda r: str(r.get("logged_at")))
+            _gr = _grs[-1].get("grain_ratio")
+            _gbase = [r.get("grain_ratio") for r in _grs[:-1]
+                      if (_dt(r.get("logged_at")) or _now) >= _gcut
+                      and r.get("grain_ratio")]
+            if not _gbase:
+                print(f"  🟡 grain {_s}: establishing baseline — "
+                      f"rows/PK = {_gr:.2f}")
+                continue
+            _gb = sum(_gbase) / len(_gbase)
+            if _gr >= grain_shift_alert * _gb:
+                _gmsg = (f"rows/PK {_gr:.2f} vs 7-day baseline {_gb:.2f} "
+                         f"(≥{grain_shift_alert:.0f}×) — grain flip? benign "
+                         "if double-dump batch; survivorship collapses repeats")
+                _findings[f"grain-shift:{_s}"] = [_gmsg]
+                print(f"  🔴 grain {_s}: {_gmsg}")
+            else:
+                print(f"  🟢 grain {_s}: rows/PK {_gr:.2f} vs baseline {_gb:.2f}")
+    else:
+        print("  🟡 grain: no telemetry rows yet "
+              "(grain_ratio NULL = pre-11/23 rows only)")
+
     # ---- event-time format + field budget (10, 11) — 11/19/2026 -----------
     # The two CHEAP cell-11 detectors promoted to NIGHTLY consumption (one
     # aggregation per silver parent / one run-log read). The functions stay
@@ -4994,3 +5078,138 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
                       if not isinstance(f.dataType, (ArrayType, StructType)))
         print(f"  -> {len(df.schema.fields)} top-level columns "
               f"({scalars} scalar, {len(df.schema.fields) - scalars} complex)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # ============================================================================
+# MAGIC # REFERENCE — Self-Healing Gold Contract (rename insurance) — design notes
+# MAGIC # ============================================================================
+# MAGIC # Distilled 11/23/2026 from the Nov 20–23 AI threads (emails 'Things',
+# MAGIC # self-sent 11/23 12:14 PM). Design reference — NOT all of this is built;
+# MAGIC # build status verified against this file's code on 11/23 (footer).
+# MAGIC
+# MAGIC # THE GAP: Silver survives upstream column renames (value-based find_pk /
+# MAGIC # find_join_keys + the grow-only _schema_registry). Gold does not — gold
+# MAGIC # mappings read silver by hardcoded column names, so one rename
+# MAGIC # (user_id -> uid) means AnalysisException or silent NULLs downstream.
+# MAGIC
+# MAGIC # THE DESIGN — resolve_gold_columns(), 4-tier resolution (in order):
+# MAGIC #   TIER 1 DIRECT: canonical Gold column present in today's silver ->
+# MAGIC #          pass through. Zero cost when nothing drifted.
+# MAGIC #   TIER 2 ALIAS:  COLUMN_ALIASES {table: {gold_col: [accepted raw
+# MAGIC #          names]}} -> coalesce() across present candidates. Also
+# MAGIC #          stitches mid-history renames where old+new columns coexist.
+# MAGIC #   TIER 3 AUTO-HEAL: yesterday-vs-today value-signature diff, 100%
+# MAGIC #          deterministic (no ML): dropped col vs new col — match on
+# MAGIC #          dtype + pattern signature (UUID / PREFIX_usr / EMAIL /
+# MAGIC #          ISO_DATE / DETECTED_KEY; REUSE find_pk and _looks_like_date,
+# MAGIC #          not separate regexes) + sampled value overlap >= ~25% ->
+# MAGIC #          map + log + persist the learned alias.
+# MAGIC #   TIER 4 UNRESOLVED_NULL: never guess on generic text. Typed NULL +
+# MAGIC #          alert; enforce_gold_contract() circuit breaker halts the Gold
+# MAGIC #          write for unresolved CRITICAL columns and parks the batch in
+# MAGIC #          gold_drift_quarantine (fail closed, zero data loss). Confirm
+# MAGIC #          the pair, add it to COLUMN_ALIASES, replay_quarantined().
+# MAGIC
+# MAGIC # RULES:
+# MAGIC #   - PERSIST auto-heals (learned_aliases in the registry) — otherwise a
+# MAGIC #     full rebuild from Bronze loses the old<->new name link; coalesce
+# MAGIC #     stitches the split timeline back together across eras.
+# MAGIC #   - Zero-overhead-until-needed: no sampling/collect unless a tier fired.
+# MAGIC #   - ML stays a SIDECAR: it reads quarantine/registry/audit outputs and
+# MAGIC #     proposes COLUMN_ALIASES / DRIFT_POLICY config patches for human
+# MAGIC #     validation — it never writes Silver directly.
+# MAGIC
+# MAGIC # END-STATE (the '3D chess' unification — col_uid Semantic Registry):
+# MAGIC #   bind each logical column to a persistent col_uid {canonical_gold_name,
+# MAGIC #   role, observed_names: [cust_id, customer_uuid], value fingerprint}.
+# MAGIC #   Silver unions all observed names; lineage joins on col_uid; Gold
+# MAGIC #   projects coalesce(observed_names). A vendor can rename a field five
+# MAGIC #   times and Gold never breaks; ambiguous matches fail closed to
+# MAGIC #   quarantine until a human binds them.
+# MAGIC
+# MAGIC # BUILD STATUS in THIS engine (re-verified 11/23 after email removal):
+# MAGIC #   present: DRIFT_POLICY, _OVERWRITE_DROP_ALLOWLIST, SILVER_MERGE_KEYS,
+# MAGIC #            find_pk / find_join_keys value recognizers, replay_quarantined
+# MAGIC #   absent:  resolve_gold_columns + enforce_gold_contract (the email
+# MAGIC #            implementations were never grafted into this engine),
+# MAGIC #            COLUMN_ALIASES, learned_aliases, canonical_hash_udf,
+# MAGIC #            the Tier-3 auto-heal loop, gold_drift_quarantine routing
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # ============================================================================
+# MAGIC # REFERENCE — Six deep failure modes (beyond renames) + roadmap
+# MAGIC # ============================================================================
+# MAGIC # Distilled 11/23/2026 from the Nov 20–23 AI threads (email 'More things',
+# MAGIC # self-sent 11/23 12:19 PM). Status verified against this file 11/23.
+# MAGIC
+# MAGIC # 1. GRAIN FLIP (1 row per entity -> 1 per event/line item)
+# MAGIC #    _latest_per_pk survivorship silently collapses repeats (49 of 50 rows
+# MAGIC #    gone); child joins can fan out and inflate Gold 10x.
+# MAGIC #    STATUS: BUILT 11/23 — _run_log.grain_ratio + engine_health_report
+# MAGIC #    check #12 (report-only by design; benign double-dumps also spike —
+# MAGIC #    the operator judges, nothing halts).
+# MAGIC
+# MAGIC # 2. LATE / OUT-OF-ORDER EVENTS crossing the watermark
+# MAGIC #    An 11:55 PM webhook retry lands 12:15 AM, after the watermark moved
+# MAGIC #    -> silent skip. Fix: filter on ARRIVAL time, merge by EVENT time;
+# MAGIC #    optional lookback buffer + guarded MERGE (target.event_time <
+# MAGIC #    source.event_time).
+# MAGIC #    STATUS: by design — CDC filters on bronze_updated_at (arrival) and
+# MAGIC #    survivorship orders by event time (_find_event_time). Lookback
+# MAGIC #    buffer not present.
+# MAGIC
+# MAGIC # 3. MAGNITUDE / UNIT DRIFT (dollars <-> cents, seconds <-> milliseconds)
+# MAGIC #    Schema, types and names all pass — Gold revenue spikes 100x
+# MAGIC #    overnight. Fix: magnitude bounds (p50 / min-max scale) per column
+# MAGIC #    fingerprint -> DRIFT_POLICY before Gold writes.
+# MAGIC #    STATUS: partial — detect_epoch_unit_drift exists; general magnitude
+# MAGIC #    bounds not built.
+# MAGIC
+# MAGIC # 4. DYNAMIC KEY EXPLOSION (data values as JSON keys)
+# MAGIC #    'responses': {'2026-11-20_usr_9912': {...}} flattens into 10k sparse
+# MAGIC #    columns -> Delta metadata blowup. Fix: key-entropy check (>50% of a
+# MAGIC #    map's keys match value patterns) -> auto-convert the struct to
+# MAGIC #    MAP<STRING,STRING> or a key-value child table.
+# MAGIC #    STATUS: partial — detect_dynamic_key_maps + check_field_budget
+# MAGIC #    exist (field budget is consumed nightly by the health report); the
+# MAGIC #    auto-conversion is not built.
+# MAGIC
+# MAGIC # 5. SPARSE PATCH OVERWRITES PUT (UPDATE SET * nulls valid fields)
+# MAGIC #    order.updated webhooks carry 2 of 20 fields; a blanket MERGE wipes
+# MAGIC #    the other 18 with NULLs. Fix: per-source merge_mode flag
+# MAGIC #    (FULL_SNAPSHOT vs SPARSE_PATCH) + COALESCE(source, target) updates
+# MAGIC #    for patch sources; explicit sentinel delete markers.
+# MAGIC #    STATUS: NOT BUILT (no merge_mode / SPARSE_PATCH in file).
+# MAGIC
+# MAGIC # 6. TOMBSTONE / HARD-DELETE BLINDNESS
+# MAGIC #    Deleted accounts stop appearing in pulls — append/merge keeps them
+# MAGIC #    active in Gold forever. Fix: intercept deleted==true / *.deleted
+# MAGIC #    payloads (bypass non-null checks) -> soft-delete flags in the merge.
+# MAGIC #    STATUS: NOT BUILT (no _is_deleted / tombstone handling in file).
+# MAGIC
+# MAGIC # DEFENSE MATRIX (which layer guards what):
+# MAGIC #   Syntax    malformed quotes/wrappers -> repair ladder      -> parse_quarantine
+# MAGIC #   Identity  column renames            -> col_uid registry   -> gold_drift_quarantine
+# MAGIC #   Structure dynamic keys              -> key entropy        -> check_field_budget
+# MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt _latest_per_pk (ours: report)
+# MAGIC #   Timing    late/out-of-order events   -> arrival watermark  -> guarded MERGE
+# MAGIC #   Semantics unit flips / patch nulls   -> fingerprint        -> DRIFT_POLICY
+# MAGIC
+# MAGIC # ROADMAP (same threads):
+# MAGIC #   - Declarative config: move registry rules, aliases and drift
+# MAGIC #     thresholds (DRIFT_POLICY, COLUMN_ALIASES, PIPELINE_RULES) into
+# MAGIC #     YAML/JSON so a new source/table is a config edit, not engine code.
+# MAGIC #   - Module split WHEN IT HURTS (not now): 4 library notebooks
+# MAGIC #     (json+udfs / schema+airbags / cdc+silver-io / orchestrator+gold)
+# MAGIC #     + 3 run notebooks (daily ingestion / gold views / maintenance+chaos).
+# MAGIC #     One-way imports; keep pure string->string logic separate from
+# MAGIC #     Spark/IO; process_table() stays the single entry point.
+# MAGIC #   - Weekly maintenance job (proposed): optimize/vacuum the fleet,
+# MAGIC #     reconcile orphaned children, cleanup orphaned temp tables, chaos
+# MAGIC #     test suite.
+# MAGIC #   - Full 94-function inventory + turn-by-turn designs live in the
+# MAGIC #     original email thread (self-sent 11/23: 'Things' 12:14 PM +
+# MAGIC #     'More things' 12:19 PM).
