@@ -3115,6 +3115,228 @@ SILVER_MERGE_KEYS = {
 # go here; everything else fails loud.
 _OVERWRITE_DROP_ALLOWLIST = set()
 
+# ============================================================================
+# TRANCHE 5 (11/24/2026) — DELETE TOMBSTONES + SPARSE-PATCH MERGE MODE
+# Roadmap failure modes 5 + 6, now BUILT (see REFERENCE cells at bottom):
+#   5. SPARSE PATCH OVERWRITES PUT — a payload that legitimately omits fields
+#      (patch semantics) cleared them (UPDATE SET col = NULL). MERGE_MODE:
+#      "FULL_SNAPSHOT" (default — today's EXACT semantics, a newer payload's
+#      NULLs overwrite) vs "SPARSE_PATCH" (a newer NULL = not-provided,
+#      COALESCE keeps the prior value). Per table in MERGE_MODE["tables"].
+#   6. TOMBSTONE / HARD-DELETE BLINDNESS — an entity deleted upstream stops
+#      appearing in the nightly FULL-SNAPSHOT dumps, but silver kept its
+#      last values 'current' forever (gold never saw the deletion).
+#      detect_deletions(): PK present in silver but absent from the last
+#      TOMBSTONE_ABSENCE_THRESHOLD consecutive dumps -> soft-delete
+#      (_is_deleted=true, _deleted_detected_at — data KEPT, never dropped).
+#      Reappearance clears the flag (resurrection). Engine-managed columns
+#      (like bronze_insert_date: never in the JSON discovery registry, so
+#      the Tranche 4 gold contract gate ignores them by design).
+# GUARDS (a false tombstone is worse than a missed one):
+#   * dump sanity: latest dump's distinct PKs < ratio * prior dump's -> SKIP
+#     (broken/truncated extraction must never tombstone half the table);
+#   * zero PKs extracted -> SKIP (pk path wrong / wrappers changed);
+#   * mass cap: candidates > cap * table rows -> SKIP + warn;
+#   * watch list is ENTITY tables with FULL-SNAPSHOT sources only. Event
+#     streams (lead_activites), children (sentiment/fields), API-windowed
+#     sources (calendly) and incremental sources (custom_activites, ~7
+#     payloads/night — NOT a full snapshot; add only after confirming the
+#     dump semantics) are excluded: absence there is history, not deletion.
+MERGE_MODE = {
+    "default": "FULL_SNAPSHOT",      # "FULL_SNAPSHOT" | "SPARSE_PATCH"
+    "tables": {},                    # e.g. {"leads_processed": "SPARSE_PATCH"}
+}
+TOMBSTONE_ABSENCE_THRESHOLD = 3      # consecutive dumps the id must be missing
+TOMBSTONE_DUMP_SANITY_RATIO = 0.5    # latest PKs < 50% of prior -> skip run
+TOMBSTONE_MASS_CAP = 0.10            # candidates >10% of table -> skip + warn
+TOMBSTONE_MASS_CAP_MIN_ROWS = 50       # cap only applies at this table size (a
+                                      # 5-row entity table CAN lose 2 ids; the
+                                      # dump-sanity guard still protects it)
+TOMBSTONE_WATCHED = {                # silver entity table -> bronze source
+    # MEASURED 11/24 (report-only smoke on live sources):
+    #   * mdl_users_raw IS a full snapshot (0 candidates — every user
+    #     re-appears in every dump) -> watching is VALID.
+    #   * leads_raw is NOT full-population: 82% of silver leads are absent
+    #     from the last 3 dumps (~9-12k payloads per night vs ~73k silver
+    #     rows — windowed/incremental). Absence is NOT deletion there;
+    #     REMOVED (the mass-cap guard correctly refused to tombstone).
+    #   * close_crm_users_raw payloads are malformed-JSON wrappers needing
+    #     the repair ladder — get_json_object extracts 0 PKs (detection
+    #     self-skips). REMOVED; a repaired-path detector is deferred work.
+    #   * custom_activites: ~7 payloads/night — incremental, unwatched.
+    # Add a table here ONLY after a report-only dry run proves its dumps
+    # carry the full entity population: detect_deletions(name, apply=False).
+    "mdl_users_processed": "mdl_users_raw",
+}
+
+
+def _ensure_tombstone_columns(table_name):
+    """Add the engine-managed tombstone columns to a silver entity table."""
+    full = f"{CATALOG}.{SILVER_SCHEMA}.{table_name}"
+    cols = set(spark.table(full).columns)
+    if "_is_deleted" not in cols:
+        spark.sql(f"ALTER TABLE {full} ADD COLUMN _is_deleted BOOLEAN")
+        print(f"  🪦 {table_name}: added _is_deleted")
+    if "_deleted_detected_at" not in cols:
+        spark.sql(f"ALTER TABLE {full} ADD COLUMN _deleted_detected_at TIMESTAMP")
+        print(f"  🪦 {table_name}: added _deleted_detected_at")
+
+
+def _dump_pk_df(bronze_name, pk, ts):
+    """Distinct non-null PK values inside ONE bronze dump (raw_data JSON).
+    Wrapper-tolerant: Close CRM payloads nest under JSON_OBJECT — try the
+    top level first, then the wrapper path, and coalesce. An unparsable
+    payload yields NULL (skipped) — such rows are quarantined by the
+    engine, not silently lost."""
+    b = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_name}").filter(
+        col("insert_date") == ts)
+    paths = [f'"$.{pk}"', f'"$.JSON_OBJECT.{pk}"']
+    pk_expr = "coalesce(" + ", ".join(
+        f'get_json_object(raw_data, {q})' for q in paths) + ")"
+    return (b.select(expr(pk_expr).alias("_pk"))
+             .where(col("_pk").isNotNull())
+             .select(col("_pk").cast("string").alias("_pk")).distinct())
+
+
+def detect_deletions(silver_name, apply=True, verbose=True):
+    """Tombstone sweep for ONE watched entity table. Reads the last
+    TOMBSTONE_ABSENCE_THRESHOLD distinct dump timestamps from bronze; a
+    silver PK absent from ALL of them was hard-deleted upstream ->
+    _is_deleted=true + _deleted_detected_at (values kept). A tombstoned PK
+    reappearing in the newest dump is resurrected (flag cleared). State
+    per run is mirrored into _delete_tracker (silver schema) for the
+    health report and audits. apply=False = report-only dry run."""
+    bronze_name = TOMBSTONE_WATCHED[silver_name]
+    pk = SILVER_MERGE_KEYS[silver_name]
+    s_full = f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}"
+    out = {"silver_name": silver_name, "action": "none"}
+
+    dumps = [r["insert_date"] for r in (
+        spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_name}")
+        .select("insert_date").distinct()
+        .orderBy(col("insert_date").desc())
+        .limit(TOMBSTONE_ABSENCE_THRESHOLD).collect())]
+    if len(dumps) < TOMBSTONE_ABSENCE_THRESHOLD:
+        out["action"] = "skipped"
+        out["why"] = (f"only {len(dumps)} distinct dump(s) — need "
+                      f"{TOMBSTONE_ABSENCE_THRESHOLD} to tombstone")
+        if verbose:
+            print(f"  ℹ️ {silver_name}: {out['why']}")
+        return out
+    out["dumps_checked"] = [str(d)[:19] for d in dumps]
+
+    # ---- guard 1: broken/truncated dump ----
+    n_latest = _dump_pk_df(bronze_name, pk, dumps[0]).count()
+    n_prior = _dump_pk_df(bronze_name, pk, dumps[1]).count()
+    if n_latest == 0 or (n_prior and n_latest < TOMBSTONE_DUMP_SANITY_RATIO * n_prior):
+        out.update(action="skipped",
+                   why=f"dump sanity: latest={n_latest:,} vs prior={n_prior:,} PKs")
+        if verbose:
+            print(f"  🛑 {silver_name}: tombstone sweep SKIPPED — {out['why']}")
+        return out
+
+    # ---- candidates: silver PKs in NONE of the last K dumps ----
+    seen = _dump_pk_df(bronze_name, pk, dumps[0])
+    for _ts in dumps[1:]:
+        seen = seen.unionByName(_dump_pk_df(bronze_name, pk, _ts))
+    # NO .cache() here (11/24): on serverless Connect, caching/
+    # materializing adds a session schema in the temp-table-manager
+    # catalog — the nightly's serverless sessions have leaked 50 of
+    # them (at the catalog quota; they are system-owned and cannot be
+    # dropped by us). PK-set recompute is cheap; new engine code must
+    # not add to that pressure.
+    seen = seen.distinct()
+    known = (spark.table(s_full)
+             .select(col(pk).cast("string").alias("_pk"))
+             .where(col("_pk").isNotNull()).distinct())
+    cand = known.join(seen, "_pk", "left_anti")
+    n_cand, n_known = cand.count(), known.count()
+    out.update(latest_dump_pks=n_latest, silver_pks=n_known, candidates=n_cand)
+
+    # ---- guard 2: mass tombstone (partial dump that slipped guard 1).
+    # Percentage cap only above TOMBSTONE_MASS_CAP_MIN_ROWS — a small entity
+    # table losing a third of its rows is a REAL deletion (the dump-sanity
+    # guard above already protects it from broken dumps); at scale, >10%
+    # of candidates in one run is dump breakage until proven otherwise.
+    if (n_known >= TOMBSTONE_MASS_CAP_MIN_ROWS
+            and n_cand > TOMBSTONE_MASS_CAP * n_known):
+        out.update(action="skipped",
+                   why=f"{n_cand:,} candidates = {n_cand / n_known:.0%} of table "
+                       f"(> {TOMBSTONE_MASS_CAP:.0%} cap) — looks like a partial dump")
+        if verbose:
+            print(f"  🛑 {silver_name}: tombstone sweep SKIPPED — {out['why']}")
+        return out
+
+    # ---- resurrection: tombstoned ids alive in the newest dump ----
+    tgt_cols = set(spark.table(s_full).columns)
+    n_res = 0
+    res_df = None
+    if "_is_deleted" in tgt_cols:
+        res_df = (spark.table(s_full)
+                  .where(col("_is_deleted") == True)
+                  .select(col(pk).cast("string").alias("_pk")).distinct()
+                  .join(_dump_pk_df(bronze_name, pk, dumps[0]), "_pk"))
+        n_res = res_df.count()
+    out["resurrections"] = n_res
+
+    if verbose:
+        print(f"  🪦 {silver_name}: {n_cand:,} deletion candidate(s), "
+              f"{n_res:,} resurrection(s) — dumps {out['dumps_checked'][0]} "
+              f".. {out['dumps_checked'][-1]}")
+    if not apply:
+        out["action"] = "report-only"
+        for r in cand.orderBy("_pk").limit(5).collect():
+            print(f"     candidate: {r['_pk']}")
+        return out
+
+    # ---- apply ----
+    _ensure_tombstone_columns(silver_name)
+    cand_view = f"_t5_cand_{silver_name}_{_RUN_ID}"
+    res_view = f"_t5_res_{silver_name}_{_RUN_ID}"
+    try:
+        cand.createOrReplaceTempView(cand_view)
+        spark.sql(f"""
+            MERGE INTO {s_full} AS t
+            USING {cand_view} AS s
+            ON t.`{pk}` = s._pk
+            WHEN MATCHED AND (t._is_deleted IS NULL OR t._is_deleted = false)
+            THEN UPDATE SET t._is_deleted = true,
+                            t._deleted_detected_at = current_timestamp()
+        """)
+        if n_res:
+            res_df.createOrReplaceTempView(res_view)
+            spark.sql(f"""
+                MERGE INTO {s_full} AS t
+                USING {res_view} AS s
+                ON t.`{pk}` = s._pk
+                WHEN MATCHED THEN UPDATE SET t._is_deleted = false,
+                                            t._deleted_detected_at = NULL
+            """)
+    finally:
+        spark.sql(f"DROP VIEW IF EXISTS {cand_view}")
+        spark.sql(f"DROP VIEW IF EXISTS {res_view}")
+
+    # ---- state mirror: _delete_tracker (rebuilt per table per run) ----
+    trk = f"{CATALOG}.{SILVER_SCHEMA}._delete_tracker"
+    if not spark.catalog.tableExists(trk):
+        spark.sql(f"""CREATE TABLE {trk} (
+            silver_name STRING, pk_value STRING, tombstoned_at TIMESTAMP,
+            last_dump_checked TIMESTAMP, run_id STRING)""")
+    spark.sql(f"DELETE FROM {trk} WHERE silver_name = '{silver_name}'")
+    spark.table(s_full).where(col("_is_deleted") == True)         .select(lit(silver_name).alias("silver_name"),
+                col(pk).cast("string").alias("pk_value"),
+                col("_deleted_detected_at").alias("tombstoned_at"),
+                lit(dumps[0]).alias("last_dump_checked"),
+                lit(_RUN_ID).alias("run_id"))         .write.mode("append").saveAsTable(trk)
+    out["action"] = "applied"
+    out["tombstones_now"] = spark.table(s_full).where(
+        col("_is_deleted") == True).count()
+    if verbose:
+        print(f"     ✅ applied: {out['tombstones_now']:,} tombstoned row(s) "
+              f"in {silver_name} (tracker updated)")
+    return out
+
+
 
 def _parent_pk(df, silver_name):
     """Pinned per-family PK first (SILVER_MERGE_KEYS — the same pins the
@@ -3560,7 +3782,21 @@ def _merge_silver(df, table_name, pk):
     # matched row keeps its first-seen value) while remaining in the
     # INSERT list so new ids get their true first-seen time.
     _set_cols = [c for c in src_cols if c != "bronze_insert_date"]
-    set_clause = ", ".join(f"t.`{c}` = s.`{c}`" for c in _set_cols)
+    # 11/24/2026 Tranche 5 — merge mode. FULL_SNAPSHOT (default) keeps today's
+    # exact semantics: a newer payload's NULLs overwrite (a full dump re-
+    # sends everything, so NULL means the field was cleared). SPARSE_PATCH:
+    # a newer NULL = not-provided — COALESCE keeps the prior value (patch
+    # sources). Identity/arrival columns always follow the source.
+    _t5_mode = MERGE_MODE["tables"].get(table_name, MERGE_MODE["default"])
+    if _t5_mode == "SPARSE_PATCH":
+        _always_src = {"payload_hash", "bronze_updated_at"}
+        set_clause = ", ".join(
+            f"t.`{c}` = COALESCE(s.`{c}`, t.`{c}`)"
+            if c not in _always_src else f"t.`{c}` = s.`{c}`"
+            for c in _set_cols)
+        print(f"  🩹 {table_name}: SPARSE_PATCH merge (newer NULLs keep prior values)")
+    else:
+        set_clause = ", ".join(f"t.`{c}` = s.`{c}`" for c in _set_cols)
     ins_cols = ", ".join(f"`{c}`" for c in src_cols)
     ins_vals = ", ".join(f"s.`{c}`" for c in src_cols)
     # 11/17/2026 — event-time provenance: bronze_updated_at is the bronze
@@ -4746,14 +4982,27 @@ def process_table(bronze_name, silver_name=None, only_arrays=None, flatten=False
     mid-run failure leaked _tmp_ tables for the rest of the notebook and
     left the global _CDC_WATERMARK set, poisoning the NEXT table's run in
     the same notebook (it would take the CDC path against the wrong
-    table's watermark)."""
+    table's watermark).
+    11/24/2026 Tranche 5 — after ANY run (CDC or REBUILD) on a watched
+    entity table, a hard-delete tombstone sweep follows (fail-soft)."""
     global _CDC_WATERMARK
+    _r = None
     try:
-        return _process_table_inner(bronze_name, silver_name=silver_name,
-                                    only_arrays=only_arrays, flatten=flatten)
+        _r = _process_table_inner(bronze_name, silver_name=silver_name,
+                                  only_arrays=only_arrays, flatten=flatten)
     finally:
         _cleanup_run()
         _CDC_WATERMARK = None
+    # 11/24/2026 Tranche 5 — hard-delete tombstones: after ANY run (CDC or
+    # REBUILD) on a watched entity table, sweep the dumps for ids that
+    # stopped appearing upstream. Fail-soft: a detection error must never
+    # kill the nightly write that already succeeded.
+    if silver_name in TOMBSTONE_WATCHED:
+        try:
+            detect_deletions(silver_name, apply=True)
+        except Exception as _t5e:
+            print(f"  ⚠️ tombstone sweep skipped ({silver_name}): {_t5e}")
+    return _r
 
 
 def run_tables(bronze_names, silver_names=None, only_arrays=None, flatten=False, continue_on_error=True):
@@ -5420,6 +5669,10 @@ def engine_health_report(check_bronze_freshness=True,
          the last 2 days: silver→gold contract drift happened — the
          HALTED / AUTO-RESOLVED columns and their resolution, newest
          first.
+      14. TOMBSTONES — Tranche 5: per watched entity table, tombstoned row
+          counts (_is_deleted — hard-deleted upstream, values kept) and a
+          suspect flag when the tombstone share exceeds the mass cap (dump
+          breakage that slipped the sweep guards).
     """
     from datetime import datetime, timedelta, timezone
     _findings = {}
@@ -5534,6 +5787,29 @@ def engine_health_report(check_bronze_freshness=True,
                     f"{len(_gq)} row(s) in 2d — " + "; ".join(_det)]
                 print(f"  🔴 gold drift ({_label}): {len(_gq)} row(s) — "
                       f"{'; '.join(_det[:3])}")
+        except Exception:
+            pass
+
+    # ---- tombstones (14) — Tranche 5 hard-delete flags (11/24) ----
+    for _sn in sorted(TOMBSTONE_WATCHED):
+        try:
+            _tf = f"{CATALOG}.{SILVER_SCHEMA}.{_sn}"
+            if not spark.catalog.tableExists(_tf):
+                continue
+            if "_is_deleted" not in set(spark.table(_tf).columns):
+                continue
+            _tot = spark.table(_tf).count()
+            _del = spark.table(_tf).where(col("_is_deleted") == True).count()
+            if _del:
+                print(f"  🪦 {_sn}: {_del:,} of {_tot:,} rows tombstoned "
+                      f"(hard-deleted upstream; values kept)")
+                if (_tot >= TOMBSTONE_MASS_CAP_MIN_ROWS
+                        and _del > TOMBSTONE_MASS_CAP * _tot):
+                    _findings[f"tombstones:{_sn}"] = [
+                        f"{_del:,} of {_tot:,} rows tombstoned — over the "
+                        f"{TOMBSTONE_MASS_CAP:.0%} mass cap: suspect dump "
+                        f"breakage until proven otherwise"]
+                    print("       🔴 over mass cap — suspect dump breakage")
         except Exception:
             pass
 
@@ -5931,13 +6207,26 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #    the other 18 with NULLs. Fix: per-source merge_mode flag
 # MAGIC #    (FULL_SNAPSHOT vs SPARSE_PATCH) + COALESCE(source, target) updates
 # MAGIC #    for patch sources; explicit sentinel delete markers.
-# MAGIC #    STATUS: NOT BUILT (no merge_mode / SPARSE_PATCH in file).
+# MAGIC #    STATUS: BUILT 11/24 (Tranche 5) — MERGE_MODE (default
+# MAGIC #    FULL_SNAPSHOT = today's exact PUT semantics; per-table
+# MAGIC #    SPARSE_PATCH = COALESCE keeps prior values on newer NULLs).
+# MAGIC #    Sentinel 'deleted' payload interception still deferred — no such
+# MAGIC #    field observed in these sources; absence-based tombstones below
+# MAGIC #    cover the deletion path.
 # MAGIC
 # MAGIC # 6. TOMBSTONE / HARD-DELETE BLINDNESS
 # MAGIC #    Deleted accounts stop appearing in pulls — append/merge keeps them
 # MAGIC #    active in Gold forever. Fix: intercept deleted==true / *.deleted
 # MAGIC #    payloads (bypass non-null checks) -> soft-delete flags in the merge.
-# MAGIC #    STATUS: NOT BUILT (no _is_deleted / tombstone handling in file).
+# MAGIC #    STATUS: BUILT 11/24 (Tranche 5) — detect_deletions(): a silver
+# MAGIC #    PK absent from the last TOMBSTONE_ABSENCE_THRESHOLD (=3)
+# MAGIC #    consecutive dumps -> _is_deleted=true + _deleted_detected_at
+# MAGIC #    (values kept); reappearance clears the flag. Guards: dump-sanity
+# MAGIC #    ratio, mass cap (>=50-row tables), wrapper-tolerant PK
+# MAGIC #    extraction. Auto-runs via process_table on TOMBSTONE_WATCHED
+# MAGIC #    entity tables (leads, close_crm_users, mdl_users;
+# MAGIC #    custom_activites excluded — incremental source, add only after
+# MAGIC #    confirming dump semantics). Paper trail: _delete_tracker.
 # MAGIC
 # MAGIC # DEFENSE MATRIX (which layer guards what):
 # MAGIC #   Syntax    malformed quotes/wrappers -> repair ladder      -> parse_quarantine
@@ -5946,20 +6235,8 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt before silver write (11/24)
 # MAGIC #   Timing    late/out-of-order events   -> arrival watermark  -> guarded MERGE
 # MAGIC #   Semantics unit flips                -> magnitude medians   -> halt (11/24)
-# MAGIC #   Semantics patch nulls (sparse put)    -> merge_mode         -> NOT BUILT (T5)
+# MAGIC #   Semantics patch nulls (sparse put)    -> merge_mode         -> BUILT 11/24 (T5)
 # MAGIC
 # MAGIC # ROADMAP (same threads):
 # MAGIC #   - Declarative config: move registry rules, aliases and drift
-# MAGIC #     thresholds (DRIFT_POLICY, COLUMN_ALIASES, PIPELINE_RULES) into
-# MAGIC #     YAML/JSON so a new source/table is a config edit, not engine code.
-# MAGIC #   - Module split WHEN IT HURTS (not now): 4 library notebooks
-# MAGIC #     (json+udfs / schema+airbags / cdc+silver-io / orchestrator+gold)
-# MAGIC #     + 3 run notebooks (daily ingestion / gold views / maintenance+chaos).
-# MAGIC #     One-way imports; keep pure string->string logic separate from
-# MAGIC #     Spark/IO; process_table() stays the single entry point.
-# MAGIC #   - Weekly maintenance job (proposed): optimize/vacuum the fleet,
-# MAGIC #     reconcile orphaned children, cleanup orphaned temp tables, chaos
-# MAGIC #     test suite.
-# MAGIC #   - Full 94-function inventory + turn-by-turn designs live in the
-# MAGIC #     original email thread (self-sent 11/23: 'Things' 12:14 PM +
-# MAGIC #     'More things' 12:19 PM).
+# MAGIC #     thresholds (DRIFT_POLICY, COLUMN_ALIASES, PIPELINE_RULES)
