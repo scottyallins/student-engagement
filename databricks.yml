@@ -1,5 +1,5 @@
 # Student Engagement Pipeline — Declarative Automation Bundle (DAB).
-# The nightly job (38 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
+# The nightly job (39 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
 # Deploy from a local clone: databricks bundle deploy --target prod   (see DEPLOY.md)
 
 bundle:
@@ -176,6 +176,19 @@ resources:
             - task_key: silver_contacts_emails
           notebook_task:
             notebook_path: 2_Silver/2_8_Silver_user_mapping.ipynb
+        # ---------- GOLD CONTRACT GATE (11/24/2026): after ALL silver, before
+        # ANY gold — enforce_gold_contracts() (utils) halts the job on the
+        # silver live→dark rename signature (SILVER_GOLD_CONTRACTS mined
+        # from all 20 gold notebooks; sticky anchors in
+        # silver._gold_col_liveness; paper trail in gold.gold_drift_quarantine).
+        # Every gold task's silver dependency was re-pointed here so no gold
+        # SQL ever reads silver with a silently-renamed column. ----------
+        - task_key: gold_contract_gate
+          depends_on:
+            - task_key: silver_user_mapping
+            - task_key: silver_custom_activities_fields
+          notebook_task:
+            notebook_path: 3_Gold/0_Gold_contract_gate.ipynb
         # ---------- GOLD SET 1: dims, metrics, lookups (star schema leftmost set;
         # every task roots at silver_user_mapping — the LAST silver task — so NO
         # gold runs before ALL silver is complete)
@@ -197,62 +210,62 @@ resources:
         # deferred: rerouting engagement would reversion the SCD2 profile.
         - task_key: gold_lead_merge_map
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_20_Gold_lead_merge_map.ipynb
         - task_key: gold_staff_dim
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
             - task_key: gold_staff_emails
             - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_01_Gold_staff_dim.ipynb
         - task_key: gold_lead_dim
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
             - task_key: gold_staff_emails
             - task_key: gold_lead_merge_map
           notebook_task:
             notebook_path: 3_Gold/3_04_Gold_lead_dim.ipynb
         - task_key: gold_staff_emails
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_00_Gold_staff_emails.ipynb
         - task_key: gold_days_since_last_email
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_05_Gold_days_since_last_email.ipynb
         - task_key: gold_days_since_last_meeting
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_06_Gold_days_since_last_meeting.ipynb
         - task_key: gold_missed_calls
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
             - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_07_Gold_missed_calls_14_days.ipynb
         - task_key: gold_days_until_next_meeting
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_08_Gold_days_until_next_meeting.ipynb
         - task_key: gold_days_since_last_login
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_09_Gold_days_since_last_login.ipynb
         - task_key: gold_calendly_metric
           depends_on:
-            - task_key: silver_calendly
+            - task_key: gold_contract_gate
           notebook_task:
             notebook_path: 3_Gold/3_10_Gold_days_since_last_meeting_calendly.ipynb
         - task_key: gold_sentiment
           depends_on:
-            - task_key: silver_user_mapping
+            - task_key: gold_contract_gate
             - task_key: gold_lead_dim
           notebook_task:
             notebook_path: 3_Gold/3_11_Gold_sentiment.ipynb
@@ -273,7 +286,7 @@ resources:
             notebook_path: 3_Gold/3_02_Gold_leads_activity_fact.ipynb
         - task_key: gold_sales_fact
           depends_on:
-            - task_key: silver_custom_activities_fields
+            - task_key: gold_contract_gate
             - task_key: gold_staff_emails
             - task_key: gold_staff_dim
             - task_key: gold_lead_dim

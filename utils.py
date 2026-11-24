@@ -1721,6 +1721,411 @@ def _guard_magnitude_drift(df, silver_name, value_col="value",
         # telemetry contract: the guard itself must never block the pipeline
         print(f"  ℹ️ magnitude-drift guard skipped ({str(_me)[:60]})")
 
+# --- 11/24/2026 GOLD CONTRACT GATE (Tranche 4: silver renames must never
+# ship silent NULLs into gold) -----------------------------------------------
+# The silver registry is grow-only: when a vendor renames a field, silver
+# GAINS the new column while the old one silently stops receiving data.
+# Gold SQL hardcodes the old name and rebuilds happily — full-table
+# CREATE OR REPLACE keeps OLD entities' values and NULLs out only new/
+# updated ones. No error anywhere. This gate runs after ALL silver and
+# before ANY gold: it enforces the silver->gold column contracts mined
+# from the 20 gold notebooks (SILVER_GOLD_CONTRACTS, mechanical extraction
+# + live-schema + hand verification, 11/24) and halts on the live->dark
+# signature. Gold's old tables stand untouched; fix, re-run.
+
+GOLD_SCHEMA = "gold"
+
+
+SILVER_GOLD_CONTRACTS = {
+    "calendly_scheduled_events_processed": ('EVENT_CREATED_AT', 'EVENT_START_TIME', 'INVITEE_EMAIL', 'INVITEE_NAME'),
+    "close_crm_users_processed": ('bronze_insert_date', 'date_created', 'date_updated', 'email', 'first_name', 'id', 'image', 'last_name'),
+    "custom_activites_processed": ('created_by', 'id', 'name'),
+    "custom_activites_processed_fields": ('custom_activites_processed_id', 'id', 'name'),
+    "lead_activites_processed": ('activity_at', 'body_preview', 'body_text_quoted', 'bronze_insert_date', 'contact_id', 'created_by', 'created_by_name', 'custom_activity_type_id', 'custom_fields', 'date_created', 'date_updated', 'direction', 'disposition', 'ends_at', 'id', 'lead_id', 'note', 'organization_id', 'outcome_id', 'source_lead_id', 'starts_at', 'status', 'subject', 'text', 'type'),
+    "leads_processed": ('bronze_insert_date', 'date_updated', 'display_name', 'id', 'name', 'status_label'),
+    "leads_processed_contacts": ('id', 'lead_id', 'leads_processed_id', 'name'),
+    "leads_processed_contacts_emails": ('email', 'leads_processed_contacts_id'),
+    "leads_processed_custom": ('Avatar', 'CSM', 'Channel_ID', 'Contract_Start_Date', 'Contracted_Value', 'DAYS_SINCE_LAST_MESSAGE_FROM_CLIENT', 'DAYS_SINCE_LAST_MESSAGE_FROM_TEAM_MEMBER', 'SENTIMENTS_LAST_30_DAYS', 'Tier', 'bronze_insert_date', 'leads_processed_id'),
+    "mdl_users_processed": ('FIRSTNAME', 'LASTACCESS', 'LASTNAME', 'USERNAME'),
+    "user_identity_map": ('cont_ids', 'lead_ids', 'masked_emails', 'master_user_id', 'real_emails', 'source_tables', 'user_32digits'),
+}
+
+
+def resolve_contract_observed(silver_name, required=None):
+    """11/24/2026 — schema-level observed-name resolution: for each required
+    column (default: the table's SILVER_GOLD_CONTRACTS entry) return its
+    OBSERVED silver name, or None when the schema no longer carries it.
+    Case-insensitive fallback: gold's 'hot_col' still resolves when silver
+    shipped 'Hot_Col' (sanitizer drift); a true disappearance returns None
+    and the caller (enforce_gold_contracts) treats that as ABSENT."""
+    _req = list(required if required is not None
+                else SILVER_GOLD_CONTRACTS.get(silver_name, ()))
+    _present = {f.name.lower(): f.name
+                for f in spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}").schema.fields}
+    return {c: _present.get(c.lower()) for c in _req}  # None = ABSENT
+
+
+def _gold_quarantine_write(rows):
+    """gold.gold_drift_quarantine — the drift paper trail (append-only)."""
+    if not rows:
+        return
+    from datetime import datetime, timezone
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{GOLD_SCHEMA}")
+    spark.createDataFrame(
+        [(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),) + r for r in rows],
+        schema=("logged_at STRING, silver_name STRING, column_name STRING, issue STRING, "
+                "anchor_frac DOUBLE, recent_frac DOUBLE, sample_rows BIGINT, "
+                "suggested STRING")
+    ).write.format("delta").mode("append").option("mergeSchema", "true") \
+     .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.gold_drift_quarantine")
+
+
+def enforce_gold_contracts(sample_days=2, min_sample=20, fallback_rows=200,
+                           halt_baseline=0.5, warn_baseline=0.1):
+    """11/24/2026 — THE GOLD CONTRACT GATE (job task gold_contract_gate).
+    For every silver table in SILVER_GOLD_CONTRACTS:
+      1. PRESENCE (resolve_contract_observed, case-insensitive). ABSENT columns
+         warn + quarantine, never halt (grow-only registry makes renames
+         go STALE, not absent; absent = extraction drift or a rebuilt
+         silver).
+      2. LIVENESS — recent window (last sample_days of bronze_updated_at;
+         fall back to the latest fallback_rows rows when thin), per-column
+         non-null fraction, ONE scan per table.
+      3. STICKY ANCHORS — silver._gold_col_liveness stores the FIRST live
+         fraction seen per column (never auto-updated: gradual decay can't
+         mask a step change; delete the row to re-anchor).
+      4. VERDICT — anchor >= halt_baseline AND recent fraction == 0.0 on a
+         sufficient sample = the rename signature -> GoldContractError
+         (job halts before gold); warn..halt baseline -> warn + quarantine.
+         Live non-contract columns are named as rename candidates in the
+         error and the quarantine row.
+    Per-table check failures degrade to warnings — but if EVERY table
+    fails, the gate raises (a silently blind gate is worse than a halt)."""
+    from pyspark.sql import functions as _F
+    from datetime import datetime, timedelta, timezone
+    _halt, _warns, _errs = [], [], []
+    _now = datetime.now(timezone.utc)
+    _cutoff = _now - timedelta(days=sample_days)
+    _lt = f"{CATALOG}.{SILVER_SCHEMA}._gold_col_liveness"
+    _anchors = {}
+    if spark.catalog.tableExists(_lt):
+        _anchors = {(r["silver_name"], r["field_name"]): float(r["anchor_frac"])
+                    for r in spark.table(_lt).collect()}
+    _new_anchors = []
+    for _s, _cols in SILVER_GOLD_CONTRACTS.items():
+        try:
+            _res = resolve_contract_observed(_s)
+            _tbl = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{_s}")
+            _ok = [c for c, obs in _res.items() if obs]
+            _absent = [c for c, obs in _res.items() if not obs]
+            for _c in _absent:
+                _warns.append((_s, _c, "ABSENT from schema", None, None, None, ""))
+            if not _ok:
+                print(f"  ⚠️ {_s}: {len(_absent)} contract column(s) ABSENT")
+                continue
+            _recent = _tbl.where(col("bronze_updated_at") >= _cutoff)
+            _n = _recent.count()
+            if _n < min_sample:
+                _recent = _tbl.orderBy(col("bronze_updated_at").desc()).limit(fallback_rows)
+                _n = _recent.count()
+            if _n < min_sample:
+                print(f"  ℹ️ {_s}: only {_n} recent rows — below the "
+                      f"{min_sample}-row verdict floor, report-only this run")
+            _row = _recent.agg(
+                _F.count(_F.lit(1)).alias("n"),
+                *[_F.sum(_F.col(_res[_c]).isNotNull().cast("int")).alias(f"nn_{_c}")
+                  for _c in _ok]).first()
+            _n = int(_row["n"] or 0)
+            _frac = {_c: ((int(_row[f"nn_{_c}"] or 0) / _n) if _n else None) for _c in _ok}
+            _bad = []
+            for _c in _ok:
+                _a = _anchors.get((_s, _c))
+                if _a is None:
+                    if _n >= min_sample and _frac[_c] is not None:
+                        _new_anchors.append((_s, _c, float(_frac[_c]),
+                                             _now.strftime("%Y-%m-%d %H:%M:%S")))
+                    continue
+                _f = _frac[_c]
+                if _n < min_sample or _f is None:
+                    continue  # thin sample — no verdict, no verdict-noise
+                if _f == 0.0 and _a >= halt_baseline:
+                    _skip = set(_res.values()) | {"bronze_updated_at", "payload_hash",
+                                                  "bronze_insert_date"}
+                    _cands = [c for c in _tbl.columns if c not in _skip]
+                    if _cands:
+                        _cr = _recent.agg(*[_F.max(_F.col(c).isNotNull().cast("int"))
+                                           .alias(c) for c in _cands]).first().asDict()
+                        _live = [c for c in _cands if _cr.get(c) == 1]
+                    else:
+                        _live = []
+                    _halt.append((_s, _c, "STALE live->dark (probable rename)",
+                                  _a, _f, _n, ", ".join(sorted(_live)[:6])))
+                    _bad.append(f"{_c}=🔴STALE")
+                elif _f == 0.0 and _a >= warn_baseline:
+                    _warns.append((_s, _c, "SOFT-STALE (sparse col went dark)",
+                                   _a, _f, _n, ""))
+                    _bad.append(f"{_c}=🟡dark")
+            _line = f"  {'🔴' if any('STALE' in b for b in _bad) else '⚠️' if _bad or _absent else '✅'} {_s}"
+            _line += f": {len(_ok)} ok, {len(_bad) + len(_absent)} flagged" if (_bad or _absent) else f": {len(_ok)} ok"
+            if _bad:
+                _line += f" ({', '.join(_bad)})"
+            if _absent:
+                _line += f" ABSENT: {', '.join(_absent[:4])}"
+            print(_line)
+        except Exception as _e:
+            _errs.append(f"{_s}: {str(_e)[:60]}")
+            print(f"  ⚠️ {_s}: check failed ({str(_e)[:60]})")
+    if _new_anchors:
+        spark.createDataFrame(_new_anchors, schema=("silver_name STRING, field_name STRING, "
+                                                    "anchor_frac DOUBLE, anchored_at STRING")) \
+             .write.format("delta").mode("append").saveAsTable(_lt)
+    _gold_quarantine_write(_halt + _warns)
+    if _halt:
+        raise GoldContractError(
+            "GOLD CONTRACT HALT — " + "; ".join(
+                f"{_s}.{_c} anchor {_a:.2f} -> recent 0.00 over {_n} rows"
+                + (f" (candidate replacement(s): {_sg})" if _sg else "")
+                for _s, _c, _i, _a, _f, _n, _sg in _halt)
+            + ". Gold writes halted BEFORE any rebuild; details in "
+              f"{GOLD_SCHEMA}.gold_drift_quarantine. Fix the rename, then re-run.")
+    if _errs and len(_errs) == len(SILVER_GOLD_CONTRACTS):
+        raise GoldContractError(f"gate blind — every table check failed: {_errs[:3]}")
+    print(f"\n🥇 GOLD CONTRACT GATE: {len(SILVER_GOLD_CONTRACTS)} tables — "
+          f"{len(_halt)} halt(s), {len(_warns)} warning(s), {len(_errs)} check error(s)")
+    return {"halts": _halt, "warns": _warns, "errors": _errs}
+
+# --- 11/24/2026 GOLD CONTRACT GATEKEEPER (Tranche 4: silver renames vs Gold SQL) ---
+# Gold notebooks read silver with HARDCODED SQL column names (20 notebooks,
+# pure %sql). A silver rename is silent today: discovery produces the new
+# name, the grow-only registry re-adds the old name as a column, and Gold
+# keeps "working" against an all-NULL ghost. This gatekeeper makes silver
+# rename-proof instead of retrofitting 20 notebooks: contract columns are
+# declared here (grow-only, curated from each gold notebook's SQL as it is
+# read), enforced at parse time (before the union can re-add a ghost) and
+# after every write (schema membership), with confident renames AUTO-RESOLVED
+# by keeping the contract name in silver.
+
+# 11/24 (later same day) — SINGLE CONTRACT SOURCE: the full mechanically
+# mined + live-verified set (SILVER_GOLD_CONTRACTS, above) now drives ALL
+# THREE gates: parse-time FULL-discovery detection (_guard_gold_contract,
+# registry-filtered), post-write schema membership (_enforce_gold_contract_
+# table), and the pre-gold liveness gate (enforce_gold_contracts, job task
+# gold_contract_gate). Identity used to live here as a hand-verified subset
+# (3_04 + 3_20 only) — superseded.
+GOLD_CONTRACTS = SILVER_GOLD_CONTRACTS
+
+# Manual rename seeds: {silver_table: {old_contract_name: new_source_name}}.
+# Empty today; auto-resolutions persist to _col_aliases and reuse themselves.
+COLUMN_ALIASES = {}
+
+
+class GoldContractError(RuntimeError):
+    """Raised by the gold-contract gatekeeper: a contract column gold SQL
+    depends on went missing from silver (rename with no confident
+    resolution, or dropped after a write). Fail-closed — nothing written on
+    the parse path; on the post-write path the task fails loudly so Gold
+    dependents are blocked before reading a broken schema."""
+
+
+def _norm_name(s):
+    """Normalize a column name for comparison: lowercase, alphanumerics only."""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _learned_aliases(silver_name):
+    """{old_name: new_name} from _col_aliases (append log; later rows win,
+    registry-read style). {} when the table doesn't exist yet."""
+    try:
+        _t = f"{CATALOG}.{SILVER_SCHEMA}._col_aliases"
+        if not spark.catalog.tableExists(_t):
+            return {}
+        _out = {}
+        for r in (spark.table(_t).where(col("silver_name") == silver_name)
+                  .orderBy("learned_at").collect()):
+            _out[r["old_name"]] = r["new_name"]
+        return _out
+    except Exception:
+        return {}
+
+
+def _learn_alias(silver_name, mapping):
+    """Persist {old: new} auto-resolutions (idempotent; read side dedups)."""
+    from datetime import datetime, timezone
+    try:
+        if not mapping:
+            return
+        spark.createDataFrame(
+            [(silver_name, o, n, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+             for o, n in mapping.items()],
+            schema="silver_name STRING, old_name STRING, new_name STRING, "
+                   "learned_at STRING"
+        ).write.format("delta").mode("append").saveAsTable(
+            f"{CATALOG}.{SILVER_SCHEMA}._col_aliases")
+    except Exception as _le:
+        print(f"  ⚠️ alias learn skipped ({str(_le)[:60]})")
+
+
+def _gold_drift_q(silver_name, cols, candidates, resolution, resolved):
+    """Best-effort audit row to _gold_drift_quarantine — the operator trail."""
+    from datetime import datetime, timezone
+    try:
+        import json as _json
+        spark.createDataFrame(
+            [(_RUN_ID, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+              silver_name, ", ".join(cols),
+              _json.dumps(candidates or {}, default=str)[:2000],
+              resolution, _json.dumps(resolved or {}, default=str)[:2000])],
+            schema="run_id STRING, logged_at STRING, silver_table STRING, "
+                   "contract_columns STRING, candidates STRING, "
+                   "resolution STRING, alias_used STRING"
+        ).write.format("delta").mode("append").saveAsTable(
+            f"{CATALOG}.{SILVER_SCHEMA}._gold_drift_quarantine")
+    except Exception as _qe:
+        print(f"  ⚠️ gold drift quarantine record skipped ({str(_qe)[:60]})")
+
+
+def resolve_gold_columns(silver_name, missing_cols, discovered_names):
+    """{missing_contract_name: replacement_source_name} for CONFIDENT renames
+    only. Priority: manual COLUMN_ALIASES -> learned _col_aliases -> a UNIQUE
+    normalized-containment candidate among discovered names (e.g.
+    body_text_quoted <- body_text). Names < 4 normalized chars and ambiguous
+    matches are left unresolved on purpose — a halt beats a wrong guess."""
+    _res = {}
+    _learned = _learned_aliases(silver_name)
+    for m in missing_cols:
+        _a = COLUMN_ALIASES.get(silver_name, {}).get(m) or _learned.get(m)
+        if _a and _a in discovered_names:
+            _res[m] = _a
+            continue
+        _nm = _norm_name(m)
+        if len(_nm) < 4:
+            continue
+        _cands = [d for d in sorted(discovered_names)
+                  if len(_norm_name(d)) >= 4 and _norm_name(d) != _nm
+                  and (_norm_name(d) in _nm or _nm in _norm_name(d))]
+        if len(_cands) == 1:
+            _res[m] = _cands[0]
+    return _res
+
+
+def _guard_gold_contract(silver_name, discovered_st, mode):
+    """11/24/2026 — parse-time gold-contract gatekeeper (called before
+    _registry_union can re-add a ghost). FULL: a contract column missing from
+    DISCOVERY is a rename or a source removal — resolve_gold_columns then
+    auto-remap (record the alias + quarantine as AUTO-RESOLVED) or raise
+    (quarantine as HALTED; nothing written). CDC: no missing-detection
+    (narrow samples falsely flag sparse fields) — applies LEARNED aliases
+    only. FULL missing-detection is registry-filtered (engine-added columns
+    and registry-less tables are skipped — they'd false-halt a rebuild). Returns {new_name: old_contract_name} for the struct rebuild.
+    Own failure never blocks the parse (telemetry contract)."""
+    try:
+        _contract = GOLD_CONTRACTS.get(silver_name)
+        if not _contract or not isinstance(discovered_st, StructType):
+            return {}
+        _disc = {f.name for f in discovered_st.fields}
+        if mode == "CDC":
+            _remap = {_new: _old for _old, _new in _learned_aliases(silver_name).items()
+                      if _new in _disc and _old not in _disc}
+            if _remap:
+                print(f"  🔗 Gold contract alias applied (learned): {_remap}")
+            return _remap
+        # Registry filter — only columns PROVEN JSON-discoverable (present
+        # in the schema registry) participate in missing-detection. Engine-
+        # added columns (bronze_insert_date) and registry-less tables (the
+        # derived children) would false-halt a full rebuild; the post-write
+        # table check still guards their schema membership. Empty registry =
+        # no proven-discoverable contract -> no-op this pass.
+        _reg = _registry_read(silver_name)
+        if not _reg:
+            return {}
+        _missing = [c for c in _contract
+                    if c in _reg
+                    and c not in _disc
+                    and not any(_norm_name(c) == _norm_name(d) for d in _disc)]
+        if not _missing:
+            return {}
+        _res = resolve_gold_columns(silver_name, _missing, _disc)
+        _unres = [m for m in _missing if m not in _res]
+        if _unres:
+            _cands = {m: [d for d in sorted(_disc) if _norm_name(m) in _norm_name(d)][:3]
+                      for m in _unres}
+            _gold_drift_q(silver_name, _unres, _cands, "HALTED", None)
+            raise GoldContractError(
+                f"GOLD-CONTRACT HALT {silver_name}: contract column(s) {_unres} "
+                f"missing from a FULL discovery, no confident rename candidate "
+                f"(near-misses: {_cands}). Gold SQL depends on these — refusing "
+                f"to let the registry re-add them as all-NULL ghosts. Nothing "
+                f"was written. Map the rename in COLUMN_ALIASES or fix the "
+                f"source, then re-run.")
+        _remap = {v: k for k, v in _res.items()}
+        _learn_alias(silver_name, _res)
+        _gold_drift_q(silver_name, _missing, {m: [_res[m]] for m in _missing},
+                      "AUTO-RESOLVED", _res)
+        print(f"  🔗 GOLD CONTRACT: rename auto-resolved {_res} — silver keeps "
+              f"the contract name(s); alias learned for future CDC batches")
+        return _remap
+    except GoldContractError:
+        raise
+    except Exception as _ge:
+        print(f"  ℹ️ gold-contract guard skipped ({str(_ge)[:60]})")
+        return {}
+
+
+def _apply_contract_remap(df, remap):
+    """Rebuild the value struct so silver keeps the CONTRACT name carrying
+    the renamed column's data ({new: old}); the all-NULL ghost is dropped.
+    Gold SQL stays untouched. A failed rebuild raises — never write silver
+    with the bare renamed column (gold would read the ghost)."""
+    from pyspark.sql.functions import struct as _struct
+    try:
+        _vst = df.schema["value"].dataType
+        _keep = []
+        for _f in _vst.fields:
+            if _f.name in remap:
+                _keep.append(col("value").getField(_f.name).alias(remap[_f.name]))
+            elif _f.name not in remap.values():
+                _keep.append(col("value").getField(_f.name))
+        df = df.withColumn("value", _struct(*_keep))
+        print(f"  🔗 contract remap applied: "
+              f"{', '.join(f'{v} -> {k}' for k, v in remap.items())}")
+        return df
+    except GoldContractError:
+        raise
+    except Exception as _re:
+        raise GoldContractError(
+            f"contract remap {remap} could not be applied ({str(_re)[:80]}) — "
+            f"refusing to write silver with the bare renamed column")
+
+
+def _enforce_gold_contract_table(table_name):
+    """11/24/2026 — post-write gold-contract check (called by the write_silver
+    wrapper after ANY write path): every contract column must still exist in
+    the silver table's SCHEMA — catches the overwriteSchema drop-column class
+    and any rename that slipped past the parse gates (a CDC batch that
+    evolved a rename in). Schema membership only — sparse columns are
+    legitimate; null-rate checks would false-flag. Fail-closed: the batch
+    has landed, but the raise fails the task LOUDLY so Gold dependents are
+    blocked before they read a broken schema."""
+    try:
+        _contract = GOLD_CONTRACTS.get(table_name)
+        if not _contract:
+            return
+        _have = {_norm_name(c) for c in
+                 spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{table_name}").columns}
+        _missing = [c for c in _contract if _norm_name(c) not in _have]
+        if _missing:
+            _gold_drift_q(table_name, _missing, {}, "TABLE-HALTED", None)
+            raise GoldContractError(
+                f"GOLD-CONTRACT HALT {table_name}: contract column(s) {_missing} "
+                f"missing from the silver table AFTER the write. The task fails "
+                f"loudly so Gold is blocked before reading a broken schema. Fix "
+                f"the rename (COLUMN_ALIASES) or the source, then re-run.")
+    except GoldContractError:
+        raise
+    except Exception as _te:
+        print(f"  ℹ️ gold-contract table check skipped ({str(_te)[:60]})")
+
 
 def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, only_payload_hashes=None):
     """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse.
@@ -2132,18 +2537,26 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     # field, and record everything this pass discovered for future passes.
     # Registry unavailable (permissions, first run) degrades to plain
     # discovery — never blocks the pipeline.
+    _contract_remap = {}  # 11/24 — set by the gold-contract gatekeeper below
     if silver_name:
         try:
             if isinstance(deduped_st, StructType):
                 # 11/24/2026 — KEY-ENTROPY AIRBAG: halt BEFORE the union/write
                 # absorb dynamic keys (see _guard_key_entropy).
                 _guard_key_entropy(silver_name, deduped_st)
+                # 11/24/2026 — GOLD CONTRACT GATEKEEPER: FULL detects+resolves
+                # renames before the union re-adds a ghost; CDC applies learned
+                # aliases. Returns {new: old} for the value-struct rebuild.
+                _contract_remap = _guard_gold_contract(
+                    silver_name, deduped_st, "CDC" if watermark else "FULL")
                 deduped_st = _registry_union(silver_name, deduped_st)
                 _registry_write(silver_name, deduped_st)
             else:
                 print("  ℹ️ Schema registry skipped (DDL-string fallback schema)")
         except KeyEntropyError:
             raise  # 11/24 — the airbag's halt must not be swallowed here
+        except GoldContractError:
+            raise  # 11/24 — same for the gold-contract halt
         except Exception as _reg_e:
             print(f"  ⚠️ Schema registry unavailable ({str(_reg_e)[:70]}) — using discovered schema only")
 
@@ -2454,6 +2867,11 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
             col("payload_hash"),
             col("parsed").alias("value")
         )
+    # 11/24/2026 — GOLD CONTRACT REMAP: rebuild the value struct so silver
+    # keeps the CONTRACT column name carrying the renamed column's data
+    # (all-NULL ghost dropped); Gold's hardcoded SQL stays untouched.
+    if _contract_remap:
+        df_flat = _apply_contract_remap(df_flat, _contract_remap)
     # 11/23/2026 — GRAIN TELEMETRY: rows per distinct PK on the batch
     # actually sent onward — the survivorship-assumption tripwire. Reuses
     # find_pk (NULL-tolerant, sampled); a telemetry failure never blocks
@@ -3178,7 +3596,7 @@ def _merge_silver(df, table_name, pk):
         spark.sql(f"DROP VIEW IF EXISTS {view}")
 
 
-def write_silver(df, table_name, bronze_name=None, flatten=False):
+def _write_silver_inner(df, table_name, bronze_name=None, flatten=False):
     """Write DataFrame to silver table. CDC mode if _CDC_WATERMARK is set.
 
     CDC mode: MERGE-by-PK upsert for tables with a SILVER_MERGE_KEYS entry
@@ -3334,6 +3752,18 @@ def write_silver(df, table_name, bronze_name=None, flatten=False):
     cnt = spark.table(full).count()
     print(f"  ✅ {table_name}: {cnt:,} rows")
     return cnt
+
+
+def write_silver(df, table_name, bronze_name=None, flatten=False):
+    """11/24/2026 — thin GOLD-CONTRACT wrapper around _write_silver_inner:
+    after ANY write path (CDC MERGE, window-replace, full overwrite, nested-
+    drift rebuild), _enforce_gold_contract_table verifies GOLD_CONTRACTS[
+    table_name] columns still exist in the silver schema. Fail-closed: raise
+    after the write — the batch has landed, but the task fails loudly and
+    Gold dependents are blocked before reading a broken schema."""
+    _r = _write_silver_inner(df, table_name, bronze_name=bronze_name, flatten=flatten)
+    _enforce_gold_contract_table(table_name)
+    return _r
 
 
 
@@ -4985,6 +5415,11 @@ def engine_health_report(check_bronze_freshness=True,
          grain flip (survivorship would silently collapse repeats; benign
          double-dump batches also spike — REPORT-ONLY, the operator judges;
          NULL grain_ratio = pre-11/23 telemetry, excluded from baselines).
+      13. GOLD DRIFT QUARANTINE — rows in silver._gold_drift_quarantine
+         (parse-time) or gold.gold_drift_quarantine (liveness gate) from
+         the last 2 days: silver→gold contract drift happened — the
+         HALTED / AUTO-RESOLVED columns and their resolution, newest
+         first.
     """
     from datetime import datetime, timedelta, timezone
     _findings = {}
@@ -5078,6 +5513,29 @@ def engine_health_report(check_bronze_freshness=True,
                 print(f"       - {_p}")
         else:
             print(f"  🟢 {_b}: healthy")
+
+    # ---- gold drift quarantine (13) — parse-time + liveness gate (11/24) ---
+    _gdq_cutoff = (_now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    for _q, _label in ((f"{CATALOG}.{SILVER_SCHEMA}._gold_drift_quarantine",
+                        "parse-time"),
+                       (f"{CATALOG}.{GOLD_SCHEMA}.gold_drift_quarantine",
+                        "liveness-gate")):
+        try:
+            if not spark.catalog.tableExists(_q):
+                continue
+            _gq = [r.asDict() for r in spark.table(_q).collect()
+                   if str(r.get("logged_at") or "") >= _gdq_cutoff]
+            if _gq:
+                _det = [f"{_r.get('silver_name') or _r.get('silver_table')}."
+                        f"{_r.get('column_name') or _r.get('contract_columns')}"
+                        f" [{_r.get('issue') or _r.get('resolution')}]"
+                        for _r in _gq[:5]]
+                _findings[f"gold-drift:{_label}"] = [
+                    f"{len(_gq)} row(s) in 2d — " + "; ".join(_det)]
+                print(f"  🔴 gold drift ({_label}): {len(_gq)} row(s) — "
+                      f"{'; '.join(_det[:3])}")
+        except Exception:
+            pass
 
     # ---- rebuild storms (7) ----------------------------------------------
     _window_start = _now - timedelta(days=rebuild_storm_window_days)
@@ -5401,13 +5859,25 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #   times and Gold never breaks; ambiguous matches fail closed to
 # MAGIC #   quarantine until a human binds them.
 # MAGIC
-# MAGIC # BUILD STATUS in THIS engine (re-verified 11/23 after email removal):
+# MAGIC # BUILD STATUS in THIS engine (re-verified 11/24, Tranche 4 complete):
 # MAGIC #   present: DRIFT_POLICY, _OVERWRITE_DROP_ALLOWLIST, SILVER_MERGE_KEYS,
-# MAGIC #            find_pk / find_join_keys value recognizers, replay_quarantined
-# MAGIC #   absent:  resolve_gold_columns + enforce_gold_contract (the email
-# MAGIC #            implementations were never grafted into this engine),
-# MAGIC #            COLUMN_ALIASES, learned_aliases, canonical_hash_udf,
-# MAGIC #            the Tier-3 auto-heal loop, gold_drift_quarantine routing
+# MAGIC #            find_pk / find_join_keys value recognizers, replay_quarantined,
+# MAGIC #            SILVER_GOLD_CONTRACTS (= GOLD_CONTRACTS — mined from all 20
+# MAGIC #            gold notebooks, live-verified 11/24), COLUMN_ALIASES (manual
+# MAGIC #            seeds), learned_aliases (silver._col_aliases, auto-persisted),
+# MAGIC #            resolve_gold_columns (confident-rename resolution),
+# MAGIC #            _guard_gold_contract (parse-time FULL halt / auto-remap,
+# MAGIC #            registry-filtered so engine-added cols never false-halt;
+# MAGIC #            CDC applies learned aliases), _enforce_gold_contract_table
+# MAGIC #            (post-write schema membership), enforce_gold_contracts
+# MAGIC #            (pre-gold LIVENESS gate — job task gold_contract_gate after
+# MAGIC #            ALL silver, before ANY gold; sticky anchors in
+# MAGIC #            silver._gold_col_liveness; paper trail in
+# MAGIC #            gold.gold_drift_quarantine) — 14 live-tested behaviors 11/24
+# MAGIC #            (halt / auto-remap / soft-stale / absent / thin / aliases).
+# MAGIC #   absent:  Tier-3 VALUE-SIGNATURE auto-heal (containment rename match
+# MAGIC #            only, no dtype/value overlap), col_uid semantic registry,
+# MAGIC #            canonical_hash_udf, replay_quarantined for gold-drift rows
 
 # COMMAND ----------
 
@@ -5471,7 +5941,7 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC
 # MAGIC # DEFENSE MATRIX (which layer guards what):
 # MAGIC #   Syntax    malformed quotes/wrappers -> repair ladder      -> parse_quarantine
-# MAGIC #   Identity  column renames            -> col_uid registry   -> gold_drift_quarantine
+# MAGIC #   Identity  column renames            -> contract gate       -> halt before gold writes (11/24)
 # MAGIC #   Structure dynamic keys              -> key entropy        -> halt before registry write (11/24)
 # MAGIC #   Grain     1:1 -> 1:many             -> cardinality ratio  -> halt before silver write (11/24)
 # MAGIC #   Timing    late/out-of-order events   -> arrival watermark  -> guarded MERGE
