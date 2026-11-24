@@ -2171,7 +2171,7 @@ def _enforce_gold_contract_table(table_name):
         print(f"  ℹ️ gold-contract table check skipped ({str(_te)[:60]})")
 
 
-def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, only_payload_hashes=None):
+def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=None, schema_sample=None, log_run=True, only_payload_hashes=None):
     """Read Bronze, dedup snapshot re-dumps, detect wrapper, repair via UDF (runs ONCE), materialize to temp table, parse.
 
     only_payload_hashes: 11/17/2026 — replay filter (replay_quarantined):
@@ -2188,7 +2188,17 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     never reduced the expensive part. An explicit int (e.g. 200) remains
     available as an opt-out for one-off experiments; it also re-enables
     the small-batch augmentation branch below.
+    log_run: 11/24/2026 — PROBE MODE. False = parse for INSPECTION ONLY
+    (the child-explode 200-row dry-run lineage probe, raw_lineage_tree)
+    without writing a run-log row. Found 11/24: the probe's FULL row
+    logged a truncated field count (142 fields from 200 rows vs the
+    nightly's 180 from ~9k changed payloads), and the health report's
+    field-count check read 180 -> 142 as a material schema change — a
+    self-inflicted false alarm. Probes must not pollute the log the
+    checks read. Default True = every REAL parse still logs.
     """
+    if not log_run:  # probe mode — shadow the writer for this call only
+        _run_log_write = lambda *a, **k: None  # noqa: E731
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
 
     if watermark:
@@ -4898,7 +4908,7 @@ def _process_table_inner(bronze_name, silver_name=None, only_arrays=None, flatte
             # Re-parse a small sample to discover full schema and lineage tree (dry run)
             #_CDC_WATERMARK = None
             print(f"\n  🔍 DRY RUN — re-parsing 200 sample rows for full lineage tree:")
-            df_sample = parse_bronze_table(bronze_name, limit=200)
+            df_sample = parse_bronze_table(bronze_name, limit=200, log_run=False)
             if df_sample is not None:
                 if flatten:
                     df_sample = flatten_structs(df_sample, skip_custom=True)
@@ -5807,8 +5817,14 @@ def engine_health_report(check_bronze_freshness=True,
                 if _d and (_l["parsed_valid"] / _d) < parse_rate_alert:
                     _probs.append(f"parse rate {_l['parsed_valid'] / _d:.1%} "
                                   f"on last batch — ladder/discovery degrading")
+            # 11/24/2026 — compare CDC batch vs CDC batch only. FULL rows
+            # were the 200-row dry-run probes (now silenced via log_run
+            # but present in history) and REBUILD rows legitimately
+            # discover more fields than a daily batch — either side of
+            # those comparisons false-alarms this check.
             _fr = [(r.get("logged_at"), r.get("fields_discovered"))
-                   for r in _rs if r.get("fields_discovered")]
+                   for r in _rs if r.get("fields_discovered")
+                   and r.get("mode") == "CDC"]
             if len(_fr) >= 2 and _fr[-1][1] is not None and _fr[-2][1] is not None \
                     and abs(_fr[-1][1] - _fr[-2][1]) > field_jump_alert:
                 _probs.append(f"field count {_fr[-2][1]} → {_fr[-1][1]} — "
@@ -6162,7 +6178,8 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
         print(f"{'=' * 80}")
         try:
             df = parse_bronze_table(tname, limit=limit,
-                                    silver_name=silver_name or tname)
+                                    silver_name=silver_name or tname,
+                                    log_run=False)
         except Exception as e:
             print(f"  !! {type(e).__name__}: {str(e)[:120]}")
             continue
