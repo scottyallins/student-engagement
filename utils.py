@@ -6239,4 +6239,16 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC
 # MAGIC # ROADMAP (same threads):
 # MAGIC #   - Declarative config: move registry rules, aliases and drift
-# MAGIC #     thresholds (DRIFT_POLICY, COLUMN_ALIASES, PIPELINE_RULES)
+# MAGIC #     thresholds (DRIFT_POLICY, COLUMN_ALIASES, PIPELINE_RULES) into
+# MAGIC #     YAML/JSON so a new source/table is a config edit, not engine code.
+# MAGIC #   - Module split WHEN IT HURTS (not now): 4 library notebooks
+# MAGIC #     (json+udfs / schema+airbags / cdc+silver-io / orchestrator+gold)
+# MAGIC #     + 3 run notebooks (daily ingestion / gold views / maintenance+chaos).
+# MAGIC #     One-way imports; keep pure string->string logic separate from
+# MAGIC #     Spark/IO; process_table() stays the single entry point.
+# MAGIC #   - Weekly maintenance job (proposed): optimize/vacuum the fleet,
+# MAGIC #     reconcile orphaned children, cleanup orphaned temp tables, chaos
+# MAGIC #     test suite.
+# MAGIC #   - Full 94-function inventory + turn-by-turn designs live in the
+# MAGIC #     original email thread (self-sent 11/23: 'Things' 12:14 PM +
+# MAGIC #     'More things' 12:19 PM).
