@@ -1794,6 +1794,135 @@ SILVER_GOLD_CONTRACTS = {
     "user_identity_map": ('cont_ids', 'lead_ids', 'masked_emails', 'master_user_id', 'real_emails', 'source_tables', 'user_32digits'),
 }
 
+# ============================================================================
+# 11/25/2026 — TRANCHE 6: COLUMN ALIASES + BIOLOGY FINGERPRINTS.
+# A vendor rename is adjudicated by a HUMAN: the fix maps old->new, edits gold,
+# and the commit is the receipt. COLUMN_ALIASES keeps every name ever
+# adjudicated for a logical column so a vendor REVERT (rename back) does not
+# re-halt. THE RULE: this dict RECORDS verdicts; it never makes them.
+# Nothing adds itself — every entry has a commit receipt.
+#
+# Resolution (nightly, derived fresh from live data, no stored precedence):
+#   exactly ONE candidate live -> it wins ("live wins"; the data is the
+#     memory — a revert needs zero new code or new adjudication)
+#   zero live                  -> existing gate tiers (halt/warn/report)
+#   two+ live                  -> AMBIGUOUS halt — only a human can tell a
+#     transition/revert from a recycled name. Never auto-pick.
+#
+# BIOLOGY FINGERPRINT (the recycled-name defense): at adjudication time pin
+# what the column IS — null-density, cardinality, format bucket. A live name
+# that no longer matches its pinned fingerprint = the vendor wired a NEW
+# concept to a KNOWN name — halt as BIOLOGY_SWAP. Fingerprint mismatch is a
+# tripwire, not a judgment: evolution vs recycling is a human call.
+# Fingerprints are pinned via pin_column_fingerprint() and pasted here with
+# the receipt — the commit IS the authorization record.
+#
+# Schema:
+# COLUMN_ALIASES[("silver_table", "contract_col")] = {
+#     "aliases": ["vendor_old_name", ...],       # names previously adjudicated
+#     "receipt": "<commit-sha> <date> — evidence one-liner",
+#     "fingerprint": {"live_frac": .., "distinct_ratio": .., "bucket": ".."},
+# }
+COLUMN_ALIASES = {}
+
+
+def _format_bucket(vals):
+    """11/25/2026 — cheap format classifier for fingerprint pinning.
+    PURE (no Spark) so the corpus can pin it: timestamp-like / hash-like /
+    email-like / numeric / free-text over a small sample."""
+    import re as _re
+    if not vals:
+        return "empty"
+    _n = len(vals)
+    _ts = sum(1 for v in vals if isinstance(v, str)
+              and _re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", v.strip()))
+    if _ts / _n >= 0.8:
+        return "timestamp-like"
+    _hs = sum(1 for v in vals if isinstance(v, str)
+              and _re.match(r"^[0-9a-f]{32}$", v.strip()))
+    if _hs / _n >= 0.8:
+        return "hash-like"
+    _es = sum(1 for v in vals if isinstance(v, str) and "@" in v and "." in v)
+    if _es / _n >= 0.8:
+        return "email-like"
+    _nu = sum(1 for v in vals if isinstance(v, (int, float))
+              and not isinstance(v, bool))
+    if _nu / _n >= 0.8:
+        return "numeric"
+    return "free-text"
+
+
+def _col_fingerprint(df, c, k=50):
+    """11/25/2026 — one agg + one small take: the column's current biology
+    (live fraction, distinct ratio, format bucket). Used to PIN at
+    adjudication time and to CHECK the live winner nightly."""
+    from pyspark.sql import functions as _F
+    _r = df.agg(_F.count(_F.lit(1)).alias("n"),
+                _F.sum(_F.col(c).isNotNull().cast("int")).alias("nn"),
+                _F.countDistinct(_F.col(c)).alias("d")).first()
+    _vals = [r[0] for r in df.where(_F.col(c).isNotNull()).select(c).limit(k).collect()]
+    return {"live_frac": int(_r["nn"] or 0) / max(int(_r["n"] or 1), 1),
+            "distinct_ratio": int(_r["d"] or 0) / max(int(_r["n"] or 1), 1),
+            "bucket": _format_bucket(_vals)}
+
+
+def _alias_verdict(frac_map, fp_pinned=None, fp_now=None):
+    """11/25/2026 — PURE resolver (corpus-pinned, no Spark). frac_map:
+    {candidate_name: recent_nonnull_frac}. Returns (verdict, winner) with
+    verdict in PASS / DARK / AMBIGUOUS / BIOLOGY_SWAP."""
+    _live = [c for c, f in frac_map.items() if (f or 0.0) > 0.0]
+    if len(_live) == 1:
+        _w = _live[0]
+        if fp_pinned and fp_now:
+            _dr = fp_now["distinct_ratio"] / max(fp_pinned["distinct_ratio"], 1e-9)
+            if (fp_now["bucket"] != fp_pinned["bucket"]
+                    or _dr > 10
+                    or fp_now["live_frac"] < fp_pinned["live_frac"] * 0.5):
+                return "BIOLOGY_SWAP", _w
+        return "PASS", _w
+    if len(_live) > 1:
+        return "AMBIGUOUS", None
+    return "DARK", None
+
+
+def pin_column_fingerprint(silver_name, column):
+    """11/25/2026 — run at adjudication time; paste the printed dict into
+    COLUMN_ALIASES under 'fingerprint' together with the commit receipt."""
+    _df = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.{silver_name}")
+    print(f"fingerprint for {silver_name}.{column}:")
+    print(_col_fingerprint(_df, column))
+
+
+def alias_contract_pins():
+    """11/25/2026 — Tranche 6 corpus pins: the four resolver verdicts + the
+    biology bucket classifier. PURE — no Spark, no tables, runs on import."""
+    _fp = {"live_frac": 0.9, "distinct_ratio": 0.01, "bucket": "timestamp-like"}
+    _ok = _alias_verdict({"old": 0.0, "new": 0.85}, _fp,
+                         {"live_frac": 0.85, "distinct_ratio": 0.012,
+                          "bucket": "timestamp-like"})
+    assert _ok == ("PASS", "new"), _ok
+    print("  PASS  11/25: alias one-live resolves (adjudicated rename, fp match)")
+    _sw = _alias_verdict({"old": 0.0, "new": 0.85}, _fp,
+                         {"live_frac": 0.85, "distinct_ratio": 0.5,
+                          "bucket": "free-text"})
+    assert _sw[0] == "BIOLOGY_SWAP", _sw
+    print("  PASS  11/25: alias biology swap — recycled name halts")
+    _am = _alias_verdict({"old": 0.6, "new": 0.85})
+    assert _am[0] == "AMBIGUOUS", _am
+    print("  PASS  11/25: alias tie — both live halts (revert vs recycled)")
+    _dk = _alias_verdict({"old": 0.0, "new": 0.0})
+    assert _dk[0] == "DARK", _dk
+    print("  PASS  11/25: alias zero-live falls through to existing tiers")
+    assert _format_bucket(["2026-11-25 10:00:00"] * 5) == "timestamp-like"
+    assert _format_bucket(["a" * 32, "b" * 32, "0" * 32]) == "hash-like"
+    assert _format_bucket(["x@y.com", "a@b.co", "c@d.org"]) == "email-like"
+    assert _format_bucket([1, 2, 3.5]) == "numeric"
+    assert _format_bucket(["hello world", "free words here"]) == "free-text"
+    print("  PASS  11/25: biology bucket classifier (ts/hash/email/numeric/text)")
+
+
+alias_contract_pins()
+
 
 def resolve_contract_observed(silver_name, required=None):
     """11/24/2026 — schema-level observed-name resolution: for each required
@@ -1867,6 +1996,14 @@ def enforce_gold_contracts(sample_days=2, min_sample=20, fallback_rows=200,
             if not _ok:
                 print(f"  ⚠️ {_s}: {len(_absent)} contract column(s) ABSENT")
                 continue
+            if "bronze_updated_at" not in _tbl.columns:
+                # 11/25 — presence-only for derived identity tables (no
+                # bronze_updated_at, e.g. user_identity_map): schema presence
+                # still verified; liveness can't be judged without a
+                # timestamp, and an unresolved-column crash hides that.
+                print(f"  ℹ️ {_s}: no bronze_updated_at — presence-only "
+                      f"({len(_ok)}/{len(_res)} contract column(s) present)")
+                continue
             _recent = _tbl.where(col("bronze_updated_at") >= _cutoff)
             _n = _recent.count()
             if _n < min_sample:
@@ -1892,7 +2029,60 @@ def enforce_gold_contracts(sample_days=2, min_sample=20, fallback_rows=200,
                 _f = _frac[_c]
                 if _n < min_sample or _f is None:
                     continue  # thin sample — no verdict, no verdict-noise
+                # 11/25 — same-name recycling defense (Case B): a live contracted
+                # column whose pinned biology no longer matches = the vendor
+                # wired a NEW concept to a KNOWN name. Tripwire, not judgment.
+                _al_e = COLUMN_ALIASES.get((_s, _c)) or {}
+                if _al_e.get("fingerprint") and _f and _f > 0.0 and _n >= min_sample:
+                    _v2, _ = _alias_verdict({_c: _f}, _al_e["fingerprint"],
+                                            _col_fingerprint(_recent, _res[_c]))
+                    if _v2 == "BIOLOGY_SWAP":
+                        _halt.append((_s, _c, "ALIAS BIOLOGY CHANGE — live column no "
+                                      "longer matches its pinned fingerprint",
+                                      _a, _f, _n, _al_e.get("receipt", "")))
+                        _bad.append(f"{_c}=🔴BIOLOGY")
+                        continue
                 if _f == 0.0 and _a >= halt_baseline:
+                    # 11/25 — ALIAS RESOLUTION before halting: adjudicated
+                    # renames resolve live-wins; ties halt AMBIGUOUS; zero live
+                    # falls through to the existing STALE halt. No aliases =
+                    # unchanged behavior.
+                    if _al_e.get("aliases"):
+                        _pl = {f.name.lower(): f.name for f in _tbl.schema.fields}
+                        _al_ok = [(_pl[a.lower()], a) for a in _al_e["aliases"]
+                                  if a.lower() in _pl]
+                        _fm = {_c: _f}
+                        if _al_ok:
+                            _ar = _recent.agg(
+                                _F.count(_F.lit(1)).alias("n"),
+                                *[_F.sum(_F.col(o).isNotNull().cast("int"))
+                                  .alias(f"nn_{a}") for o, a in _al_ok]).first()
+                            _fm.update({o: int(_ar[f"nn_{a}"] or 0)
+                                        / max(int(_ar["n"] or 1), 1)
+                                        for o, a in _al_ok})
+                        _v, _w = _alias_verdict(_fm, None, None)
+                        if _v == "PASS" and _al_e.get("fingerprint"):
+                            _v, _w = _alias_verdict(
+                                _fm, _al_e["fingerprint"],
+                                _col_fingerprint(_recent, _res.get(_w) or _w))
+                        if _v == "PASS":
+                            _warns.append((_s, _c, f"ALIAS-RESOLVED (live via alias {_w})",
+                                           _a, _f, _n, _al_e.get("receipt", "")))
+                            _bad.append(f"{_c}=🔀via:{_w}")
+                            continue
+                        if _v == "AMBIGUOUS":
+                            _lv = [c for c, f in _fm.items() if f > 0]
+                            _halt.append((_s, _c, "AMBIGUOUS ALIASES both live (revert "
+                                          "vs recycled name?)", _a, _f, _n,
+                                          ", ".join(sorted(_lv))))
+                            _bad.append(f"{_c}=🔴AMBIG")
+                            continue
+                        if _v == "BIOLOGY_SWAP":
+                            _halt.append((_s, _c, f"ALIAS BIOLOGY CHANGE — {_w} no longer "
+                                          "matches its pinned fingerprint",
+                                          _a, _f, _n, _al_e.get("receipt", "")))
+                            _bad.append(f"{_c}=🔴BIOLOGY")
+                            continue
                     _skip = set(_res.values()) | {"bronze_updated_at", "payload_hash",
                                                   "bronze_insert_date"}
                     _cands = [c for c in _tbl.columns if c not in _skip]
