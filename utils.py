@@ -3450,8 +3450,10 @@ _EVENT_TIME_CANDIDATES = [
 def _find_event_time(df):
     """11/17/2026 — resolve the payload's business event-time column from
     the parsed columns (see _EVENT_TIME_CANDIDATES). Scalar fields only
-    (arrays/structs/maps cannot order). String event times order correctly
-    lexicographically because Postgres renders them uniformly per column.
+    (arrays/structs/maps cannot order). 11/24/2026 — the 'renders
+    uniformly per column' claim is DISPROVEN (date_updated precision mix);
+    all ordering/comparison sites must go through _et_sort_key /
+    try_to_timestamp, never raw strings.
     Returns the column name or None."""
     _low = {}
     for _f in df.schema.fields:
@@ -3464,6 +3466,23 @@ def _find_event_time(df):
         if _c in _low:
             return _low[_c]
     return None
+
+
+def _et_sort_key(et_col_name):
+    """11/24/2026 — CAST-TO-TIMESTAMP primary sort for event-time
+    survivorship. The source changed precision mid-stream (leads /
+    lead_activites date_updated mixes 25-char second-precision with
+    32-char microsecond strings — found by the nightly event-time audit),
+    so 'renders uniformly per column' no longer holds and lexicographic
+    ordering is not provably sound (an offset pair like 22:00+00:00 vs
+    18:00-05:00 misorders by an hour). try_to_timestamp parses every
+    observed ISO variant; values that fail to parse sort LAST (garbage
+    event time must not win 'current') and then fall to the caller's raw-
+    string tiebreak, which preserves the pre-fix order among garbage
+    rows. Callers: _latest_per_pk, _merge_silver (batch dedup window and
+    the MERGE provenance predicate)."""
+    from pyspark.sql.functions import try_to_timestamp
+    return try_to_timestamp(col(f"`{et_col_name}`"))
 
 
 def _latest_per_pk(df, pk):
@@ -3489,7 +3508,8 @@ def _latest_per_pk(df, pk):
     _et = _find_event_time(df)
     if _et:
         print(f"  🕰️ event-time survivorship via `{_et}` (arrival as tiebreak)")
-        _order = [col(f"`{_et}`").desc_nulls_last(),
+        _order = [_et_sort_key(_et).desc_nulls_last(),
+                  col(f"`{_et}`").desc_nulls_last(),
                   col("bronze_insert_date").desc_nulls_last()]
     else:
         print("  ℹ️ no payload event-time column (date_updated/updated_at/…) — "
@@ -3770,6 +3790,7 @@ def _merge_silver(df, table_name, pk):
     _et = _find_event_time(df)
     if _et:
         w = Window.partitionBy(pk).orderBy(
+            _et_sort_key(_et).desc_nulls_last(),
             col(f"`{_et}`").desc_nulls_last(),
             col("bronze_insert_date").desc_nulls_last(),
             col("payload_hash").desc())
@@ -3851,7 +3872,9 @@ def _merge_silver(df, table_name, pk):
     # THE BUSINESS CLOCK instead; arrival time stays the fallback for
     # tables with no event-time field.
     if _et and _et in src.columns and _et in spark.table(full).columns:
-        _prov = f"s.`{_et}` > t.`{_et}` OR t.`{_et}` IS NULL"
+        _prov = (f"try_to_timestamp(s.`{_et}`) > "
+                  f"try_to_timestamp(t.`{_et}`) OR "
+                  f"try_to_timestamp(t.`{_et}`) IS NULL")
         print(f"  🕰️ {table_name}: event-time provenance via `{_et}`")
     else:
         _prov = ("s.bronze_updated_at > t.bronze_updated_at "
@@ -5560,17 +5583,22 @@ def audit_event_time_format(silver_name, quiet=False):
     _flags = []
     if len(_classes) > 1:
         _flags.append(f"MIXED format classes: {sorted(_classes)}")
-    elif _classes and len(_lens) > 1:
-        _flags.append(f"single class but MIXED lengths: {sorted(_lens)} "
-                      "(precision change — ordering risk)")
     if _flags:
         for _f in _flags:
-            print(f"  🔴 EVENT-TIME {silver_name}.{_et}: {_f} — lexicographic "
-                  "survivorship ordering may be WRONG for mixed rows; "
-                  "cast/normalize before trusting 'current'")
+            print(f"  🔴 EVENT-TIME {silver_name}.{_et}: {_f} — no single "
+                  "parse covers these; investigate before trusting 'current'")
+    elif _classes and len(_lens) > 1:
+        # 11/24/2026 — mixed lengths (precision change) downgraded from a
+        # red ordering-risk finding: survivorship AND the MERGE provenance
+        # predicate order by try_to_timestamp (_et_sort_key) since 11/24, so
+        # the engine is cast-safe. Ad-hoc gold/analysis comparisons must
+        # still cast before comparing.
+        print(f"  ℹ️ EVENT-TIME {silver_name}.{_et}: precision mix "
+              f"{sorted(_lens)} — engine ordering is CAST-SAFE (11/24 fix); "
+              "ad-hoc comparisons: try_to_timestamp() first")
     else:
         print(f"  🟢 EVENT-TIME {silver_name}.{_et}: uniform — "
-              "lexicographic ordering is sound")
+              "cast-based ordering is sound")
     return _flags
 
 
