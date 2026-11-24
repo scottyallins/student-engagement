@@ -127,6 +127,50 @@ print(f"✅ Config loaded: {CATALOG}.{BRONZE_SCHEMA} → {CATALOG}.{SILVER_SCHEM
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # SOURCE INTAKE — pointing process_table at a NEW source (11/24/2026)
+# MAGIC From the second-source audit: the engine is DELIBERATELY specialized
+# MAGIC # to the nine Close CRM / MDL sources — every pin is evidence-backed,
+# MAGIC # and this is the decision map a 10th source forces, NOT a refactoring
+# MAGIC # list. Work the checklist top to bottom BEFORE the first run:
+# MAGIC #   1. PROFILE the new source's free-text keys against _PROBLEM_KEYS.
+# MAGIC #      The genuinely SILENT failure mode is narrow: quote repair that
+# MAGIC #      pairs quotes wrongly AND still yields valid JSON (parses-but-
+# MAGIC #      corrupts). A wrapper key that happens to sit in the exempt set
+# MAGIC #      goes DARK (never unwrapped — discovery sees nothing structured);
+# MAGIC #      STRESS-TESTED 11/24 (fake source, scratch): a foreign wrapper
+# MAGIC #      key (DATA_BLOB) holding stringified inner JSON did NOT unwrap —
+# MAGIC #      run stayed GREEN (fields_discovered counted top-level keys,
+# MAGIC #      ZERO quarantine) and both wrapper rows went dark at the column
+# MAGIC #      level. Wrapper unwrapping is narrower than 'any string starting
+# MAGIC #      with {' — profile every new wrapper dialect as INTAKE-BLOCKING.
+# MAGIC #      THE TELL that fires: the run-log 'type-conflict' note, which
+# MAGIC #      engine_health_report surfaces in red (the same finding
+# MAGIC #      close_crm_users_raw carries today). Everything else fails LOUD:
+# MAGIC #      SCHEMA DISCOVERY FAILED or parse quarantine, both counted.
+# MAGIC #   2. PIN the real grain in SILVER_MERGE_KEYS. Unlisted tables fall
+# MAGIC #      back to find_pk — which once preferred lead_id on
+# MAGIC #      lead_activites (would have collapsed per-lead). Grain telemetry
+# MAGIC #      (check 12) prints rows/PK on day one, so the COLLAPSE case shows
+# MAGIC #      a ratio well above 1.0 — but a coincidentally-unique wrong PK
+# MAGIC #      stays silent at 1.0. Pin it; don't guess.
+# MAGIC #   3. CONFIRM the bronze column contract: raw_data (payload JSON),
+# MAGIC #      insert_date (source DUMP timestamp), bronze_updated_at
+# MAGIC #      (arrival clock / CDC watermark). Different names = wrong
+# MAGIC #      watermark or hard failure.
+# MAGIC #   4. LOCATE custom fields (custom / custom_cf_*). A different key
+# MAGIC #      (custom_fields, metadata, attributes, …) explodes them as plain
+# MAGIC #      columns or parks them in the wrong place.
+# MAGIC #   5. REGISTER the table in PIPELINE_NUMBERS / EXPECTED_BRONZE_TABLES
+# MAGIC #      so fleet health sees it (check 15 flags unregistered bronze
+# MAGIC #      tables now). Tombstone-watching additionally requires a
+# MAGIC #      full-snapshot PROOF: detect_deletions(name, apply=False) first.
+# MAGIC # If any step is wrong the engine still RUNS — it writes silver that
+# MAGIC # looks clean and is grain-wrong or wrapper-dark. That is the
+# MAGIC # silent-break case; this checklist is how you avoid paying it.
+
+# COMMAND ----------
+
 # DBTITLE 1,# JSON Repair UDF
 # ============================================================================
 # JSON REPAIR UDF 11/17/2026 — universal normalization with type-based wrapper detection
@@ -5673,6 +5717,10 @@ def engine_health_report(check_bronze_freshness=True,
           counts (_is_deleted — hard-deleted upstream, values kept) and a
           suspect flag when the tombstone share exceeds the mass cap (dump
           breakage that slipped the sweep guards).
+      15. UNEXPECTED BRONZE TABLES — bronze tables in the catalog that are
+          not in EXPECTED_BRONZE_TABLES: a new/unregistered source is
+          invisible to this report and the nightly until registered (see
+          the SOURCE INTAKE checklist).
     """
     from datetime import datetime, timedelta, timezone
     _findings = {}
@@ -5812,6 +5860,21 @@ def engine_health_report(check_bronze_freshness=True,
                     print("       🔴 over mass cap — suspect dump breakage")
         except Exception:
             pass
+
+    # ---- unexpected bronze tables (15) — second-source tripwire (11/24) ----
+    try:
+        _have = {r["tableName"] for r in spark.sql(
+            f"SHOW TABLES IN {CATALOG}.{BRONZE_SCHEMA}").collect()}
+        _extra = sorted(_have - set(EXPECTED_BRONZE_TABLES))
+        if _extra:
+            _findings["bronze:unregistered"] = [
+                f"{len(_extra)} bronze table(s) not in EXPECTED_BRONZE_TABLES: "
+                + ", ".join(_extra[:10])
+                + " — invisible to fleet health (SOURCE INTAKE step 5)"]
+            print(f"  🔴 unexpected bronze table(s): {', '.join(_extra[:10])}"
+                  " — not registered, invisible to this report")
+    except Exception:
+        pass
 
     # ---- rebuild storms (7) ----------------------------------------------
     _window_start = _now - timedelta(days=rebuild_storm_window_days)
