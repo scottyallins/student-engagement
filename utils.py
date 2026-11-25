@@ -2387,8 +2387,14 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     self-inflicted false alarm. Probes must not pollute the log the
     checks read. Default True = every REAL parse still logs.
     """
-    if not log_run:  # probe mode — shadow the writer for this call only
-        _run_log_write = lambda *a, **k: None  # noqa: E731
+    # probe mode — route telemetry through a no-op for this call only.
+    # MUST NOT assign to the name `_run_log_write`: any assignment inside
+    # this function makes that name LOCAL for the whole function, and the
+    # real nightly path (log_run=True) then dies with UnboundLocalError at
+    # the first run-log write — exactly the 11/25 nightly outage (run
+    # 248050494912565, introduced by commit 43391b9). Bind a different
+    # local name instead; the global writer stays untouched.
+    _log_writer = _run_log_write if log_run else (lambda *a, **k: None)
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
 
     if watermark:
@@ -2485,7 +2491,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     if not sample_row:
         # 11/17/2026 — run log: an empty increment is the signal the
         # volume-anomaly guard computes on (empty pull vs source outage).
-        _run_log_write(bronze_table, silver_name or bronze_table,
+        _log_writer(bronze_table, silver_name or bronze_table,
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        note="empty increment — no non-null raw_data after dedup/CDC")
@@ -2568,7 +2574,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     total = df.count()
     if total == 0:
         print(f"  ⏭️ SKIP: No data after repair")
-        _run_log_write(bronze_table, silver_name or bronze_table,
+        _log_writer(bronze_table, silver_name or bronze_table,
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=_needs_repair,
@@ -2601,7 +2607,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         # report 'CDC: No new rows' on a table whose entire batch was
         # unparseable. Raise loudly; process_table's cleanup guard still
         # releases temp tables/caches before the error surfaces.
-        _run_log_write(bronze_table, silver_name or bronze_table,
+        _log_writer(bronze_table, silver_name or bronze_table,
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=True,
@@ -2750,7 +2756,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     if _element_ddl is None or _fail_reason is not None:
         print(f"  ❌ SCHEMA DISCOVERY FAILED datatype validation: {_fail_reason or 'no structured schema found at any level'}")
         print(f"     ⏭️ SKIP: refusing to write silver — a wrong-schema build would produce a stringified 'value' column")
-        _run_log_write(bronze_table, silver_name or bronze_table,
+        _log_writer(bronze_table, silver_name or bronze_table,
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=_needs_repair,
@@ -2887,7 +2893,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         # ladder regression. Old behavior: silent return None → the run
         # reported 'no new data' and moved on. Raise loudly instead; the
         # write never happens, so existing silver data is still safe.
-        _run_log_write(bronze_table, silver_name or bronze_table,
+        _log_writer(bronze_table, silver_name or bronze_table,
                        "CDC" if watermark else "FULL",
                        raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                        repair_needed=_needs_repair, parsed_valid=0,
@@ -3067,7 +3073,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         if _all_null:
             print(f"  ⛔ ABORT: All {len(_check_type.fields)} fields are NULL across {valid:,} rows — schema mismatch")
             print(f"  ⛔ Previous silver data preserved (write skipped)")
-            _run_log_write(bronze_table, silver_name or bronze_table,
+            _log_writer(bronze_table, silver_name or bronze_table,
                            "CDC" if watermark else "FULL",
                            raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                            repair_needed=_needs_repair,
@@ -3129,7 +3135,7 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
         print(f"  ℹ️ grain telemetry skipped ({str(_ge)[:60]})")
     # 11/17/2026 — run-log row for the successful parse (fleet telemetry;
     # see _run_log_write). Volume-anomaly and convergence alerting read this.
-    _run_log_write(bronze_table, silver_name or bronze_table,
+    _log_writer(bronze_table, silver_name or bronze_table,
                    "CDC" if watermark else "FULL",
                    raw_rows=_raw_total, deduped_rows=_dedup_total, cdc_rows=_after,
                    repair_needed=_needs_repair,
