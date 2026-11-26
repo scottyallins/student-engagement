@@ -455,7 +455,7 @@ The gold waves are intentionally sequenced around attribute completeness: `lead_
 
 ## 9. Full Table Reference
 
-Catalog: `crm_ingestion`. Schemas: `config` (1 table), `bronze` (9), `silver` (30), `gold` (21) — 61 tables, 46 of them produced by the nightly DAG. The rest are the on-demand activity extracts, the custom-activities permission children, the engine's quarantine and state tables, two transient `_tmp_*` scratch tables from manual maintenance, and `gold.lead_emails`, retired since its email attribution moved into `lead_dim` (it still stands but is no longer refreshed).
+Catalog: `crm_ingestion`. Schemas: `config` (1 table), `bronze` (9), `silver` (28), `gold` (21) — 59 tables, 46 of them produced by the nightly DAG. The rest are the on-demand activity extracts, the custom-activities permission children, the engine's quarantine and state tables, and `gold.lead_emails`, retired since its email attribution moved into `lead_dim` (it still stands but is no longer refreshed).
 
 ### Config
 | Table | Purpose |
@@ -465,7 +465,7 @@ Catalog: `crm_ingestion`. Schemas: `config` (1 table), `bronze` (9), `silver` (3
 ### Bronze (9) — sources and row counts in §4
 `leads_raw`, `lead_activites_raw`, `close_crm_users_raw`, `custom_activites_raw`, `all_payments`, `calendly_scheduled_events`, `student_sentiment`, `mdl_users_raw`, `lead_merges`
 
-### Silver (30) — row counts and schemas in §5 (16 in the DAG)
+### Silver (28) — row counts and schemas in §5 (16 in the DAG)
 The 16 nightly tables: `leads_processed`, `leads_processed_custom`, `leads_processed_contacts`, `leads_processed_contacts_emails`, `lead_activites_processed`, `lead_activites_email_body`, `lead_activites_processed_attendees`, `lead_activites_processed_envelope`, `lead_activites_processed_to`, `close_crm_users_processed`, `custom_activites_processed`, `custom_activites_processed_fields`, `calendly_scheduled_events_processed`, `student_sentiment_processed`, `mdl_users_processed`, `user_identity_map` — plus the on-demand extracts (`lead_activites_processed_custom`, `lead_activites_processed_custom_fields`), the custom-activities permission children (`custom_activites_processed_editable_with_roles`, `custom_activites_processed_fields_editable_with_roles`), the quarantine tables (`parse_quarantine`, `null_pk_quarantine`), and the engine state tables (`_run_log`, `_schema_registry`, `_gold_col_liveness`, `_gold_drift_quarantine`, `_delete_tracker`, `_key_join_map`).
 
 ### Gold (21, 20 live in the DAG)
