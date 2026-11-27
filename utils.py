@@ -11,6 +11,73 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,# Structural Guard — duplicate definitions fail loudly at import
+# 11/26/2026 — the Nov 23 near-miss (duplicate parse_bronze_table defs; later-def-wins
+# silently re-enabled cache that had just been removed) becomes impossible: utils
+# refuses to import with ANY duplicate def/class name. Fail closed BEFORE any write
+# can happen. Doctrine: path resolution is FAIL-OPEN (unresolvable source path warns
+# and skips — never blocks the nightly); duplicate detection is FAIL-CLOSED.
+import ast as _guard_ast
+import os as _guard_os
+
+def _resolve_utils_source():
+    """Find this file on disk: __file__ first, then cwd candidates (bundle root),
+    then the dev repo path. Returns None if unresolvable (guard degrades to a warning)."""
+    _cands = []
+    try:
+        _cands.append(__file__)
+    except NameError:
+        pass
+    try:
+        _wd = _guard_os.getcwd()
+        _cands += [_guard_os.path.join(_wd, "utils.py"),
+                   _guard_os.path.join(_wd, "student-engagement", "utils.py")]
+    except Exception:
+        pass
+    _cands.append("/Workspace/Users/scottsbv@gmail.com/student-engagement/utils.py")
+    for _c in _cands:
+        if _c and _guard_os.path.isfile(_c):
+            return _c
+    return None
+
+def _scan_duplicate_definitions(source_text):
+    """Pure (no Spark, no IO): every re-defined function/class as (name, first_line, dup_line).
+    The engine refuses to run if this returns anything — later-def-wins is silent corruption."""
+    _tree = _guard_ast.parse(source_text)
+    _seen, _dups = {}, []
+    for _node in _guard_ast.walk(_tree):
+        if isinstance(_node, (_guard_ast.FunctionDef, _guard_ast.AsyncFunctionDef, _guard_ast.ClassDef)):
+            if _node.name in _seen and _seen[_node.name] != _node.lineno:
+                _dups.append((_node.name, _seen[_node.name], _node.lineno))
+            else:
+                _seen[_node.name] = _node.lineno
+    return _dups
+
+def _guard_no_duplicate_definitions():
+    _p = _resolve_utils_source()
+    if _p is None:
+        print("  WARN structural guard: utils.py source path unresolvable here — duplicate scan skipped")
+        return
+    with open(_p, encoding="utf-8") as _f:
+        _dups = _scan_duplicate_definitions(_f.read())
+    if _dups:
+        raise ImportError(
+            "utils.py has DUPLICATE definitions (later-def-wins hazard, Nov 23 incident): "
+            + ", ".join(f"{_n} (lines {_a}, {_b})" for _n, _a, _b in _dups[:10])
+        )
+    print(f"  PASS structural guard: no duplicate definitions ({_p})")
+
+_guard_no_duplicate_definitions()
+
+# --- guard self-pins (auto-run at import) ---
+assert _scan_duplicate_definitions("def a():\n    pass\n\ndef a():\n    pass\n") == [("a", 1, 4)], \
+    "dup scanner must detect re-definitions"
+assert _scan_duplicate_definitions("def a():\n    pass\n\ndef b():\n    pass\n") == [], \
+    "dup scanner must not flag distinct names"
+print("  PASS structural guard: dup-def scanner self-pins (2/2)")
+
+# COMMAND ----------
+
 # DBTITLE 1,# Configuration
 # ============================================================================
 # SILVER LAYER - CONFIGURATION 11/17/2026
@@ -5872,6 +5939,243 @@ print("🧰 Drift/deletion/identity detectors loaded — audit_event_time_format
 
 # COMMAND ----------
 
+# DBTITLE 1,# Gap Taxonomy Engine I — Vocabulary Drift, Sticky Baselines, Dispatcher, Pins
+# 11/26/2026 — Tranche 1 of the deterministic taxonomy-coverage plan (the 30-gap forge).
+# DOCTRINE:
+#   * AX-02 evidence-only: findings carry the observed sets, never vibes. A
+#     justification string is required INSIDE the evidence dict (dispatcher spec).
+#   * AX-113 drift-begins-before-measured: vocabulary drift is only measurable once the
+#     sticky baseline exists; before that the check reports INFO, not PASS.
+#   * AX-117 ambiguity-surfaced: every refusal/failure states exactly why.
+#   * READ-mode checks are PROBE-SILENT: read-only, never write _run_log (Nov 24
+#     lesson — probes that write evidence self-fulfill alarms).
+#   * WRITE-mode (baseline refresh) is operator-only: the dispatcher refuses without a
+#     justification AND explicit approval. Baselines are sticky — never touched by nightly.
+#   * Exceptions return structured findings, never raise (11/19 blanket fail-safe).
+#   * Pins run at import: a check that cannot fail is untested (11/17 corpus pattern).
+#   * SC-safe throughout: no .rdd anywhere; collect_set/collect on small vocab sets only.
+
+from pyspark.sql import functions as _gap_F
+from pyspark.sql import types as _gap_T
+
+_VOCAB_BASELINE_TABLE = "crm_ingestion.silver._vocab_baselines"
+
+# Source-of-truth enum/vocabulary columns the engine vows to watch (the 10 vocabulary
+# taxonomies from the 30-gap plan, one config per column). Extend freely — every entry
+# becomes baseline rows on the next deliberate refresh.
+VOCAB_DRIFT_TARGETS = {
+    ("lead_activites_processed", "type"): "AX-02/AX-113",
+    ("lead_activites_processed", "status"): "AX-02/AX-113",
+    ("lead_activites_processed", "disposition"): "AX-02/AX-113",
+    ("lead_activites_processed", "outcome_id"): "AX-02/AX-113",
+    ("lead_activites_processed", "custom_activity_type_id"): "AX-02/AX-113",
+    ("leads_processed", "status_label"): "AX-02/AX-113",
+    ("leads_processed_custom", "Tier"): "AX-02/AX-113",
+    ("leads_processed_custom", "program"): "AX-02/AX-113",
+    ("leads_processed_custom", "Buyer_Readiness_Stage"): "AX-02/AX-113",
+    ("calendly_scheduled_events_processed", "EVENT_TYPE_NAME"): "AX-02/AX-113",
+    ("calendly_scheduled_events_processed", "EVENT_NAME"): "AX-02/AX-113",
+    ("lead_activites_processed_attendees", "status"): "AX-02/AX-113",
+    ("mdl_users_processed", "LANG"): "AX-02/AX-113",
+}
+
+def _gap_finding(check, status, severity, evidence, action, axiom):
+    """Shared finding shape for the whole gap-taxonomy engine (Tranches 1-4)."""
+    return {"check": check, "status": status, "severity": severity,
+            "evidence": evidence, "recommended_action": action,
+            "axiom": axiom, "engine": "gap_taxonomy"}
+
+def check_vocabulary_drift(spark, silver_name, column_name, df=None,
+                           sample_rows=100000, known_values=None):
+    """AX-02/AX-113 — vocabulary/enum drift for one (silver table, column).
+    Baseline: explicit known_values allow-list, else the sticky silver._vocab_baselines.
+    New values (observed minus baseline) => FAIL naming them; empty baseline => INFO
+    (not yet measurable per AX-113); observed subset of baseline => PASS. df overrides
+    the table read (pins pass fixtures; prod passes table names). Read-only, never raises."""
+    try:
+        _df = df if df is not None else spark.table(f"crm_ingestion.silver.`{silver_name}`")
+        _observed = set(r[0] for r in (
+            _df.select(_gap_F.col(column_name).cast("string").alias("v"))
+               .where(_gap_F.col("v").isNotNull() & (_gap_F.trim(_gap_F.col("v")) != ""))
+               .limit(sample_rows).distinct().collect()))
+        if known_values is not None:
+            _baseline = set(str(v) for v in known_values)
+            _src = "explicit allow-list"
+        else:
+            _src = "sticky baseline"
+            try:
+                _baseline = set(r[0] for r in spark.table(_VOCAB_BASELINE_TABLE)
+                    .where((_gap_F.col("silver_name") == silver_name) &
+                           (_gap_F.col("column_name") == column_name))
+                    .select("value").distinct().collect())
+            except Exception:
+                _baseline = set()
+        if not _baseline:
+            return _gap_finding("vocabulary_drift", "INFO", "INFO",
+                {"silver_name": silver_name, "column": column_name,
+                 "observed_count": len(_observed), "sample_values": sorted(_observed)[:10],
+                 "baseline_source": _src,
+                 "justification": "no baseline rows for this column — drift not yet measurable (AX-113)"},
+                "Arm via invoke_gap_check('refresh_vocab_baselines', spark=..., justification=..., approved=True)",
+                "AX-113")
+        _new = sorted(_observed - _baseline)
+        _retired = sorted(_baseline - _observed)
+        if _new:
+            return _gap_finding("vocabulary_drift", "FAIL", "MEDIUM",
+                {"silver_name": silver_name, "column": column_name,
+                 "new_values": _new[:20], "new_count": len(_new),
+                 "observed_count": len(_observed), "baseline_count": len(_baseline),
+                 "baseline_source": _src, "retired_values": _retired[:10],
+                 "justification": "values absent from the baseline appeared in the live column (AX-02: evidence is the observed set)"},
+                "Investigate the source enum change; refresh the baseline deliberately if accepted",
+                "AX-02/AX-113")
+        return _gap_finding("vocabulary_drift", "PASS", "INFO",
+            {"silver_name": silver_name, "column": column_name,
+             "observed_count": len(_observed), "baseline_count": len(_baseline),
+             "baseline_source": _src, "retired_values": _retired[:10],
+             "justification": "observed vocabulary is a subset of the sticky baseline"},
+            "None — vocabulary stable", "AX-02")
+    except Exception as _e:
+        return _gap_finding("vocabulary_drift", "ERROR", "HIGH",
+            {"silver_name": silver_name, "column": column_name,
+             "justification": "check raised — structured fail-safe per 11/19 doctrine",
+             "error": f"{type(_e).__name__}: {str(_e)[:200]}"},
+            "Fix invocation (table or column name)", "AX-117")
+
+def refresh_vocab_baselines(spark, justification, approved, targets=None, sample_rows=100000):
+    """AX-02 — WRITE-MODE, sticky by doctrine. Rebuilds silver._vocab_baselines for the
+    configured targets, PRESERVING first_seen of known values and stamping the operator's
+    justification into every row. Never called by the nightly — only through the
+    dispatcher write-gate. Table is created on first arming; until then all vocabulary
+    checks report INFO (AX-113)."""
+    import datetime as _gap_dt
+    _today = _gap_dt.date.today().isoformat()
+    _targets = dict(targets) if targets else dict(VOCAB_DRIFT_TARGETS)
+    try:
+        try:
+            _old = {(r.silver_name, r.column_name, r.value): r.first_seen
+                    for r in spark.table(_VOCAB_BASELINE_TABLE).collect()}
+        except Exception:
+            _old = {}
+        _rows = []
+        for (_t, _c) in _targets:
+            _obs = sorted(set(r[0] for r in (
+                spark.table(f"crm_ingestion.silver.`{_t}`")
+                     .select(_gap_F.col(_c).cast("string").alias("v"))
+                     .where(_gap_F.col("v").isNotNull() & (_gap_F.trim(_gap_F.col("v")) != ""))
+                     .limit(sample_rows).distinct().collect())))
+            for _v in _obs:
+                _rows.append((_t, _c, _v, _old.get((_t, _c, _v), _today), _today, str(justification)[:300]))
+        _schema = _gap_T.StructType([
+            _gap_T.StructField("silver_name", _gap_T.StringType()),
+            _gap_T.StructField("column_name", _gap_T.StringType()),
+            _gap_T.StructField("value", _gap_T.StringType()),
+            _gap_T.StructField("first_seen", _gap_T.StringType()),
+            _gap_T.StructField("last_seen", _gap_T.StringType()),
+            _gap_T.StructField("justification", _gap_T.StringType())])
+        _out = spark.createDataFrame(_rows, schema=_schema) if _rows else \
+            spark.createDataFrame([], schema=_schema)
+        (_out.write.format("delta").mode("overwrite")
+             .option("mergeSchema", "true").saveAsTable(_VOCAB_BASELINE_TABLE))
+        return _gap_finding("refresh_vocab_baselines", "PASS", "INFO",
+            {"rows_written": len(_rows),
+             "targets": sorted(set(f"{t}.{c}" for (t, c) in _targets)),
+             "justification": justification},
+            "Baselines armed — vocabulary drift checks are now measurable", "AX-02")
+    except Exception as _e:
+        return _gap_finding("refresh_vocab_baselines", "ERROR", "HIGH",
+            {"justification": justification,
+             "error": f"{type(_e).__name__}: {str(_e)[:200]}"},
+            "Fix targets/columns and retry", "AX-117")
+
+# The single dispatch point (dispatcher spec, 11/26). Write-mode demands human approval.
+GAP_CHECK_REGISTRY = {
+    "vocabulary_drift": {
+        "fn": "check_vocabulary_drift", "mode": "read",
+        "required": ["silver_name", "column_name"],
+        "axiom": "AX-02/AX-113",
+        "failure_mode": "enum/vocabulary drift begins before it is measured"},
+    "refresh_vocab_baselines": {
+        "fn": "refresh_vocab_baselines", "mode": "write",
+        "required": ["justification", "approved"],
+        "axiom": "AX-02",
+        "failure_mode": "baseline staleness masquerading as drift"},
+}
+
+def invoke_gap_check(name, spark, **inputs):
+    """11/26/2026 — the SINGLE dispatch point for the gap-taxonomy engine.
+    * unknown name            -> structured REFUSED finding (names the registry)
+    * missing required inputs -> structured REFUSED finding (names the missing keys)
+    * write-mode              -> requires non-empty justification AND approved=True,
+                                else REFUSED — the write-gate never raises (AX-117)
+    * any exception           -> structured ERROR finding, never raised (11/19 doctrine)"""
+    try:
+        _reg = GAP_CHECK_REGISTRY.get(name)
+        if _reg is None:
+            return _gap_finding("dispatcher", "REFUSED", "MEDIUM",
+                {"requested": name, "available": sorted(GAP_CHECK_REGISTRY),
+                 "justification": "unknown check name — refusing rather than guessing"},
+                "Invoke with a registered name", "AX-117")
+        _missing = [k for k in _reg["required"]
+                    if k not in inputs or inputs.get(k) in (None, "", [])]
+        if _missing:
+            return _gap_finding("dispatcher", "REFUSED", "MEDIUM",
+                {"requested": name, "missing_inputs": _missing,
+                 "required": _reg["required"],
+                 "justification": "required inputs absent — refusing rather than guessing"},
+                f"Pass required inputs: {_reg['required']}", "AX-117")
+        if _reg["mode"] == "write" and inputs.get("approved") is not True:
+            return _gap_finding("dispatcher", "REFUSED", "HIGH",
+                {"requested": name, "justification": inputs.get("justification"),
+                 "write_gate": "approved=True required for write-mode"},
+                "Human review required — re-invoke with approved=True", "AX-02")
+        return globals()[_reg["fn"]](spark, **inputs)
+    except Exception as _e:
+        return _gap_finding("dispatcher", "ERROR", "HIGH",
+            {"requested": name,
+             "justification": "raised — structured fail-safe",
+             "error": f"{type(_e).__name__}: {str(_e)[:200]}"},
+            "Inspect inputs", "AX-117")
+
+# --- Tranche 1 corpus pins (auto-run at import; 11/17 ladder-corpus pattern) ---
+_gap_failures = []
+def _gap_pin(label, cond, detail=""):
+    if not cond:
+        _gap_failures.append(f"{label}: {detail}")
+
+_fx = spark.createDataFrame(
+    [{"v": "call"}, {"v": "meeting"}, {"v": "NEW_ENUM_X"}],
+    schema=_gap_T.StructType([_gap_T.StructField("v", _gap_T.StringType())]))
+
+_r = check_vocabulary_drift(spark, "pin_table", "v", df=_fx, known_values=["call", "meeting"])
+_gap_pin("known-bad fails and names the value",
+         _r["status"] == "FAIL" and "NEW_ENUM_X" in _r["evidence"]["new_values"], str(_r))
+
+_r = check_vocabulary_drift(spark, "pin_table", "v",
+                            df=_fx.where(_gap_F.col("v") != "NEW_ENUM_X"),
+                            known_values=["call", "meeting"])
+_gap_pin("known-good passes", _r["status"] == "PASS", str(_r))
+
+_r = invoke_gap_check("refresh_vocab_baselines", spark, justification="pin test", approved=False)
+_gap_pin("write-gate refuses without approval", _r["status"] == "REFUSED", str(_r))
+
+_r = invoke_gap_check("vocabulary_driftzz", spark, silver_name="x", column_name="y")
+_gap_pin("unknown name refused", _r["status"] == "REFUSED", str(_r))
+
+_r = invoke_gap_check("vocabulary_drift", spark, silver_name="x")
+_gap_pin("missing input refused and named",
+         _r["status"] == "REFUSED" and _r["evidence"].get("missing_inputs") == ["column_name"], str(_r))
+
+_r = check_vocabulary_drift(spark, "pin_table", "not_a_column", df=_fx, known_values=["x"])
+_gap_pin("exception returns structured ERROR, never raises",
+         _r["status"] == "ERROR" and "justification" in _r["evidence"], str(_r))
+
+if _gap_failures:
+    raise AssertionError("Gap taxonomy Tranche 1 regression: " + "; ".join(_gap_failures))
+print("  PASS 11/26: gap taxonomy I — vocabulary engine + dispatcher (6/6 pins)")
+
+# COMMAND ----------
+
 # DBTITLE 1,# ENGINE HEALTH — fleet control room
 # ============================================================================
 # ENGINE HEALTH — fleet control room 11/17/2026
@@ -6556,3 +6860,51 @@ def raw_lineage_tree(bronze_name=None, silver_name=None, limit=200):
 # MAGIC #   - Full 94-function inventory + turn-by-turn designs live in the
 # MAGIC #     original email thread (self-sent 11/23: 'Things' 12:14 PM +
 # MAGIC #     'More things' 12:19 PM).
+
+# COMMAND ----------
+
+# DBTITLE 1,# Utils Index Generator (regenerates UTILS_INDEX.md)
+# 11/26/2026 — GENERATED reference, never hand-edited. Doctrine: maintained docs drift
+# (the README re-verification exists for exactly that); generated docs cannot. Reads
+# utils.py itself and writes an alphabetical def/class registry with owning cell, line
+# number, and first docstring line. Run after every utils change; commit the result
+# alongside the code change.
+
+def build_utils_index(source_path=None, output_path=None):
+    """Regenerate UTILS_INDEX.md — the alphabetical function registry of this engine.
+    Returns the output path written. Pure file/AST work: no Spark, no table reads."""
+    import ast as _idx_ast, os as _idx_os, datetime as _idx_dt
+    _src = source_path or _resolve_utils_source()
+    if _src is None:
+        raise FileNotFoundError("utils.py source path unresolvable — pass source_path explicitly")
+    _text = open(_src, encoding="utf-8").read()
+    _tree = _idx_ast.parse(_text)
+    _cell_of, _cur = {}, "(header)"
+    for _i, _line in enumerate(_text.split("\n"), 1):
+        if _line.startswith("# DBTITLE 1,"):
+            _cur = _line.split("# DBTITLE 1,", 1)[1].strip()
+        _cell_of[_i] = _cur
+    _rows = []
+    for _node in _idx_ast.walk(_tree):
+        if isinstance(_node, (_idx_ast.FunctionDef, _idx_ast.AsyncFunctionDef, _idx_ast.ClassDef)):
+            _doc = (_idx_ast.get_docstring(_node) or "").strip()
+            _rows.append((_node.name,
+                          "class" if isinstance(_node, _idx_ast.ClassDef) else "def",
+                          _node.lineno,
+                          _cell_of.get(_node.lineno, "?"),
+                          _doc.split("\n")[0][:120]))
+    _rows.sort(key=lambda r: r[0].lower())
+    _out = output_path or _idx_os.path.join(_idx_os.path.dirname(_src), "UTILS_INDEX.md")
+    _now = _idx_dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    with open(_out, "w", encoding="utf-8") as _f:
+        _f.write(f"# UTILS_INDEX — generated {_now}\n\n")
+        _f.write("GENERATED FILE — never hand-edit. Regenerate after every utils.py change:\n")
+        _f.write("%run utils, then `build_utils_index()`; commit the result with the change.\n\n")
+        _f.write(f"{len(_rows)} functions and classes across this engine, alphabetical.\n\n")
+        _f.write("| Name | Kind | Line | Cell | Description |\n")
+        _f.write("| --- | --- | --- | --- | --- |\n")
+        for _n, _k, _ln, _cell, _desc in _rows:
+            _d = _desc.replace("|", "\\|") or "—"
+            _f.write(f"| `{_n}` | {_k} | {_ln} | {_cell} | {_d} |\n")
+    print(f"  PASS utils index: {len(_rows)} entries -> {_out}")
+    return _out
