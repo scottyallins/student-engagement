@@ -5971,7 +5971,6 @@ VOCAB_DRIFT_TARGETS = {
     ("lead_activites_processed", "custom_activity_type_id"): "AX-02/AX-113",
     ("leads_processed", "status_label"): "AX-02/AX-113",
     ("leads_processed_custom", "Tier"): "AX-02/AX-113",
-    ("leads_processed_custom", "program"): "AX-02/AX-113",
     ("leads_processed_custom", "Buyer_Readiness_Stage"): "AX-02/AX-113",
     ("calendly_scheduled_events_processed", "EVENT_TYPE_NAME"): "AX-02/AX-113",
     ("calendly_scheduled_events_processed", "EVENT_NAME"): "AX-02/AX-113",
@@ -6173,6 +6172,181 @@ _gap_pin("exception returns structured ERROR, never raises",
 if _gap_failures:
     raise AssertionError("Gap taxonomy Tranche 1 regression: " + "; ".join(_gap_failures))
 print("  PASS 11/26: gap taxonomy I — vocabulary engine + dispatcher (6/6 pins)")
+
+# COMMAND ----------
+
+# DBTITLE 1,# Gap Taxonomy Engine II — Blind-Spot Census (the check that plans the checks)
+# 11/26/2026 — Tranche 5 first artifact, forged early because its output RANKS the
+# remaining gap work. AX-122 (unobserved column paths), AX-02 (evidence only).
+# Observation tiers per (silver table, column):
+#   SYSTEM                CDC machinery watching itself (payload_hash, bronze_insert_date,
+#                         bronze_updated_at, _is_deleted, _deleted_detected_at) — excluded.
+#   CONTENT-WATCHED       a named check reads the VALUES: VOCAB_DRIFT_TARGETS (Tranche 1)
+#                         plus the per-table event-time column audited nightly by
+#                         audit_event_time_format (engine health check 10).
+#   CONTENT-BLIND-REG     table is in _schema_registry (presence/type pinned) but no
+#                         check reads this column's values.
+#   CONTENT-BLIND-UNREG   worst class: nothing watches this column at all.
+# 11/26 live-first-run catches (receipts in INTERVIEW terms): only ~1.8% of silver
+# columns have a named content check; _schema_registry pins only 7 of 20 source
+# tables (child tables + quarantines unpinned); registry holds a ghost row for the
+# dropped db_source_processed. The census does not measure itself (_-tables excluded).
+# Scope note: aggregate guards (grain ratio, count growth, quarantine rate) watch
+# TABLES, not column contents — this measures column-CONTENT observation only.
+# Census is a MEASUREMENT: INFO by default; WARN only against a pinned coverage
+# floor (armed deliberately, like everything else in Tranche 5).
+
+def _bs_system_column(name):
+    """CDC machinery columns — the guards themselves, never blind spots."""
+    return name in {"payload_hash", "bronze_insert_date", "bronze_updated_at",
+                    "_is_deleted", "_deleted_detected_at"}
+
+def _bs_classify(spark, column_specs=None, watched=None, registered_tables=None):
+    """Shared resolution + classification for census_blind_spots / blind_spot_rows.
+    Live defaults: information_schema columns (excluding _-prefixed engine tables),
+    VOCAB_DRIFT_TARGETS + resolved event-time columns, _schema_registry tables."""
+    if column_specs is None:
+        _rows = spark.sql(
+            f"SELECT table_name, column_name FROM {CATALOG}.information_schema.columns "
+            f"WHERE table_schema = '{SILVER_SCHEMA}'").collect()
+        _engine = {(r.table_name, r.column_name) for r in _rows
+                   if r.table_name.startswith("_")}
+        column_specs = [(r.table_name, r.column_name) for r in _rows
+                        if not r.table_name.startswith("_")]
+    else:
+        _engine = set()
+    if watched is None:
+        watched = {(t, c) for (t, c) in VOCAB_DRIFT_TARGETS}
+        for _t in sorted({t for t, _ in column_specs}):
+            try:
+                _et = _find_event_time(spark.table(f"{CATALOG}.{SILVER_SCHEMA}.`{_t}`"))
+                if _et:
+                    watched.add((_t, _et))
+            except Exception:
+                pass
+    else:
+        watched = set(watched)
+    if registered_tables is None:
+        try:
+            registered_tables = {r.silver_name for r in
+                spark.table(_SCHEMA_REGISTRY).select("silver_name").distinct().collect()}
+        except Exception:
+            registered_tables = set()
+    _cls = {}
+    for (_t, _c) in column_specs:
+        if _bs_system_column(_c):
+            _cls[(_t, _c)] = "system"
+        elif (_t, _c) in watched:
+            _cls[(_t, _c)] = "content_watched"
+        elif _t in registered_tables:
+            _cls[(_t, _c)] = "content_blind_registered"
+        else:
+            _cls[(_t, _c)] = "content_blind_unregistered"
+    return _cls, _engine
+
+def census_blind_spots(spark, column_specs=None, watched=None,
+                       registered_tables=None, coverage_floor=None):
+    """AX-122/AX-02 — the blind-spot census: which silver columns have NO named
+    content-level check watching them. INFO census by default; WARN only when a
+    pinned coverage_floor is exceeded. Ranked worklist via blind_spot_rows().
+    Pins override column_specs/watched/registered_tables for determinism.
+    unregistered_tables is derived FROM the classification, never re-read, so the
+    evidence can never disagree with the tier counts (first live run caught that)."""
+    try:
+        _cls, _engine = _bs_classify(spark, column_specs, watched, registered_tables)
+        _n = len(_cls) or 1
+        _cw = sum(1 for v in _cls.values() if v == "content_watched")
+        _sys = sum(1 for v in _cls.values() if v == "system")
+        _br = sum(1 for v in _cls.values() if v == "content_blind_registered")
+        _bu = sum(1 for v in _cls.values() if v == "content_blind_unregistered")
+        _blind_pct = round(100 * (_br + _bu) / _n, 1)
+        _per_table = {}
+        for (_t, _c), _k in _cls.items():
+            if _k.startswith("content_blind"):
+                _per_table[_t] = _per_table.get(_t, 0) + 1
+        _top = sorted(_per_table.items(), key=lambda x: -x[1])[:8]
+        _evidence = {
+            "silver_tables": len({t for t, _ in _cls}),
+            "columns_censused": len(_cls),
+            "system_columns": _sys,
+            "content_watched": _cw,
+            "content_watched_pct": round(100 * _cw / _n, 1),
+            "content_blind_pct": _blind_pct,
+            "content_blind_registered": _br,
+            "content_blind_unregistered": _bu,
+            "unregistered_tables": sorted({t for (t, _c), _k in _cls.items()
+                                           if _k == "content_blind_unregistered"}),
+            "top_blind_tables": [{"table": t, "blind_columns": n} for t, n in _top],
+            "engine_columns_excluded": len(_engine),
+            "justification": "census measured from live information_schema + engine check registries (AX-02)"}
+        if coverage_floor is not None and _blind_pct > coverage_floor:
+            return _gap_finding("census_blind_spots", "WARN", "MEDIUM", _evidence,
+                f"content-blind {_blind_pct}% exceeds the pinned floor {coverage_floor}% — aim checks at the top blind tables",
+                "AX-122/AX-02")
+        return _gap_finding("census_blind_spots",
+                            "INFO" if coverage_floor is None else "PASS", "INFO", _evidence,
+            "blind_spot_rows() gives the ranked worklist; aim Tranche 2/3 checks at the top blind tables",
+            "AX-122/AX-02")
+    except Exception as _e:
+        return _gap_finding("census_blind_spots", "ERROR", "HIGH",
+            {"justification": "raised — structured fail-safe",
+             "error": f"{type(_e).__name__}: {str(_e)[:200]}"},
+            "Fix census invocation", "AX-117")
+
+def blind_spot_rows(spark, column_specs=None, watched=None, registered_tables=None):
+    """AX-122 — the ranked worklist behind the census: one row per content-blind
+    column (silver_name, column_name, blind_class). On-demand, read-only."""
+    from pyspark.sql import types as _bs_T
+    _schema = _bs_T.StructType([
+        _bs_T.StructField("silver_name", _bs_T.StringType()),
+        _bs_T.StructField("column_name", _bs_T.StringType()),
+        _bs_T.StructField("blind_class", _bs_T.StringType())])
+    try:
+        _cls, _ = _bs_classify(spark, column_specs, watched, registered_tables)
+        _rows = [(t, c, k) for (t, c), k in sorted(_cls.items())
+                 if k.startswith("content_blind")]
+        return spark.createDataFrame(_rows, schema=_schema)
+    except Exception:
+        return spark.createDataFrame([], schema=_schema)
+
+# register through the single dispatch point (additive; Tranche 1 owns the base dict)
+GAP_CHECK_REGISTRY["census_blind_spots"] = {
+    "fn": "census_blind_spots", "mode": "read", "required": [],
+    "axiom": "AX-122/AX-02",
+    "failure_mode": "columns whose content nobody watches — drift lands silently"}
+
+# --- Blind-spot census pins (auto-run at import) ---
+_bs_failures = []
+def _bs_pin(label, cond, detail=""):
+    if not cond: _bs_failures.append(f"{label}: {detail}")
+
+_fx_specs = [("t1", "payload_hash"), ("t1", "updated_at"), ("t1", "notes"), ("t2", "amount")]
+_fx_watched = {("t1", "updated_at")}
+_fx_reg = {"t1"}
+_r = census_blind_spots(spark, column_specs=_fx_specs, watched=_fx_watched,
+                        registered_tables=_fx_reg)
+_e = _r["evidence"]
+_bs_pin("tiering exact + evidence consistent",
+        _e["system_columns"] == 1 and _e["content_watched"] == 1
+        and _e["content_blind_registered"] == 1 and _e["content_blind_unregistered"] == 1
+        and _e["content_blind_pct"] == 50.0
+        and _e["unregistered_tables"] == ["t2"], str(_e))
+
+_r = census_blind_spots(spark, column_specs=_fx_specs, watched=_fx_watched,
+                        registered_tables=_fx_reg, coverage_floor=40)
+_bs_pin("floor exceeded -> WARN", _r["status"] == "WARN", str(_r["status"]))
+
+_r = census_blind_spots(spark, column_specs=_fx_specs, watched=_fx_watched,
+                        registered_tables=_fx_reg, coverage_floor=90)
+_bs_pin("floor met -> PASS", _r["status"] == "PASS", str(_r["status"]))
+
+_r = invoke_gap_check("census_blind_spots", spark, column_specs=_fx_specs,
+                      watched=_fx_watched, registered_tables=_fx_reg)
+_bs_pin("dispatcher routes the census", _r["status"] == "INFO" and _r["engine"] == "gap_taxonomy", str(_r["status"]))
+
+if _bs_failures:
+    raise AssertionError("Blind-spot census regression: " + "; ".join(_bs_failures))
+print("  PASS 11/26: blind-spot census (4/4 pins)")
 
 # COMMAND ----------
 
