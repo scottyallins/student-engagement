@@ -55,6 +55,8 @@ resources:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_1_01_Silver_leads_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_leads_custom
           depends_on:
             - task_key: silver_leads
@@ -66,6 +68,8 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_1_02_Silver_leads_processed_custom.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_contacts
           depends_on:
             - task_key: silver_leads
@@ -77,6 +81,8 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_1_03_01_Silver_leads_processed_contacts.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         # ---------- SILVER SET 3: grandchildren (wait for ALL children) ----------
         - task_key: silver_contacts_emails
           depends_on:
@@ -88,11 +94,15 @@ resources:
             - task_key: silver_activities_to
           notebook_task:
             notebook_path: 2_Silver/2_1_03_02_Silver_leads_processed_contacts_emails.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_activities
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_2_01_Silver_lead_activites_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_email_body
           depends_on:
             - task_key: silver_leads
@@ -104,6 +114,8 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_2_02_Silver_lead_activites_email_body.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         # ---------- SILVER SET 2: children (each waits for ALL silver set-1 parents) ----------
         - task_key: silver_activities_attendees
           depends_on:
@@ -116,6 +128,8 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_2_03_Silver_lead_activites_attendees.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_activities_envelope
           depends_on:
             - task_key: silver_leads
@@ -127,6 +141,8 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_2_04_Silver_lead_activites_processed_envelope.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_activities_to
           depends_on:
             - task_key: silver_leads
@@ -138,16 +154,22 @@ resources:
             - task_key: silver_mdl_users
           notebook_task:
             notebook_path: 2_Silver/2_2_05_Silver_lead_activites_processed_to.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_crm_users
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_3_Silver_close_crm_users_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_custom_activities
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_4_01_Silver_custom_activites_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         # custom-activity fields child: the cf_ key -> field-name dictionary
         # (one row per field definition per type; gold 3_03 resolves setter/closer/
         # contract value/program through it instead of hardcoded keys). The two
@@ -157,27 +179,37 @@ resources:
             - task_key: silver_custom_activities
           notebook_task:
             notebook_path: 2_Silver/2_4_02_Silver_custom_activites_processed_fields.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_calendly
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_5_Silver_calendly_scheduled_events_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_sentiment
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_6_Silver_student_sentiment_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         - task_key: silver_mdl_users
           depends_on:
             - task_key: bronze_ingestion
           notebook_task:
             notebook_path: 2_Silver/2_7_Silver_mdl_users_processed.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         # ---------- SILVER SET 4: identity mapping (waits for ALL other silver) ----------
         - task_key: silver_user_mapping
           depends_on:
             - task_key: silver_contacts_emails
           notebook_task:
             notebook_path: 2_Silver/2_8_Silver_user_mapping.ipynb
+          max_retries: 2
+          min_retry_interval_millis: 300000
         # ---------- GOLD CONTRACT GATE (11/24/2026): after ALL silver, before
         # ANY gold — enforce_gold_contracts() (utils) halts the job on the
         # silver live→dark rename signature (SILVER_GOLD_CONTRACTS mined
