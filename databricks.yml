@@ -1,5 +1,5 @@
 # Student Engagement Pipeline — Declarative Automation Bundle (DAB).
-# The nightly job (39 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
+# The nightly job (40 tasks, explicit dependency DAG, 8:00 AM EST) is defined here as code.
 # Deploy from a local clone: databricks bundle deploy --target prod   (see DEPLOY.md)
 
 bundle:
@@ -355,6 +355,11 @@ resources:
             - task_key: gold_communication_state
           notebook_task:
             notebook_path: 3_Gold/3_15_Gold_customer_health_history.ipynb
+        - task_key: gold_ml_frame
+          depends_on:
+            - task_key: gold_health_history
+          notebook_task:
+            notebook_path: 3_Gold/3_21_Gold_ml_training_frame.ipynb
         # ---------- GOLD SET 4 (continued): communication state ----------
         - task_key: gold_communication_state
           depends_on:

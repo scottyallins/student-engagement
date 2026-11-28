@@ -7,7 +7,7 @@ A Databricks Medallion Architecture pipeline (Bronze → Silver → Gold) that t
 
 Everything the pipeline does lives in this repository: the Bronze ingestion, Silver processing, and Gold build notebooks, plus the nightly job itself, defined as code in `databricks.yml` (a Declarative Automation Bundle) and deployed with the Databricks CLI.
 
-The job runs **39 tasks, daily at 8:00 AM Eastern, on serverless compute**, completing in roughly 20–35 minutes for about $0.80 per run at list pricing.
+The job runs **40 tasks, daily at 8:00 AM Eastern, on serverless compute**, completing in roughly 20–35 minutes for about $0.80 per run at list pricing.
 
 ---
 
@@ -75,7 +75,7 @@ GOLD    crm_ingestion.gold            20 live tables + lead_merge_map (3_01 buil
        merge map       lead_merge_map (CRM lead merges, chain-resolved)
     |
     v
-Databricks Job — 39 tasks, daily 8:00 AM ET, serverless, defined as code in databricks.yml
+Databricks Job — 40 tasks, daily 8:00 AM ET, serverless, defined as code in databricks.yml
 ```
 
 ---
@@ -401,7 +401,7 @@ Client email lookup: `email = primary_customer_email OR array_contains(customer_
 
 ---
 
-## 8. Job Orchestration (39 tasks)
+## 8. Job Orchestration (40 tasks)
 
 | Field | Value |
 |---|---|
