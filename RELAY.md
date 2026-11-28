@@ -14,7 +14,7 @@ Clipboard relay is O(n^2) transport and already caused one wrong-remote incident
 
 ## Current rulings
 - Repo topology: student-engagement.git = canonical deterministic lineage; Autonomous = clean-room canary.
-- ML FREEZE (2026-11-27, owner directive): labels and observation only. No ML-driven decisions until lifted.
+- ML FREEZE (2026-11-27, owner directive): labels and observation only. No ML-driven decisions until 2026-12-01 (lift date set by owner).
   Substrate: `crm_ingestion.ml_prototype.training_frame_v2_multi_date` (15,464 pairs; UP 2,108 / DOWN 1,966 /
   STABLE 11,390; 17 label dates) — nightly refresh = task `gold_ml_frame` (3_21).
 - Blind-spot census materialized: `crm_ingestion.silver._column_census` (585 rows; 234 registered-blind,
@@ -22,5 +22,13 @@ Clipboard relay is O(n^2) transport and already caused one wrong-remote incident
 
 ## Open items
 - Deploy gap (AX-518): bundle carries retries + on-failure email + gold_ml_frame; live job still on old settings.
-- Late-arrival watermark: bounded-lookback CDC patch pending owner approval.
+- Late-arrival watermark: RESOLVED 11/27 — owner approved; 24h lookback patch in repo pending deploy.
 - Frame ownership across workspaces (source nightly proposed as owner of the label substrate).
+
+## Owner rulings — 2026-11-27
+1. Deploy: APPROVED — owner deploys after this push.
+2. Delta Sharing of the training frame (one table, read-only): APPROVED — share `student_engagement_ml_frame`; recipient metastore id pending from ML workspace.
+3. ML freeze lift date: 2026-12-01.
+4. 24h bounded-lookback CDC patch: APPROVED — built in this push.
+5. duration_ms run-log telemetry: APPROVED — built in this push.
+6. Kill switch (named emergency stop + coordinated drill): explanation pending with owner; not yet approved.

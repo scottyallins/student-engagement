@@ -1607,7 +1607,7 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
                    deduped_rows=None, cdc_rows=None, repair_needed=None,
                    discovery_mode=None, fields_discovered=None,
                    parsed_valid=None, parsed_null=None, quarantined_new=None,
-                   note=None, rung_stats=None, grain_ratio=None):
+                   note=None, rung_stats=None, grain_ratio=None, duration_ms=None):
     """11/17/2026 — RUN LOG: one row per parse run, appended to
     {SILVER_SCHEMA}._run_log (rows in / deduped / CDC / parsed /
     quarantined / fields / discovery mode / note / rung mix). The fleet's nervous
@@ -1621,7 +1621,10 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
     exclude NULLs or the history silently biases toward zero.
     11/23/2026 — grain_ratio (rows/distinct pk on the batch sent onward):
     NULL before 11/23 or when no PK is detectable — also PRE-TELEMETRY,
-    not zero; the grain-shift health check reads it."""
+    not zero; the grain-shift health check reads it.
+    11/27/2026 — duration_ms (elapsed parse ms, stamped by parse_bronze_table's
+    timed wrapper): NULL before 11/27 = PRE-TELEMETRY, not zero. REBUILD rows
+    don't set it yet (rebuild paths log directly)."""
     try:
         from datetime import datetime, timezone
         spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
@@ -1632,14 +1635,14 @@ def _run_log_write(bronze_table, silver_name, mode, raw_rows=None,
               raw_rows, deduped_rows, cdc_rows, repair_needed,
               discovery_mode, fields_discovered,
               parsed_valid, parsed_null, quarantined_new, note,
-              rung_stats, grain_ratio)],
+              rung_stats, grain_ratio, duration_ms)],
             schema=("run_id STRING, logged_at STRING, bronze_table STRING, "
                     "silver_name STRING, mode STRING, raw_rows BIGINT, "
                     "deduped_rows BIGINT, cdc_rows BIGINT, repair_needed BOOLEAN, "
                     "discovery_mode STRING, fields_discovered INT, "
                     "parsed_valid BIGINT, parsed_null BIGINT, "
                     "quarantined_new BIGINT, note STRING, rung_stats STRING, "
-                    "grain_ratio DOUBLE")
+                    "grain_ratio DOUBLE, duration_ms BIGINT")
         ).write.format("delta").mode("append").option(
             # 11/19 — rung_stats column evolves the existing _run_log table
             "mergeSchema", "true").saveAsTable(
@@ -2461,12 +2464,32 @@ def parse_bronze_table(bronze_table, watermark=None, limit=None, silver_name=Non
     # the first run-log write — exactly the 11/25 nightly outage (run
     # 248050494912565, introduced by commit 43391b9). Bind a different
     # local name instead; the global writer stays untouched.
-    _log_writer = _run_log_write if log_run else (lambda *a, **k: None)
+    # 11/27/2026 — DURATION TELEMETRY (owner-approved): stamp elapsed ms on
+    # every run-log row from this parse (success, skip, and failure paths
+    # alike). Never assign to _run_log_write — the 11/25 UnboundLocalError
+    # lesson above still applies; this binds a different local name.
+    _parse_t0 = time.time()
+    def _timed_log(*_a, **_k):
+        if not log_run:
+            return
+        _k.setdefault("duration_ms", int((time.time() - _parse_t0) * 1000))
+        _run_log_write(*_a, **_k)
+    _log_writer = _timed_log
     df = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.{bronze_table}")
 
     if watermark:
-        df = df.filter(col("bronze_updated_at") > lit(watermark))
-        print(f"  CDC: reading Bronze rows after {watermark}")
+        # 11/27/2026 — OWNER-APPROVED bounded lookback (late-arrival guard).
+        # Strict > watermark skipped any bronze row landing late with
+        # bronze_updated_at <= the committed max. Re-reading the trailing 24h
+        # is safe: CDC writes are MERGE (idempotent) — re-seen rows merge as
+        # no-ops. Trade-off (accepted): cdc_rows telemetry includes overlap.
+        from datetime import timedelta
+        try:
+            _wm_floor = watermark - timedelta(hours=24)
+        except TypeError:
+            _wm_floor = watermark  # non-datetime watermark: strict behavior kept
+        df = df.filter(col("bronze_updated_at") > lit(_wm_floor))
+        print(f"  CDC: reading Bronze rows after {_wm_floor} (watermark {watermark} minus 24h lookback)")
 
     if limit:
         df = df.limit(limit)
